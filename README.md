@@ -309,9 +309,9 @@ make
 make install            # PREFIX defaults to /usr/local
 ```
 
-A FreeBSD port skeleton lives in `ports/` — Makefile, `pkg-descr`, `pkg-plist` and
-`pkg-message`, with `TRAY`, `DASH` and `SPREAD` options. Saber is **not in the ports tree**;
-copy the directory to `/usr/ports/x11/saber` to build it that way.
+Saber is **not in the ports tree**, and no port skeleton ships here yet. Build it with `make`
+as above; a `ports/` directory with `TRAY`, `DASH` and `SPREAD` options will land alongside an
+actual ports submission.
 
 `make install` places `saber` and `saberctl` in `${PREFIX}/bin` (mode 555, neither setuid), the
 default configuration in `${ETC_PREFIX}/etc/saber/saber.conf`, and the BFB emblem in

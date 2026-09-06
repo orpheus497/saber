@@ -19,8 +19,66 @@ saber.1
 # the same treatment hikari-sakura gives its own .devdocs/.
 .devdocs/
 
+# FreeBSD port skeleton. Kept on disk, held back from the repository until the
+# port is actually submitted -- a MAINTAINER line is a public commitment to a
+# reachable address, and that is a decision for submission time, not now.
+ports/
+
 .claude/
 
 # Captured runtime logs from redirect typos (e.g. `2>1` instead of `2>&1`)
 /1
 /2
+
+# --------------------------------------------------------------- secrets
+# Nothing here is used by Saber today. These are standing guards: a key or a
+# credential dropped into the tree during debugging must never become a
+# commit, and a rule that only appears after the mistake is a rule too late.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_ecdsa
+id_ed25519
+*.gpg
+*.asc
+secrets.*
+credentials.*
+.netrc
+.npmrc
+.pypirc
+.aws/
+.ssh/
+
+# ------------------------------------------------- local / machine-specific
+# Editor and tool state, personal overrides, and anything scoped to one host.
+# Same reasoning as .devdocs/ above: development context, not product.
+# (.claude/ is already covered above.)
+.cursor/
+.aider*
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.local
+*.local.*
+compile_commands.json
+.cache/
+
+# Ad-hoc scratch: crash traces, session captures, test scribbles.
+*.log
+*.bak
+*.orig
+*.rej
+core
+core.*
+vgcore.*

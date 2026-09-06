@@ -10,6 +10,11 @@
   <a href="#known-limits">Known limits</a>
 </p>
 
+<p align="center">
+  <img src=".github/screenshot.webp" width="100%"
+       alt="Saber on a FreeBSD session: the panel column runs down the left edge carrying the BFB emblem, sheet indicator, trash and session controls, with the Dash open beside it showing a searchable grid of installed applications.">
+</p>
+
 ---
 
 > **Status: working, not yet released.** The panel runs, draws, and every planned surface

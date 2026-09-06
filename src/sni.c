@@ -672,13 +672,31 @@ split_service(const char *service,
   *object_path = g_strdup(ITEM_DEFAULT_OBJECT_PATH);
 }
 
-static void
+static bool
 register_item(struct saber_sni *sni, const char *service, const char *sender)
 {
   char *bus_name = NULL;
   char *object_path = NULL;
 
   split_service(service, sender, &bus_name, &object_path);
+
+  /* Action purpose: Any session peer can call this, and both halves go on to
+  g_dbus_connection_call, g_bus_watch_name and g_dbus_connection_signal_subscribe
+  -- each of which opens with a g_return_if_fail on the argument. An invalid name
+  would therefore leak the floating parameter tuple of every property fetch,
+  return a watch id of 0 that on_item_vanished can never fire for, leaving a tray
+  entry that can never be removed, and abort the process outright under
+  G_DEBUG=fatal-criticals. Checked before first use, not at each of them. */
+  if (bus_name == NULL || object_path == NULL || !g_dbus_is_name(bus_name) ||
+      !g_variant_is_object_path(object_path)) {
+    g_warning("saber: refusing a StatusNotifierItem registration with an "
+              "invalid bus name or object path (%s, %s)",
+        bus_name != NULL ? bus_name : "(none)",
+        object_path != NULL ? object_path : "(none)");
+    g_free(bus_name);
+    g_free(object_path);
+    return false;
+  }
 
   char *canonical = g_strconcat(bus_name, object_path, NULL);
 
@@ -689,7 +707,7 @@ register_item(struct saber_sni *sni, const char *service, const char *sender)
     g_free(canonical);
     g_free(bus_name);
     g_free(object_path);
-    return;
+    return true;
   }
 
   struct saber_sni_item *item =
@@ -713,6 +731,8 @@ register_item(struct saber_sni *sni, const char *service, const char *sender)
       "StatusNotifierItemRegistered",
       g_variant_new("(s)", item->service));
   notify_changed(sni);
+
+  return true;
 }
 
 static void
@@ -746,14 +766,24 @@ host_watch_destroy(gpointer data)
   }
 }
 
-static void
+static bool
 register_host(struct saber_sni *sni, const char *service, const char *sender)
 {
   const char *name =
       service != NULL && service[0] != '\0' ? service : sender;
 
-  if (name == NULL || g_hash_table_contains(sni->hosts, name)) {
-    return;
+  /* Same reasoning as register_item: an unvalidated name here would take a
+  watch id of 0 and leave an immortal entry in sni->hosts, which is what
+  IsStatusNotifierHostRegistered answers from. */
+  if (name == NULL || !g_dbus_is_name(name)) {
+    g_warning("saber: refusing a StatusNotifierHost registration with an "
+              "invalid bus name (%s)",
+        name != NULL ? name : "(none)");
+    return false;
+  }
+
+  if (g_hash_table_contains(sni->hosts, name)) {
+    return true;
   }
 
   guint id = g_bus_watch_name(G_BUS_TYPE_SESSION,
@@ -767,6 +797,8 @@ register_host(struct saber_sni *sni, const char *service, const char *sender)
   g_hash_table_insert(sni->hosts, g_strdup(name), GUINT_TO_POINTER(id));
 
   emit_signal(sni, "StatusNotifierHostRegistered", NULL);
+
+  return true;
 }
 
 /* ---------------------------------------------------------------- */
@@ -793,7 +825,15 @@ handle_method(GDBusConnection *connection,
     const char *service = NULL;
 
     g_variant_get(parameters, "(&s)", &service);
-    register_item(sni, service, sender);
+
+    if (!register_item(sni, service, sender)) {
+      g_dbus_method_invocation_return_error_literal(invocation,
+          G_DBUS_ERROR,
+          G_DBUS_ERROR_INVALID_ARGS,
+          "Invalid service name or object path");
+      return;
+    }
+
     g_dbus_method_invocation_return_value(invocation, NULL);
     return;
   }
@@ -802,7 +842,15 @@ handle_method(GDBusConnection *connection,
     const char *service = NULL;
 
     g_variant_get(parameters, "(&s)", &service);
-    register_host(sni, service, sender);
+
+    if (!register_host(sni, service, sender)) {
+      g_dbus_method_invocation_return_error_literal(invocation,
+          G_DBUS_ERROR,
+          G_DBUS_ERROR_INVALID_ARGS,
+          "Invalid service name");
+      return;
+    }
+
     g_dbus_method_invocation_return_value(invocation, NULL);
     return;
   }

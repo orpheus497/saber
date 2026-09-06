@@ -1305,7 +1305,15 @@ menu_window(void *user, void *handle)
 
   switch (menu->kind) {
   case SABER_MENU_APP:
-    window_raise(handle);
+    /* Action purpose: the row's handle was snapshotted into the menu when it
+    opened, and the compositor can close that window while the menu is still on
+    screen -- after which toplevel_free has released it and both the raise and
+    the wl_proxy behind it would be a use-after-free. handle_closed withdraws
+    the window from the model before freeing it, so a handle the model still
+    knows is a handle that still exists. */
+    if (saber_model_find_by_window(set->deps.model, handle) != NULL) {
+      window_raise(handle);
+    }
     break;
 
   case SABER_MENU_SESSION: {

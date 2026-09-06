@@ -324,6 +324,43 @@ wlr-foreign-toplevel-management-unstable-v1-protocol.h:
 wlr-foreign-toplevel-management-unstable-v1-protocol.c:
 	wayland-scanner private-code protocol/wlr-foreign-toplevel-management-unstable-v1.xml ${.TARGET}
 
+virtual-keyboard-unstable-v1-protocol.h:
+	wayland-scanner client-header protocol/virtual-keyboard-unstable-v1.xml ${.TARGET}
+virtual-keyboard-unstable-v1-protocol.c:
+	wayland-scanner private-code protocol/virtual-keyboard-unstable-v1.xml ${.TARGET}
+
+wlr-virtual-pointer-unstable-v1-protocol.h:
+	wayland-scanner client-header protocol/wlr-virtual-pointer-unstable-v1.xml ${.TARGET}
+wlr-virtual-pointer-unstable-v1-protocol.c:
+	wayland-scanner private-code protocol/wlr-virtual-pointer-unstable-v1.xml ${.TARGET}
+
+# [COMMENT] Action purpose: vinput(1) is a test harness, not part of the product,
+# so it is deliberately absent from `all` -- nothing Saber ships depends on it
+# and a broken harness must never break the build. It gets its own protocol pair
+# for the same reason: `saber` links neither, and adding them to PROTOCOL_OBJS
+# would put two protocols into the panel binary that the panel never speaks.
+#
+# It needs xkbcommon to compile the keymap it hands the compositor, which is
+# already a dependency of `saber` itself, and no cairo, pango, glib or ucl.
+VINPUT_PROTOCOL_HEADERS = \
+	virtual-keyboard-unstable-v1-protocol.h \
+	wlr-virtual-pointer-unstable-v1-protocol.h
+
+VINPUT_PROTOCOL_OBJS = \
+	virtual-keyboard-unstable-v1-protocol.o \
+	wlr-virtual-pointer-unstable-v1-protocol.o
+
+VINPUT_CFLAGS = -Wall -I. ${WAYLAND_CFLAGS} ${XKBCOMMON_CFLAGS}
+VINPUT_LIBS = ${WAYLAND_LIBS} ${XKBCOMMON_LIBS}
+
+${VINPUT_PROTOCOL_OBJS} vinput.o: ${VINPUT_PROTOCOL_HEADERS}
+
+vinput.o: tools/vinput.c
+	${CC} ${VINPUT_CFLAGS} -c ${.CURDIR}/tools/vinput.c -o ${.TARGET}
+
+vinput: vinput.o ${VINPUT_PROTOCOL_OBJS}
+	${CC} ${LDFLAGS} -o ${.TARGET} vinput.o ${VINPUT_PROTOCOL_OBJS} ${VINPUT_LIBS}
+
 # [COMMENT] Action purpose: Report which optional features this binary was
 # built with, without running the panel. `make features` answers the same
 # question about a tree that has not been built yet, which is what makes
@@ -340,12 +377,14 @@ features:
 clean:
 	@echo "cleaning generated protocol sources"
 	@rm -f ${PROTOCOL_HEADERS} ${PROTOCOL_HEADERS:S/.h$/.c/}
+	@rm -f ${VINPUT_PROTOCOL_HEADERS} ${VINPUT_PROTOCOL_HEADERS:S/.h$/.c/}
 	@echo "cleaning headers"
 	@rm -f version.h
 	@echo "cleaning object files"
 	@rm -f ${OBJS} ${PROTOCOL_OBJS} ${CTL_OBJS}
+	@rm -f vinput.o ${VINPUT_PROTOCOL_OBJS}
 	@echo "cleaning executables"
-	@rm -f saber saberctl
+	@rm -f saber saberctl vinput
 
 distclean: clean
 	@rm -f saber-${VERSION}.tar.gz

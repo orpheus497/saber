@@ -67,8 +67,13 @@ handle_title(void *data,
     return;
   }
 
+  /* Action purpose: Any Wayland client can set this to an arbitrary byte string,
+  and it reaches g_utf8_casefold and pango further down. glib's UTF-8 walkers
+  document their input as required-valid and read past the terminator on a
+  truncated sequence, so the bytes are made valid here, at the one place they
+  enter the process, rather than at each consumer. Same for app_id below. */
   g_free(toplevel->title);
-  toplevel->title = g_strdup(title);
+  toplevel->title = title != NULL ? g_utf8_make_valid(title, -1) : NULL;
   toplevel->pending |= SABER_TOPLEVEL_CHANGE_TITLE;
 }
 
@@ -86,7 +91,7 @@ handle_app_id(void *data,
   }
 
   g_free(toplevel->app_id);
-  toplevel->app_id = g_strdup(app_id);
+  toplevel->app_id = app_id != NULL ? g_utf8_make_valid(app_id, -1) : NULL;
   toplevel->pending |= SABER_TOPLEVEL_CHANGE_APP_ID;
 }
 

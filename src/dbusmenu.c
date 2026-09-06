@@ -29,6 +29,13 @@ it is not useful either way. Both are far above any real menu. */
 #define MENU_MAX_ENTRIES 512
 #define MENU_MAX_DEPTH 16
 
+/* Action purpose: The two bounds above cap one level and the descent, but not
+their product -- 512 rows at each of 16 levels is a legal reply that D-Bus is
+happy to carry within its 128MB message limit, while each node costs a struct, a
+GPtrArray and two strdups here. This caps the tree as a whole. Still far above
+any real menu: the largest seen in practice is in the low hundreds. */
+#define MENU_MAX_NODES 4096
+
 /* GetLayout's recursionDepth: -1 is the whole tree. Saber draws the submenus
 itself rather than asking the application to open them, so it wants the tree in
 one round trip; AboutToShow still runs before a submenu opens, for applications
@@ -169,10 +176,11 @@ apply_properties(struct saber_dbusmenu_item *item, GVariant *props)
 }
 
 /* Function purpose: Turn one `(ia{sv}av)` layout node, and everything below it,
-into an item. `depth` is the remaining recursion budget: a peer chooses the
-nesting, so the descent has to be bounded rather than trusted. */
+into an item. `depth` is the remaining recursion budget and `budget` the
+remaining node budget, shared across the whole tree: a peer chooses both the
+nesting and the breadth, so each has to be bounded rather than trusted. */
 static struct saber_dbusmenu_item *
-parse_node(GVariant *node, int depth)
+parse_node(GVariant *node, int depth, gsize *budget)
 {
   gint32 id = 0;
   GVariant *props = NULL;
@@ -200,12 +208,13 @@ parse_node(GVariant *node, int depth)
   }
 
   if (depth > 0) {
-    for (gsize i = 0; i < n; i++) {
+    for (gsize i = 0; i < n && *budget > 0; i++) {
       GVariant *wrapper = g_variant_get_child_value(children, i);
       GVariant *child = g_variant_get_variant(wrapper);
 
       if (g_variant_is_of_type(child, G_VARIANT_TYPE("(ia{sv}av)"))) {
-        g_ptr_array_add(item->children, parse_node(child, depth - 1));
+        (*budget)--;
+        g_ptr_array_add(item->children, parse_node(child, depth - 1, budget));
       }
 
       g_variant_unref(child);
@@ -303,7 +312,15 @@ saber_dbusmenu_refresh(struct saber_dbusmenu *menu)
 
   g_variant_get(reply, "(u@(ia{sv}av))", &revision, &layout);
 
-  struct saber_dbusmenu_item *root = parse_node(layout, MENU_MAX_DEPTH);
+  gsize budget = MENU_MAX_NODES;
+  struct saber_dbusmenu_item *root =
+      parse_node(layout, MENU_MAX_DEPTH, &budget);
+
+  /* Reported once for the whole tree rather than at each level that ran out. */
+  if (budget == 0) {
+    g_warning("saber: a dbusmenu exceeded %d nodes; the rest was dropped.",
+        MENU_MAX_NODES);
+  }
 
   g_variant_unref(layout);
   g_variant_unref(reply);

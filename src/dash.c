@@ -316,10 +316,32 @@ entry_free(gpointer data)
   g_free(entry);
 }
 
+/* Function purpose: A valid-UTF-8 copy of `text`, for the callers below that
+walk it as UTF-8. Desktop-entry data carries no such guarantee: an id is derived
+from a filename, which is an arbitrary byte string on this platform, and Exec
+reaches us through g_key_file_get_value precisely when g_key_file_get_string
+rejected it as malformed. The walkers document their input as required-valid and
+run off the end of a truncated sequence. Validating here rather than at the
+source keeps Exec byte-exact for the execvp path, which must not be repaired. */
+static char *
+utf8_dup(const char *text)
+{
+  return g_utf8_validate(text, -1, NULL) ? g_strdup(text)
+                                         : g_utf8_make_valid(text, -1);
+}
+
 static char *
 fold(const char *text)
 {
-  return text != NULL && *text != '\0' ? g_utf8_casefold(text, -1) : NULL;
+  if (text == NULL || *text == '\0') {
+    return NULL;
+  }
+
+  char *valid = utf8_dup(text);
+  char *folded = g_utf8_casefold(valid, -1);
+
+  g_free(valid);
+  return folded;
 }
 
 /* Function purpose: The command a desktop entry actually runs, stripped of its
@@ -430,15 +452,17 @@ dash_build_entries(struct saber_dash *dash)
 
     struct dash_entry *entry = g_new0(struct dash_entry, 1);
     char *exec = exec_basename(app->exec);
+    char *sort_label = utf8_dup(label);
 
     entry->app = saber_appinfo_ref(app);
     entry->label = label;
     entry->fold_name = fold(label);
     entry->fold_generic = fold(app->generic_name);
     entry->fold_exec = fold(exec);
-    entry->sort_key = g_utf8_collate_key(label, -1);
+    entry->sort_key = g_utf8_collate_key(sort_label, -1);
     entry->category = entry_category(app);
 
+    g_free(sort_label);
     g_free(exec);
     g_ptr_array_add(dash->entries, entry);
   }

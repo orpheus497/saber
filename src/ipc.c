@@ -301,6 +301,13 @@ dispatch(struct ipc_client *client, char *line)
     instead of filtering on a string nothing will ever match. */
     if (arg != NULL && strpbrk(arg, " \t") != NULL) {
       respond(client, "error app id must be a single token\n");
+    } else if (arg != NULL && !g_utf8_validate(arg, -1, NULL)) {
+      /* Action purpose: Rejected rather than repaired. This reaches
+      g_utf8_casefold, which requires valid input, and a desktop file ID that is
+      not UTF-8 cannot match anything -- so silently folding it to replacement
+      characters would answer "no such application" to what is really a mangled
+      keybinding, and say nothing about why. */
+      respond(client, "error app id must be valid UTF-8\n");
     } else if (handlers->spread == NULL) {
       respond(client, "error feature not built\n");
     } else {

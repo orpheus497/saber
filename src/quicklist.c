@@ -665,13 +665,21 @@ level_done(void *data, struct saber_popup *popup)
 
   struct ql_level *level = data;
 
-  if (level->parent != NULL) {
-    level_close_children(level->parent);
-    saber_popup_damage(level->parent->popup);
+  /* Action purpose: read the parent before closing it. level_close_children
+  reaches level_destroy on the parent's current child -- which is this level --
+  and ends in g_free, so every later dereference of `level` would be a read of
+  freed memory. The compositor delivers popup_done innermost first, so this is
+  the ordinary path, not an edge case. */
+  struct ql_level *parent = level->parent;
+  struct saber_quicklist *ql = level->ql;
+
+  if (parent != NULL) {
+    level_close_children(parent);
+    saber_popup_damage(parent->popup);
     return;
   }
 
-  saber_quicklist_close(level->ql);
+  saber_quicklist_close(ql);
 }
 
 static const struct saber_popup_listener level_popup_listener = {

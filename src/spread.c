@@ -93,6 +93,29 @@ struct saber_spread {
 
 /* ------------------------------------------------------------- primitives */
 
+/* Function purpose: Casefold a filter that did not come from the compositor.
+The panel passes a desktop file ID here, which is derived from a filename and so
+is an arbitrary byte string, and g_utf8_casefold requires valid UTF-8 and walks
+off the end of a truncated sequence without it. Toplevel app_ids need no such
+care -- toplevel.c makes those valid as they enter the process. */
+static char *
+fold_filter(const char *app_id)
+{
+  if (app_id == NULL || *app_id == '\0') {
+    return NULL;
+  }
+
+  if (g_utf8_validate(app_id, -1, NULL)) {
+    return g_utf8_casefold(app_id, -1);
+  }
+
+  char *valid = g_utf8_make_valid(app_id, -1);
+  char *folded = g_utf8_casefold(valid, -1);
+
+  g_free(valid);
+  return folded;
+}
+
 static void
 rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r)
 {
@@ -1130,9 +1153,7 @@ saber_spread_show(struct saber_spread *spread,
   }
 
   g_free(spread->filter);
-  spread->filter = app_id != NULL && *app_id != '\0'
-      ? g_utf8_casefold(app_id, -1)
-      : NULL;
+  spread->filter = fold_filter(app_id);
 
   if (spread->surface != NULL) {
     saber_spread_refresh(spread);
@@ -1241,9 +1262,7 @@ saber_spread_toggle(struct saber_spread *spread,
   }
 
   if (spread->surface != NULL) {
-    char *wanted = app_id != NULL && *app_id != '\0'
-        ? g_utf8_casefold(app_id, -1)
-        : NULL;
+    char *wanted = fold_filter(app_id);
     bool same = g_strcmp0(wanted, spread->filter) == 0;
 
     g_free(wanted);

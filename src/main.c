@@ -28,8 +28,10 @@ linked and not merely that their headers were on the include path. */
 #include <saber/anim.h>
 #include <saber/appinfo.h>
 #include <saber/config.h>
+#include <saber/dash.h>
 #include <saber/devices.h>
 #include <saber/display.h>
+#include <saber/ipc.h>
 #include <saber/match.h>
 #include <saber/model.h>
 #include <saber/panel.h>
@@ -37,6 +39,7 @@ linked and not merely that their headers were on the include path. */
 #include <saber/saber.h>
 #include <saber/sheets.h>
 #include <saber/sni.h>
+#include <saber/spread.h>
 #include <saber/theme.h>
 #include <saber/toplevel.h>
 #include <saber/trash.h>
@@ -159,9 +162,178 @@ struct saber_app {
   struct saber_unity *unity;
   struct saber_icons *icons;
   struct saber_panels *panels;
+  struct saber_dash *dash;
+  struct saber_spread *spread;
+  struct saber_ipc *ipc;
 
   GMainLoop *loop;
 };
+
+/* Function purpose: The saberctl verb table. ipc.c holds no panel logic, so
+every verb resolves to one of these; a NULL member is answered "error feature
+not built", which is how a WITH_DASH=NO build needs no conditional there. */
+static enum saber_ipc_result
+ipc_dash(void *user)
+{
+#ifdef HAVE_DASH
+  struct saber_app *app = user;
+
+  if (app->dash != NULL) {
+    saber_dash_toggle(app->dash, NULL);
+
+    return SABER_IPC_RESULT_OK;
+  }
+#else
+  (void)user;
+#endif
+
+  return SABER_IPC_RESULT_NOT_BUILT;
+}
+
+static enum saber_ipc_result
+ipc_spread(const char *app_id, void *user)
+{
+#ifdef HAVE_SPREAD
+  struct saber_app *app = user;
+
+  if (app->spread != NULL) {
+    saber_spread_toggle(app->spread, app_id, NULL);
+
+    return SABER_IPC_RESULT_OK;
+  }
+#else
+  (void)app_id;
+  (void)user;
+#endif
+
+  return SABER_IPC_RESULT_NOT_BUILT;
+}
+
+static enum saber_ipc_result
+ipc_sheet(int sheet, void *user)
+{
+#ifdef HAVE_SHEETS
+  struct saber_app *app = user;
+
+  if (app->sheets != NULL) {
+    saber_sheets_switch(app->sheets, sheet, NULL, NULL);
+
+    return SABER_IPC_RESULT_OK;
+  }
+#else
+  (void)sheet;
+  (void)user;
+#endif
+
+  return SABER_IPC_RESULT_NOT_BUILT;
+}
+
+static enum saber_ipc_result
+ipc_pin(int sheet, void *user)
+{
+#ifdef HAVE_SHEETS
+  struct saber_app *app = user;
+
+  if (app->sheets != NULL) {
+    saber_sheets_pin(app->sheets, sheet, NULL, NULL);
+
+    return SABER_IPC_RESULT_OK;
+  }
+#else
+  (void)sheet;
+  (void)user;
+#endif
+
+  return SABER_IPC_RESULT_NOT_BUILT;
+}
+
+static enum saber_ipc_result
+ipc_launch(int favourite, void *user)
+{
+  struct saber_app *app = user;
+  const struct saber_item *item = saber_model_nth(app->model, favourite - 1);
+
+  if (item == NULL || item->type != SABER_ITEM_APP) {
+    return SABER_IPC_RESULT_NO_FAVOURITE;
+  }
+
+  /* Action purpose: Unity's Super+N focuses a running application rather than
+  starting a second copy. Unminimise first -- on hikari the minimised bit means
+  "on a sheet you are not looking at", so activating without clearing it raises
+  a window that stays invisible. */
+  if (item->windows != NULL && item->windows->len > 0) {
+    struct saber_toplevel *window = g_ptr_array_index(item->windows, 0);
+
+    saber_toplevel_unset_minimized(window);
+    saber_toplevel_activate(window);
+
+    return SABER_IPC_RESULT_OK;
+  }
+
+  if (item->app == NULL) {
+    return SABER_IPC_RESULT_FAILED;
+  }
+
+  if (!saber_appinfo_launch(item->app, NULL, NULL, NULL)) {
+    return SABER_IPC_RESULT_FAILED;
+  }
+
+  saber_model_note_launch(app->model, item->id);
+
+  return SABER_IPC_RESULT_OK;
+}
+
+static enum saber_ipc_result
+ipc_status(struct saber_ipc_report *report, void *user)
+{
+  struct saber_app *app = user;
+
+  saber_ipc_report_line(report, "version %s", SABER_VERSION);
+  saber_ipc_report_line(report, "panels %d",
+      (int)saber_panels_count(app->panels));
+  saber_ipc_report_line(report, "items %d", (int)saber_model_size(app->model));
+  saber_ipc_report_line(report, "dash %s",
+      app->dash != NULL && saber_dash_is_visible(app->dash) ? "open" : "closed");
+  saber_ipc_report_line(report, "spread %s",
+      app->spread != NULL && saber_spread_is_visible(app->spread) ? "open"
+                                                                 : "closed");
+
+  return SABER_IPC_RESULT_OK;
+}
+
+static enum saber_ipc_result
+ipc_quit(void *user)
+{
+  struct saber_app *app = user;
+
+  g_main_loop_quit(app->loop);
+
+  return SABER_IPC_RESULT_OK;
+}
+
+/* Function purpose: Adapters that give the panel's hooks the shape they want.
+The Dash and the spread are separate surfaces with their own modules, so the
+panel reaches them through a function pointer rather than a link dependency --
+which is also what keeps the column working under WITH_DASH=NO. */
+static void
+on_bfb_clicked(struct saber_output *output, void *user)
+{
+  struct saber_app *app = user;
+
+  if (app->dash != NULL) {
+    saber_dash_toggle(app->dash, output);
+  }
+}
+
+static void
+on_spread_requested(const char *app_id, struct saber_output *output, void *user)
+{
+  struct saber_app *app = user;
+
+  if (app->spread != NULL) {
+    saber_spread_toggle(app->spread, app_id, output);
+  }
+}
 
 static void
 app_repaint(struct saber_app *app)
@@ -257,108 +429,6 @@ static const struct saber_toplevel_listener app_toplevel_listener = {
   .closed = on_toplevel_closed,
 };
 
-/* Action purpose: The manager display.c binds during startup is bound inside
-the FIRST of saber_display_create's two round trips, and the compositor answers
-a bind by sending one `toplevel` event per window that already exists. Those
-arrive in the SECOND round trip -- before anything has attached a listener --
-so every window open when Saber starts is dispatched into nothing and the
-column comes up empty until the user opens something new. It fails silently and
-looks exactly like a compositor that does not support the protocol.
-
-Binding a second manager here, and only then attaching the listener, makes the
-compositor resend the whole list to an object that is listening for it. The
-first manager is stopped and released below.
-
-The proper fix belongs in display.c -- bind this global lazily, or let the
-caller listen before the second round trip -- at which point this whole
-function should go. */
-struct toplevel_rebind {
-  struct zwlr_foreign_toplevel_manager_v1 *manager;
-};
-
-static void
-rebind_global(void *data,
-    struct wl_registry *registry,
-    uint32_t name,
-    const char *interface,
-    uint32_t version)
-{
-  struct toplevel_rebind *rebind = data;
-
-  if (rebind->manager != NULL ||
-      strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) != 0) {
-    return;
-  }
-
-  rebind->manager = wl_registry_bind(registry, name,
-      &zwlr_foreign_toplevel_manager_v1_interface, version < 3 ? version : 3);
-}
-
-static void
-rebind_global_remove(void *data, struct wl_registry *registry, uint32_t name)
-{
-  (void)data;
-  (void)registry;
-  (void)name;
-}
-
-static const struct wl_registry_listener rebind_registry_listener = {
-  .global = rebind_global,
-  .global_remove = rebind_global_remove,
-};
-
-/* The stopped manager may still deliver a handle or two before `finished`;
-both are released here so the startup path leaves nothing dangling. */
-static void
-stale_toplevel(void *data,
-    struct zwlr_foreign_toplevel_manager_v1 *manager,
-    struct zwlr_foreign_toplevel_handle_v1 *handle)
-{
-  (void)data;
-  (void)manager;
-
-  zwlr_foreign_toplevel_handle_v1_destroy(handle);
-}
-
-static void
-stale_finished(void *data, struct zwlr_foreign_toplevel_manager_v1 *manager)
-{
-  (void)data;
-
-  zwlr_foreign_toplevel_manager_v1_destroy(manager);
-}
-
-static const struct zwlr_foreign_toplevel_manager_v1_listener stale_listener = {
-  .toplevel = stale_toplevel,
-  .finished = stale_finished,
-};
-
-static struct zwlr_foreign_toplevel_manager_v1 *
-rebind_toplevel_manager(struct saber_display *display)
-{
-  if (display->foreign_toplevel_manager == NULL) {
-    return NULL;
-  }
-
-  zwlr_foreign_toplevel_manager_v1_add_listener(
-      display->foreign_toplevel_manager, &stale_listener, NULL);
-  zwlr_foreign_toplevel_manager_v1_stop(display->foreign_toplevel_manager);
-  display->foreign_toplevel_manager = NULL;
-
-  struct toplevel_rebind rebind = { NULL };
-  struct wl_registry *registry = wl_display_get_registry(display->wl_display);
-
-  wl_registry_add_listener(registry, &rebind_registry_listener, &rebind);
-
-  /* One round trip binds the manager; the `toplevel` burst it provokes cannot
-  arrive before the sync that ends this trip, so it is still waiting when the
-  caller attaches its listener. */
-  wl_display_roundtrip(display->wl_display);
-  wl_registry_destroy(registry);
-
-  return rebind.manager;
-}
-
 static void
 on_sheets_state(const struct saber_sheets_state *state, void *user)
 {
@@ -440,6 +510,11 @@ before it; the model outlives the panels that read it. */
 static void
 app_shutdown(struct saber_app *app)
 {
+  /* Before the panels: both hold a surface that owns the seat's keyboard while
+  mapped, and tearing the display down under them leaves the session deaf. */
+  saber_ipc_destroy(app->ipc);
+  saber_dash_destroy(app->dash);
+  saber_spread_destroy(app->spread);
   saber_panels_destroy(app->panels);
   saber_toplevels_destroy(app->toplevels);
   saber_unity_destroy(app->unity);
@@ -513,7 +588,8 @@ run(void)
   to follow it -- zwlr_foreign_toplevel_handle_v1.activate takes a seat and has
   no seatless form, so without this every click that should raise a window does
   nothing at all and reports nothing. */
-  app.toplevels = saber_toplevels_create(rebind_toplevel_manager(app.display),
+  app.toplevels = saber_toplevels_create(
+      saber_display_take_foreign_toplevels(app.display),
       &app_toplevel_listener, &app);
 
   if (app.toplevels != NULL) {
@@ -574,6 +650,7 @@ run(void)
     .trash = app.trash,
     .devices = app.devices,
     .sni = app.sni,
+    .index = app.index,
   };
 
   app.panels = saber_panels_create(&deps);
@@ -586,6 +663,70 @@ run(void)
     app_shutdown(&app);
 
     return EXIT_FAILURE;
+  }
+
+#ifdef HAVE_DASH
+  struct saber_dash_deps dash_deps = {
+    .display = app.display,
+    .config = &app.config,
+    .theme = &app.theme,
+    .icons = app.icons,
+    .index = app.index,
+    .match = app.match,
+    .model = app.model,
+  };
+
+  app.dash = saber_dash_create(&dash_deps);
+  saber_panels_set_dash(app.panels, on_bfb_clicked, &app);
+#endif
+
+#ifdef HAVE_SPREAD
+  struct saber_spread_deps spread_deps = {
+    .display = app.display,
+    .config = &app.config,
+    .theme = &app.theme,
+    .icons = app.icons,
+    .index = app.index,
+    .match = app.match,
+    .model = app.model,
+    .toplevels = app.toplevels,
+  };
+
+  app.spread = saber_spread_create(&spread_deps);
+  saber_panels_set_spread(app.panels, on_spread_requested, &app);
+#endif
+
+  /* Action purpose: The socket is also the single-instance lock. ipc.c connects
+  before it unlinks, so a live panel is detected rather than having its socket
+  stolen; a stale file from an unclean exit is removed instead. */
+  struct saber_ipc_handlers handlers = {
+    .dash = ipc_dash,
+    .spread = ipc_spread,
+    .launch = ipc_launch,
+    .sheet = ipc_sheet,
+    .pin = ipc_pin,
+    .status = ipc_status,
+    .quit = ipc_quit,
+    .user = &app,
+  };
+
+  GError *ipc_error = NULL;
+
+  app.ipc = saber_ipc_create(&handlers, &ipc_error);
+
+  if (app.ipc == NULL) {
+    if (g_error_matches(ipc_error, SABER_IPC_ERROR,
+            SABER_IPC_ERROR_ALREADY_RUNNING)) {
+      fprintf(stderr, "saber: %s\n", ipc_error->message);
+      g_error_free(ipc_error);
+      app_shutdown(&app);
+
+      return EXIT_FAILURE;
+    }
+
+    /* Anything else costs saberctl and nothing else, so it is a warning. */
+    g_warning("saber: %s", ipc_error->message);
+    g_error_free(ipc_error);
   }
 
   guint sigint = g_unix_signal_add(SIGINT, on_signal, &app);

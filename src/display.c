@@ -4,8 +4,11 @@ hand because the compositor advertises no wp_cursor_shape_v1, and pumps the
 connection from a GLib GSource. */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cairo.h>
@@ -471,6 +474,77 @@ static const struct wl_pointer_listener pointer_listener = {
   .axis_discrete = pointer_handle_axis_discrete,
 };
 
+/* Function purpose: Re-create a mappable fd holding the cached keymap, so a
+listener registered after the seat bound still receives one.
+
+Action purpose: wl_keyboard.keymap fires exactly once, when the seat announces
+its keyboard, and that is long before the Dash or a menu exists. Forwarding it
+only to whoever happened to be listening at that instant leaves every later
+listener falling back to xkb_keymap_new_from_names(NULL) -- the compiled-in US
+default -- so a search field types the wrong characters for anyone whose layout
+is not US, silently and only for text entry. Caching the bytes and handing out
+a fresh fd is what makes registration order stop mattering. */
+static int
+keymap_replay_fd(struct saber_display *display)
+{
+  int fd = -1;
+
+#if defined(SHM_ANON)
+  fd = shm_open(SHM_ANON, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+#else
+  char name[64];
+
+  g_snprintf(name, sizeof(name), "/saber-keymap-%d", (int)getpid());
+  fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+
+  if (fd >= 0) {
+    shm_unlink(name);
+  }
+#endif
+
+  if (fd < 0) {
+    return -1;
+  }
+
+  if (ftruncate(fd, (off_t)display->keymap_size) < 0) {
+    close(fd);
+    return -1;
+  }
+
+  ssize_t written = write(fd, display->keymap_data, display->keymap_size);
+
+  if (written < 0 || (size_t)written != display->keymap_size) {
+    close(fd);
+    return -1;
+  }
+
+  /* The consumer mmaps from offset 0; write(2) left the cursor at the end. */
+  if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
+static void
+keymap_deliver(struct saber_display *display)
+{
+  if (display->keymap_data == NULL || display->keyboard_listener == NULL ||
+      display->keyboard_listener->keymap == NULL) {
+    return;
+  }
+
+  int fd = keymap_replay_fd(display);
+
+  if (fd < 0) {
+    return;
+  }
+
+  display->keyboard_listener->keymap(display->keyboard_data,
+      display->keymap_format, fd, (uint32_t)display->keymap_size);
+}
+
 static void
 keyboard_handle_keymap(void *data,
     struct wl_keyboard *wl_keyboard,
@@ -481,6 +555,18 @@ keyboard_handle_keymap(void *data,
   (void)wl_keyboard;
 
   struct saber_display *display = data;
+
+  /* Cache before forwarding: the listener owns the fd once it has it and is
+  entitled to close it. */
+  void *mapped = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+  if (mapped != MAP_FAILED) {
+    g_free(display->keymap_data);
+    display->keymap_data = g_memdup2(mapped, size);
+    display->keymap_size = size;
+    display->keymap_format = format;
+    munmap(mapped, size);
+  }
 
   if (display->keyboard_listener != NULL &&
       display->keyboard_listener->keymap != NULL) {
@@ -708,8 +794,10 @@ registry_handle_global(void *data,
         &xdg_activation_v1_interface, 1);
   } else if (strcmp(interface,
                  zwlr_foreign_toplevel_manager_v1_interface.name) == 0) {
-    display->foreign_toplevel_manager = wl_registry_bind(registry, name,
-        &zwlr_foreign_toplevel_manager_v1_interface, version_min(version, 3));
+    /* Recorded, not bound -- see saber_display_take_foreign_toplevels. */
+    display->foreign_toplevel_global = name;
+    display->foreign_toplevel_version = version_min(version, 3);
+    display->foreign_toplevel_advertised = true;
   } else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
     display->data_device_manager = wl_registry_bind(registry, name,
         &wl_data_device_manager_interface, version_min(version, 3));
@@ -963,6 +1051,10 @@ saber_display_set_keyboard_listener(struct saber_display *display,
 {
   display->keyboard_listener = listener;
   display->keyboard_data = data;
+
+  /* Replay the keymap the seat already sent, so registration order does not
+  decide whether this listener knows the user's layout. */
+  keymap_deliver(display);
 }
 
 void
@@ -1002,6 +1094,33 @@ saber_display_find_output(struct saber_display *display, const char *name)
   }
 
   return NULL;
+}
+
+static void
+foreign_toplevels_bind(struct saber_display *display)
+{
+  if (display->foreign_toplevel_manager != NULL ||
+      !display->foreign_toplevel_advertised) {
+    return;
+  }
+
+  display->foreign_toplevel_manager = wl_registry_bind(display->registry,
+      display->foreign_toplevel_global,
+      &zwlr_foreign_toplevel_manager_v1_interface,
+      display->foreign_toplevel_version);
+}
+
+struct zwlr_foreign_toplevel_manager_v1 *
+saber_display_take_foreign_toplevels(struct saber_display *display)
+{
+  foreign_toplevels_bind(display);
+
+  struct zwlr_foreign_toplevel_manager_v1 *manager =
+      display->foreign_toplevel_manager;
+
+  display->foreign_toplevel_manager = NULL;
+
+  return manager;
 }
 
 void
@@ -1049,6 +1168,14 @@ saber_display_create(const char *name)
 
   cursor_init(display);
 
+  /* Action purpose: LAST, and it must stay last. The compositor answers this
+  bind with one `toplevel` event per window that is already open; binding it
+  above, with a round trip still to come, dispatches that burst into nothing.
+  Bound here it cannot be delivered until the caller pumps the connection,
+  which is after saber_display_take_foreign_toplevels has handed the proxy to
+  a listener. Nothing may dispatch, round-trip or run the main loop below. */
+  foreign_toplevels_bind(display);
+
   return display;
 }
 
@@ -1075,6 +1202,7 @@ saber_display_destroy(struct saber_display *display)
     wl_cursor_theme_destroy(display->cursor_theme);
   }
 
+  g_free(display->keymap_data);
   g_free(display->cursor_theme_name);
   g_free(display->cursor_name);
 
@@ -1092,6 +1220,11 @@ saber_display_destroy(struct saber_display *display)
 
   if (display->data_device_manager != NULL) {
     wl_data_device_manager_destroy(display->data_device_manager);
+  }
+
+  /* Only ever non-NULL when nothing took it; the taker owns it otherwise. */
+  if (display->foreign_toplevel_manager != NULL) {
+    zwlr_foreign_toplevel_manager_v1_destroy(display->foreign_toplevel_manager);
   }
 
   if (display->activation != NULL) {

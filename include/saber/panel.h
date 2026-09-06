@@ -11,6 +11,7 @@ event to the right column is this module's job, not the caller's. */
 
 #include <stdbool.h>
 
+#include <saber/appinfo.h>
 #include <saber/config.h>
 #include <saber/devices.h>
 #include <saber/display.h>
@@ -36,9 +37,39 @@ struct saber_panel_deps {
   struct saber_trash *trash;
   struct saber_devices *devices;
   struct saber_sni *sni;
+  /* Only for resolving the desktop entry registered against inode/directory,
+  when neither $FILEMANAGER nor xdg-open answers. NULL costs that last resort
+  and nothing else. */
+  struct saber_appinfo_index *index;
 };
 
 struct saber_panels;
+
+/* Function purpose: The spread's toggle, injected rather than linked, because
+the spread is behind WITH_SPREAD and a column must still work without it. The
+signature is saber_spread_toggle's, so the application can pass one straight
+through. `output` is the one whose tile was clicked; `app_id` NULL would mean
+an unfiltered spread, which the panel never asks for. While this is unset a
+tile with several windows cycles through them instead. */
+typedef void (*saber_panel_spread_func)(const char *app_id,
+    struct saber_output *output,
+    void *user);
+
+void
+saber_panels_set_spread(struct saber_panels *panels,
+    saber_panel_spread_func func,
+    void *user);
+
+/* Function purpose: What the BFB opens. Same injection shape as the spread and
+for the same reason -- the Dash is a separate surface with its own module, and
+routing through a hook keeps the column working under WITH_DASH=NO. The BFB is
+inert while this is unset. */
+typedef void (*saber_panel_dash_func)(struct saber_output *output, void *user);
+
+void
+saber_panels_set_dash(struct saber_panels *panels,
+    saber_panel_dash_func func,
+    void *user);
 
 /* Function purpose: Create a column on every output the configuration selects,
 and keep doing so as outputs come and go. Registers the display's output and

@@ -47,28 +47,31 @@ ETC_PREFIX ?= ${PREFIX}
 # before they are written would break the build for anyone who checks out an
 # intermediate commit, which is the whole reason the phases are separate.
 OBJS = \
+	anim.o \
 	appinfo.o \
 	buffer.o \
 	config.o \
-	devices.o \
+	dash.o \
 	dbusmenu.o \
+	devices.o \
+	display.o \
+	dnd.o \
+	ipc.o \
+	main.o \
 	match.o \
-	anim.o \
 	model.o \
 	panel.o \
 	quicklist.o \
 	render.o \
-	sni.o \
-	unity.o \
-	display.o \
-	ipc.o \
-	main.o \
 	session.o \
 	sheets.o \
+	sni.o \
+	spread.o \
 	surface.o \
 	theme.o \
 	toplevel.o \
-	trash.o
+	trash.o \
+	unity.o
 
 # [COMMENT] Action purpose: saberctl(1) is a second binary, not a mode of the
 # first, and links NOTHING but libc. It runs on every bound keypress (D-008),

@@ -41,6 +41,13 @@ struct saber_surface_listener {
       int width,
       int height);
 
+  /* Function purpose: The compositor finished a frame and `time` is the
+  timestamp it paced it with, in the same millisecond domain as the input
+  events. Animation must advance on this and on nothing else -- a timer runs
+  ahead of the refresh and stutters. Calling saber_surface_damage from here
+  keeps the loop turning; returning without it lets it stop. */
+  void (*frame)(void *data, uint32_t time);
+
   /* The compositor withdrew the surface -- output gone, or session ending.
   The surface must be destroyed; it cannot be reused. */
   void (*closed)(void *data, struct saber_surface *surface);

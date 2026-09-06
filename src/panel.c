@@ -5,14 +5,27 @@ The panel set owns the display's single pointer and output listeners and routes
 each event to the column whose surface received it, because the display layer
 deliberately has room for only one of each. */
 
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
+#include <unistd.h>
+
+#include <sys/wait.h>
+
+#include <dev/evdev/input-event-codes.h>
 
 #include <glib.h>
+#include <pango/pangocairo.h>
+
+#include "xdg-activation-v1-protocol.h"
 
 #include <saber/anim.h>
 #include <saber/appinfo.h>
 #include <saber/panel.h>
+#include <saber/quicklist.h>
+#include <saber/session.h>
 #include <saber/surface.h>
 
 /* linux/input-event-codes.h is a Linux header; the three button codes the
@@ -29,6 +42,18 @@ through a compatibility shim. */
 #define SABER_THROB_DEPTH 0.12
 #define SABER_WIGGLE_PIXELS 3.0
 #define SABER_SEPARATOR_GAP 8.0
+#define SABER_TOKEN_TIMEOUT_MS 1000
+
+/* The sheet grid, in logical pixels: one wide cell for sheet 0 over a three by
+three block for 1-9. */
+#define SABER_GRID_PAD 10
+#define SABER_GRID_GAP 6
+#define SABER_GRID_CELL_W 44
+#define SABER_GRID_CELL_H 40
+#define SABER_GRID_ZERO_H 32
+#define SABER_GRID_COLUMNS 3
+#define SABER_GRID_FONT "Sans Bold 13"
+#define SABER_GRID_SMALL_FONT "Sans 8"
 
 /* `sub` selects one device or one tray item within the single model entry that
 stands for the whole zone; -1 means the entry itself. */
@@ -67,11 +92,60 @@ struct saber_panel {
   double pointer_x, pointer_y;
 };
 
+/* Which tile a quicklist was opened from. The menu's callbacks run after the
+menu itself is gone, so they cannot read anything off it. */
+enum saber_menu_kind {
+  SABER_MENU_APP,
+  SABER_MENU_SESSION,
+  SABER_MENU_TRASH,
+  SABER_MENU_TRAY,
+};
+
+struct saber_menu {
+  struct saber_panels *set;
+  enum saber_menu_kind kind;
+  char *id; /* the model item's id, for an application menu */
+};
+
+/* Resolved on first use and kept. `warned` is what keeps a system with no way
+to open a directory from logging on every click. */
+struct saber_filemanager {
+  char **argv;               /* NULL-terminated; the path is appended */
+  struct saber_appinfo *app; /* held ref, when the index answered */
+  bool resolved, warned;
+};
+
+/* A launch parked until its xdg_activation token arrives. */
+struct saber_launch {
+  struct saber_panels *set;
+  struct xdg_activation_token_v1 *token;
+  struct saber_appinfo *app;
+  char *id;
+  guint timeout;
+};
+
+struct saber_sheet_grid;
+
 struct saber_panels {
   struct saber_panel_deps deps;
   struct saber_render render;
   GPtrArray *list;
   struct saber_panel *pointer_panel;
+
+  /* Action purpose: One popup at a time. A second would strand the first's
+  grab and its listener swap, and stacking popups out of order is what
+  xdg_wm_base.not_the_topmost_popup disconnects a client for. */
+  struct saber_quicklist *menu;
+  struct saber_menu *menu_ctx;
+  struct saber_sheet_grid *grid;
+
+  struct saber_filemanager filemanager;
+  GPtrArray *launches; /* struct saber_launch * */
+
+  saber_panel_spread_func spread;
+  void *spread_user;
+  saber_panel_dash_func dash;
+  void *dash_user;
 };
 
 static void
@@ -82,6 +156,15 @@ panel_layout(struct saber_panel *panel);
 
 static void
 panel_sync_anim(struct saber_panel *panel);
+
+static void
+panel_set_hover(struct saber_panel *panel, int slot);
+
+static int
+panel_slot_at(const struct saber_panel *panel, double x, double y);
+
+static void
+sheet_grid_close(struct saber_sheet_grid *grid);
 
 /* ------------------------------------------------------------- animation */
 
@@ -736,6 +819,68 @@ window_raise(struct saber_toplevel *toplevel)
   saber_toplevel_activate(toplevel);
 }
 
+/* ------------------------------------------------------- launch with a token */
+
+static void
+launch_free(gpointer data)
+{
+  struct saber_launch *launch = data;
+
+  if (launch->timeout != 0) {
+    g_source_remove(launch->timeout);
+  }
+
+  if (launch->token != NULL) {
+    xdg_activation_token_v1_destroy(launch->token);
+  }
+
+  saber_appinfo_unref(launch->app);
+  g_free(launch->id);
+  g_free(launch);
+}
+
+static void
+launch_finish(struct saber_launch *launch, const char *token)
+{
+  struct saber_panels *set = launch->set;
+
+  if (saber_appinfo_launch(launch->app, NULL, NULL, token)) {
+    saber_model_note_launch(set->deps.model, launch->id);
+  } else {
+    g_warning("saber: failed to launch '%s'", launch->id);
+  }
+
+  g_ptr_array_remove_fast(set->launches, launch);
+}
+
+static void
+launch_token_done(void *data,
+    struct xdg_activation_token_v1 *token,
+    const char *string)
+{
+  (void)token;
+
+  launch_finish(data, string);
+}
+
+static const struct xdg_activation_token_v1_listener launch_token_listener = {
+  .done = launch_token_done,
+};
+
+/* Action purpose: A compositor that binds xdg_activation_v1 but never answers
+would otherwise swallow the launch entirely. The application then starts with
+no token, which costs it the focus and nothing else. */
+static gboolean
+launch_token_timeout(gpointer data)
+{
+  struct saber_launch *launch = data;
+
+  launch->timeout = 0;
+  launch_finish(launch, NULL);
+
+  return G_SOURCE_REMOVE;
+}
+
 static void
 panel_launch(struct saber_panels *set, struct saber_item *item)
 {
@@ -745,15 +890,1044 @@ panel_launch(struct saber_panels *set, struct saber_item *item)
     return;
   }
 
-  /* TODO: request an xdg_activation token first and hand it to the child, so
-  the compositor gives the new window focus rather than marking it urgent. */
-  if (!saber_appinfo_launch(item->app, NULL, NULL, NULL)) {
-    g_warning("saber: failed to launch '%s'", item->id);
+  struct saber_display *display = set->deps.display;
+
+  if (display->activation == NULL) {
+    if (!saber_appinfo_launch(item->app, NULL, NULL, NULL)) {
+      g_warning("saber: failed to launch '%s'", item->id);
+
+      return;
+    }
+
+    saber_model_note_launch(set->deps.model, item->id);
 
     return;
   }
 
-  saber_model_note_launch(set->deps.model, item->id);
+  /* Action purpose: The token is issued asynchronously, so the launch waits
+  for it: XDG_ACTIVATION_TOKEN in the child's environment is the only thing
+  that lets the new window raise itself instead of arriving urgent. The click's
+  serial is what the compositor validates the request against. */
+  struct saber_launch *launch = g_new0(struct saber_launch, 1);
+
+  launch->set = set;
+  launch->app = saber_appinfo_ref(item->app);
+  launch->id = g_strdup(item->id);
+  launch->token = xdg_activation_v1_get_activation_token(display->activation);
+
+  xdg_activation_token_v1_add_listener(launch->token, &launch_token_listener,
+      launch);
+
+  if (display->seat != NULL) {
+    xdg_activation_token_v1_set_serial(launch->token,
+        display->pointer_enter_serial, display->seat);
+  }
+
+  if (set->pointer_panel != NULL && set->pointer_panel->surface != NULL) {
+    xdg_activation_token_v1_set_surface(launch->token,
+        set->pointer_panel->surface->wl_surface);
+  }
+
+  if (item->id != NULL) {
+    xdg_activation_token_v1_set_app_id(launch->token, item->id);
+  }
+
+  xdg_activation_token_v1_commit(launch->token);
+  launch->timeout =
+      g_timeout_add(SABER_TOKEN_TIMEOUT_MS, launch_token_timeout, launch);
+
+  g_ptr_array_add(set->launches, launch);
+  saber_display_flush(display);
+}
+
+/* ------------------------------------------------------------ file manager */
+
+/* Function purpose: The desktop entry registered as the default for
+inode/directory, read from the mimeapps.list files in XDG order. The panel's own
+index is asked rather than GIO's, so a folder opens in the same application the
+launcher would show. Borrowed. */
+static struct saber_appinfo *
+filemanager_from_index(struct saber_panels *set)
+{
+  if (set->deps.index == NULL) {
+    return NULL;
+  }
+
+  GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+
+  g_ptr_array_add(paths,
+      g_build_filename(g_get_user_config_dir(), "mimeapps.list", NULL));
+
+  for (const char *const *dir = g_get_system_config_dirs(); *dir != NULL;
+      dir++) {
+    g_ptr_array_add(paths, g_build_filename(*dir, "mimeapps.list", NULL));
+  }
+
+  g_ptr_array_add(paths, g_build_filename(g_get_user_data_dir(), "applications",
+                             "mimeapps.list", NULL));
+
+  for (const char *const *dir = g_get_system_data_dirs(); *dir != NULL; dir++) {
+    g_ptr_array_add(paths,
+        g_build_filename(*dir, "applications", "mimeapps.list", NULL));
+  }
+
+  struct saber_appinfo *app = NULL;
+
+  for (guint i = 0; app == NULL && i < paths->len; i++) {
+    GKeyFile *file = g_key_file_new();
+
+    if (g_key_file_load_from_file(file, g_ptr_array_index(paths, i),
+            G_KEY_FILE_NONE, NULL)) {
+      char **ids = g_key_file_get_string_list(file, "Default Applications",
+          "inode/directory", NULL, NULL);
+
+      for (guint n = 0; ids != NULL && ids[n] != NULL && app == NULL; n++) {
+        app = saber_appinfo_index_lookup(set->deps.index, ids[n]);
+      }
+
+      g_strfreev(ids);
+    }
+
+    g_key_file_free(file);
+  }
+
+  g_ptr_array_unref(paths);
+
+  return app;
+}
+
+/* Function purpose: Whatever can open a directory on this system, worked out
+once and kept. $FILEMANAGER is the user's explicit answer and wins, xdg-open is
+the portable one, and the inode/directory handler is the last resort. Nothing
+is guessed by name: a tile that shells out to a browser nobody installed is
+worse than one that says it cannot. */
+static void
+filemanager_resolve(struct saber_panels *set)
+{
+  struct saber_filemanager *fm = &set->filemanager;
+
+  if (fm->resolved) {
+    return;
+  }
+
+  fm->resolved = true;
+
+  const char *env = g_getenv("FILEMANAGER");
+  char **argv = NULL;
+
+  if (env != NULL && *env != '\0' &&
+      g_shell_parse_argv(env, NULL, &argv, NULL)) {
+    char *program = g_find_program_in_path(argv[0]);
+
+    if (program != NULL) {
+      g_free(argv[0]);
+      argv[0] = program;
+      fm->argv = argv;
+
+      return;
+    }
+
+    g_warning("saber: FILEMANAGER names '%s', which is not on PATH", argv[0]);
+    g_strfreev(argv);
+  }
+
+  char *program = g_find_program_in_path("xdg-open");
+
+  if (program != NULL) {
+    fm->argv = g_new0(char *, 2);
+    fm->argv[0] = program;
+
+    return;
+  }
+
+  fm->app = saber_appinfo_ref(filemanager_from_index(set));
+}
+
+/* Function purpose: fork/exec an argv the panel assembled itself -- never a
+shell, so a mount point with a space in its name cannot become two arguments.
+Double forked, so the grandchild reparents to init and the panel never has to
+reap anything under a main loop that knows nothing about it. */
+static bool
+panel_spawn(char *const *argv)
+{
+  pid_t outer = fork();
+
+  if (outer < 0) {
+    g_warning("saber: fork: %s", g_strerror(errno));
+
+    return false;
+  }
+
+  if (outer == 0) {
+    setsid();
+
+    if (fork() == 0) {
+      int null = open("/dev/null", O_RDWR);
+
+      if (null >= 0) {
+        dup2(null, STDIN_FILENO);
+        dup2(null, STDOUT_FILENO);
+        dup2(null, STDERR_FILENO);
+
+        if (null > STDERR_FILENO) {
+          close(null);
+        }
+      }
+
+      execv(argv[0], argv);
+      _exit(127);
+    }
+
+    _exit(0);
+  }
+
+  int status = 0;
+
+  while (waitpid(outer, &status, 0) < 0 && errno == EINTR) {
+    continue;
+  }
+
+  return true;
+}
+
+static void
+panel_open_path(struct saber_panels *set, const char *path)
+{
+  if (path == NULL || *path == '\0') {
+    return;
+  }
+
+  filemanager_resolve(set);
+
+  struct saber_filemanager *fm = &set->filemanager;
+
+  if (fm->argv != NULL) {
+    guint length = g_strv_length(fm->argv);
+    char **argv = g_new0(char *, length + 2);
+
+    /* Shallow: every string still belongs to fm->argv or to the caller. */
+    for (guint i = 0; i < length; i++) {
+      argv[i] = fm->argv[i];
+    }
+
+    argv[length] = (char *)path;
+    panel_spawn(argv);
+    g_free(argv);
+
+    return;
+  }
+
+  if (fm->app != NULL) {
+    char *uri = g_filename_to_uri(path, NULL, NULL);
+    const char *uris[] = { uri != NULL ? uri : path, NULL };
+
+    saber_appinfo_launch(fm->app, NULL, uris, NULL);
+    g_free(uri);
+
+    return;
+  }
+
+  if (!fm->warned) {
+    fm->warned = true;
+    g_warning("saber: nothing can open a directory here -- set FILEMANAGER, "
+              "install xdg-open, or register a handler for inode/directory");
+  }
+}
+
+/* -------------------------------------------------------------- quicklists */
+
+/* Action purpose: A quicklist's window rows are a labelled list of opaque
+handles reported through one callback, which is exactly the shape a menu the
+panel composes itself needs. The session and trash entries ride in there rather
+than growing a second menu widget; the handle is the entry's tag plus one, plus
+one only so that no handle is NULL. */
+#define SABER_MENU_TAG(n) ((void *)(uintptr_t)((n) + 1))
+#define SABER_MENU_UNTAG(p) ((int)(uintptr_t)(p) - 1)
+
+enum saber_trash_entry {
+  SABER_TRASH_OPEN,
+  SABER_TRASH_EMPTY,
+};
+
+static void
+panel_close_menu(struct saber_panels *set)
+{
+  if (set->menu != NULL) {
+    saber_quicklist_close(set->menu);
+  }
+
+  sheet_grid_close(set->grid);
+}
+
+static void
+menu_closed(void *user)
+{
+  struct saber_menu *menu = user;
+  struct saber_panels *set = menu->set;
+
+  set->menu = NULL;
+
+  /* Action purpose: The context is deliberately NOT freed here. quicklist.c
+  reports the close before it reports the activation that caused it, and the
+  handlers below still need it; the next menu to open frees it instead.
+
+  The panel saw no pointer events while the menu held the seat, so its idea of
+  what is hovered is as old as the click that opened the menu. */
+  struct saber_panel *panel = set->pointer_panel;
+
+  if (panel != NULL) {
+    panel_set_hover(panel,
+        panel_slot_at(panel, panel->pointer_x, panel->pointer_y));
+  }
+}
+
+static void
+menu_action(void *user, enum saber_quicklist_action action)
+{
+  struct saber_menu *menu = user;
+  struct saber_panels *set = menu->set;
+
+  if (menu->kind != SABER_MENU_APP || menu->id == NULL) {
+    return;
+  }
+
+  switch (action) {
+  case SABER_QUICKLIST_PIN:
+    if (saber_model_pin(set->deps.model, menu->id)) {
+      saber_model_save(set->deps.model);
+      saber_panels_refresh(set);
+    }
+    break;
+
+  case SABER_QUICKLIST_UNPIN:
+    if (saber_model_unpin(set->deps.model, menu->id)) {
+      saber_model_save(set->deps.model);
+      saber_panels_refresh(set);
+    }
+    break;
+
+  case SABER_QUICKLIST_QUIT: {
+    struct saber_item *item = saber_model_find(set->deps.model, menu->id);
+
+    /* Every window, because the row says Quit and not Close: an application
+    showing three windows is not quit by closing one of them. */
+    for (guint i = 0; item != NULL && i < (guint)saber_item_window_count(item);
+        i++) {
+      saber_toplevel_close(g_ptr_array_index(item->windows, i));
+    }
+    break;
+  }
+  }
+}
+
+static void
+menu_window(void *user, void *handle)
+{
+  struct saber_menu *menu = user;
+  struct saber_panels *set = menu->set;
+  GError *error = NULL;
+
+  switch (menu->kind) {
+  case SABER_MENU_APP:
+    window_raise(handle);
+    break;
+
+  case SABER_MENU_SESSION: {
+    int tag = SABER_MENU_UNTAG(handle);
+
+    /* Anything outside the enum is the dismiss row. */
+    if (tag < 0 || tag >= SABER_SESSION_ACTION_COUNT) {
+      break;
+    }
+
+    if (!saber_session_run(set->deps.config, tag, &error)) {
+      g_warning("saber: %s: %s", saber_session_action_id(tag),
+          error != NULL ? error->message : "failed");
+    }
+    break;
+  }
+
+  case SABER_MENU_TRASH:
+    if (SABER_MENU_UNTAG(handle) == SABER_TRASH_OPEN) {
+      panel_open_path(set, saber_trash_path(set->deps.trash));
+      break;
+    }
+
+    if (!saber_trash_empty(set->deps.trash, &error)) {
+      g_warning("saber: cannot empty the trash: %s",
+          error != NULL ? error->message : "failed");
+    }
+    break;
+
+  case SABER_MENU_TRAY:
+    break;
+  }
+
+  g_clear_error(&error);
+}
+
+static const struct saber_quicklist_handlers panel_menu_handlers = {
+  .action = menu_action,
+  .window = menu_window,
+  .closed = menu_closed,
+};
+
+/* Function purpose: Everything a menu on this tile shares -- the parent
+surface, the edge it grows away from, the palette, and the tile rectangle it
+hangs off -- so each caller supplies only its own contents. */
+static void
+panel_menu_params(struct saber_panel *panel,
+    const struct saber_slot *slot,
+    struct saber_quicklist_params *params)
+{
+  saber_quicklist_params_init(params);
+
+  params->parent = panel->surface;
+  params->edge = panel->set->deps.config->panel.edge;
+  params->theme = panel->set->deps.theme;
+  params->anchor_x = 0;
+  params->anchor_y = (int32_t)slot->y;
+  params->anchor_width = (int32_t)panel->width;
+  params->anchor_height = (int32_t)slot->height;
+}
+
+static struct saber_menu *
+panel_menu_context(struct saber_panels *set,
+    enum saber_menu_kind kind,
+    const char *id)
+{
+  if (set->menu_ctx != NULL) {
+    g_free(set->menu_ctx->id);
+    g_free(set->menu_ctx);
+  }
+
+  struct saber_menu *menu = g_new0(struct saber_menu, 1);
+
+  menu->set = set;
+  menu->kind = kind;
+  menu->id = g_strdup(id);
+  set->menu_ctx = menu;
+
+  return menu;
+}
+
+static void
+panel_open_app_menu(struct saber_panel *panel,
+    const struct saber_slot *slot,
+    struct saber_item *item)
+{
+  struct saber_panels *set = panel->set;
+  size_t count = saber_item_window_count(item);
+  struct saber_quicklist_window *windows =
+      count > 0 ? g_new0(struct saber_quicklist_window, count) : NULL;
+
+  for (size_t i = 0; i < count; i++) {
+    struct saber_toplevel *toplevel = g_ptr_array_index(item->windows, i);
+
+    windows[i].title = toplevel->title;
+    windows[i].handle = toplevel;
+  }
+
+  struct saber_quicklist_params params;
+
+  panel_menu_params(panel, slot, &params);
+  params.app = item->app;
+  params.windows = windows;
+  params.windows_len = count;
+  params.pinned = item->pinned;
+  params.running = count > 0;
+  params.offer_pin = true;
+
+  panel_close_menu(set);
+  set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
+      panel_menu_context(set, SABER_MENU_APP, item->id));
+
+  g_free(windows);
+}
+
+static void
+panel_open_tray_menu(struct saber_panel *panel,
+    const struct saber_slot *slot,
+    struct saber_sni_item *entry)
+{
+  struct saber_panels *set = panel->set;
+  struct saber_quicklist_params params;
+
+  panel_menu_params(panel, slot, &params);
+  params.menu_bus_name = saber_sni_item_bus_name(entry);
+  params.menu_object_path = saber_sni_item_menu_path(entry);
+
+  panel_close_menu(set);
+  set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
+      panel_menu_context(set, SABER_MENU_TRAY, NULL));
+
+  /* The item published nothing drawable. ContextMenu is then the only thing
+  left to ask, and most items answer it by doing nothing. */
+  if (set->menu == NULL) {
+    saber_sni_item_context_menu(entry, (int)panel->pointer_x,
+        (int)panel->pointer_y);
+  }
+}
+
+/* Function purpose: The session menu. D-013: an action this user cannot
+perform is ABSENT, never greyed out -- somebody outside the operator group sees
+a menu with no power entries at all rather than three dead ones. */
+static void
+panel_open_session_menu(struct saber_panel *panel,
+    const struct saber_slot *slot)
+{
+  static const enum saber_session_action order[] = {
+    SABER_SESSION_LOCK,
+    SABER_SESSION_LOGOUT,
+    SABER_SESSION_SUSPEND,
+    SABER_SESSION_REBOOT,
+    SABER_SESSION_POWEROFF,
+  };
+
+  struct saber_panels *set = panel->set;
+  struct saber_quicklist_window entries[G_N_ELEMENTS(order) + 1];
+  size_t count = 0;
+
+  for (size_t i = 0; i < G_N_ELEMENTS(order); i++) {
+    if (!saber_session_available(set->deps.config, order[i])) {
+      continue;
+    }
+
+    entries[count].title = saber_session_action_label(order[i]);
+    entries[count].handle = SABER_MENU_TAG(order[i]);
+    count++;
+  }
+
+  if (count == 0) {
+    g_message("saber: no session action is available to this user");
+
+    return;
+  }
+
+  /* The ordinary escape from a power menu, and it is also what keeps a menu
+  down to a single available action from being one the widget declines to
+  draw. */
+  entries[count].title = "Cancel";
+  entries[count].handle = SABER_MENU_TAG(SABER_SESSION_ACTION_COUNT);
+  count++;
+
+  struct saber_quicklist_params params;
+
+  panel_menu_params(panel, slot, &params);
+  params.windows = entries;
+  params.windows_len = count;
+
+  panel_close_menu(set);
+  set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
+      panel_menu_context(set, SABER_MENU_SESSION, NULL));
+}
+
+static void
+panel_open_trash_menu(struct saber_panel *panel, const struct saber_slot *slot)
+{
+  struct saber_panels *set = panel->set;
+  struct saber_quicklist_window entries[] = {
+    { .title = "Open Trash", .handle = SABER_MENU_TAG(SABER_TRASH_OPEN) },
+    { .title = "Empty Trash", .handle = SABER_MENU_TAG(SABER_TRASH_EMPTY) },
+  };
+
+  struct saber_quicklist_params params;
+
+  panel_menu_params(panel, slot, &params);
+  params.windows = entries;
+  params.windows_len = G_N_ELEMENTS(entries);
+
+  panel_close_menu(set);
+  set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
+      panel_menu_context(set, SABER_MENU_TRASH, NULL));
+}
+
+/* -------------------------------------------------------------- sheet grid */
+
+/* Sheet 0 is not one of ten equal cells: its views stay visible underneath
+whichever sheet is being displayed. It gets a row of its own above the three by
+three block that holds 1-9, so the asymmetry is what the grid shows rather than
+something the user is expected to remember. */
+struct saber_sheet_grid {
+  struct saber_panels *set;
+  struct saber_panel *panel;
+  struct saber_popup *popup;
+
+  int counts[SABER_SHEET_COUNT];
+  int current;
+  int width, height;
+  int hovered, selected;
+
+  PangoFontDescription *font, *small_font;
+
+  const struct saber_pointer_listener *prev_pointer;
+  void *prev_pointer_data;
+  const struct saber_keyboard_listener *prev_keyboard;
+  void *prev_keyboard_data;
+
+  bool inside, pressed, closing, held, listening;
+};
+
+static void
+grid_cell(int sheet, double *x, double *y, double *width, double *height)
+{
+  if (sheet == 0) {
+    *x = SABER_GRID_PAD;
+    *y = SABER_GRID_PAD;
+    *width = SABER_GRID_COLUMNS * SABER_GRID_CELL_W +
+        (SABER_GRID_COLUMNS - 1) * SABER_GRID_GAP;
+    *height = SABER_GRID_ZERO_H;
+
+    return;
+  }
+
+  int column = (sheet - 1) % SABER_GRID_COLUMNS;
+  int row = (sheet - 1) / SABER_GRID_COLUMNS;
+
+  *x = SABER_GRID_PAD + column * (SABER_GRID_CELL_W + SABER_GRID_GAP);
+  *y = SABER_GRID_PAD + SABER_GRID_ZERO_H + SABER_GRID_GAP +
+      row * (SABER_GRID_CELL_H + SABER_GRID_GAP);
+  *width = SABER_GRID_CELL_W;
+  *height = SABER_GRID_CELL_H;
+}
+
+/* `y` is the text's vertical centre, which is what every caller here has. */
+static void
+grid_text(cairo_t *cr,
+    PangoFontDescription *font,
+    const char *text,
+    double x,
+    double y,
+    double width,
+    bool centre)
+{
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  int text_width = 0, text_height = 0;
+
+  pango_layout_set_font_description(layout, font);
+  pango_layout_set_text(layout, text, -1);
+  pango_layout_get_pixel_size(layout, &text_width, &text_height);
+
+  cairo_move_to(cr, centre ? x + (width - text_width) / 2.0 : x,
+      y - text_height / 2.0);
+  pango_cairo_show_layout(cr, layout);
+  g_object_unref(layout);
+}
+
+static void
+grid_render(void *data,
+    struct saber_popup *popup,
+    cairo_t *cr,
+    int width,
+    int height)
+{
+  (void)popup;
+
+  struct saber_sheet_grid *grid = data;
+  const struct saber_theme *theme = grid->set->deps.theme;
+
+  saber_theme_set_source(cr, &theme->background);
+  cairo_rectangle(cr, 0.0, 0.0, width, height);
+  cairo_fill(cr);
+
+  saber_theme_set_source(cr, &theme->dim);
+  cairo_set_line_width(cr, 1.0);
+  cairo_rectangle(cr, 0.5, 0.5, width - 1.0, height - 1.0);
+  cairo_stroke(cr);
+
+  for (int sheet = 0; sheet < SABER_SHEET_COUNT; sheet++) {
+    double x, y, w, h;
+
+    grid_cell(sheet, &x, &y, &w, &h);
+
+    int count = grid->counts[sheet];
+    bool marked = sheet == grid->hovered || sheet == grid->selected;
+    const struct saber_color *ink = &theme->dim;
+
+    if (sheet == grid->current) {
+      saber_theme_set_source(cr, &theme->accent);
+      cairo_rectangle(cr, x, y, w, h);
+      cairo_fill(cr);
+      ink = &theme->badge_fg;
+    } else if (count > 0) {
+      saber_theme_set_source(cr, &theme->backlight);
+      cairo_rectangle(cr, x, y, w, h);
+      cairo_fill(cr);
+      ink = &theme->foreground;
+    }
+
+    /* An empty sheet keeps its outline, so the grid still reads as ten places,
+    and keeps the dim ink, so it reads as an empty one. */
+    saber_theme_set_source(cr, marked ? &theme->accent : &theme->dim);
+    cairo_set_line_width(cr, marked ? 2.0 : 1.0);
+    cairo_rectangle(cr, x + 0.5, y + 0.5, w - 1.0, h - 1.0);
+    cairo_stroke(cr);
+
+    char label[8], badge[16];
+
+    g_snprintf(label, sizeof(label), "%d", sheet);
+    g_snprintf(badge, sizeof(badge), "%d", count);
+    saber_theme_set_source(cr, ink);
+
+    if (sheet == 0) {
+      grid_text(cr, grid->font, label, x + 10.0, y + h / 2.0, 0.0, false);
+      grid_text(cr, grid->small_font, "always visible", x + 28.0, y + h / 2.0,
+          0.0, false);
+
+      if (count > 0) {
+        grid_text(cr, grid->small_font, badge, x + w - 16.0, y + h / 2.0, 0.0,
+            false);
+      }
+
+      continue;
+    }
+
+    grid_text(cr, grid->font, label, x, y + h / 2.0 - (count > 0 ? 5.0 : 0.0),
+        w, true);
+
+    if (count > 0) {
+      grid_text(cr, grid->small_font, badge, x, y + h - 10.0, w, true);
+    }
+  }
+}
+
+static int
+grid_at(double px, double py)
+{
+  for (int sheet = 0; sheet < SABER_SHEET_COUNT; sheet++) {
+    double x, y, w, h;
+
+    grid_cell(sheet, &x, &y, &w, &h);
+
+    if (px >= x && px < x + w && py >= y && py < y + h) {
+      return sheet;
+    }
+  }
+
+  return -1;
+}
+
+static void
+grid_hover(struct saber_sheet_grid *grid, double x, double y)
+{
+  int sheet = grid_at(x, y);
+
+  if (sheet == grid->hovered) {
+    return;
+  }
+
+  grid->hovered = sheet;
+  grid->selected = sheet;
+  saber_popup_damage(grid->popup);
+}
+
+/* The grid is torn down before the switch is asked for: closing frees it, and
+the socket answers on its own schedule. */
+static void
+grid_activate(struct saber_sheet_grid *grid, int sheet)
+{
+  struct saber_sheets *sheets = grid->set->deps.sheets;
+
+  if (sheet < 0 || sheet >= SABER_SHEET_COUNT) {
+    return;
+  }
+
+  sheet_grid_close(grid);
+  saber_sheets_switch(sheets, sheet, NULL, NULL);
+}
+
+static void
+grid_pointer_enter(void *data, struct wl_surface *surface, double x, double y)
+{
+  struct saber_sheet_grid *grid = data;
+
+  grid->inside = grid->popup != NULL && surface == grid->popup->wl_surface;
+
+  if (grid->inside) {
+    grid_hover(grid, x, y);
+  }
+}
+
+static void
+grid_pointer_leave(void *data, struct wl_surface *surface)
+{
+  struct saber_sheet_grid *grid = data;
+
+  if (grid->popup == NULL || surface != grid->popup->wl_surface) {
+    return;
+  }
+
+  grid->inside = false;
+  grid->hovered = -1;
+  saber_popup_damage(grid->popup);
+}
+
+static void
+grid_pointer_motion(void *data, uint32_t time, double x, double y)
+{
+  (void)time;
+
+  struct saber_sheet_grid *grid = data;
+
+  if (grid->inside) {
+    grid_hover(grid, x, y);
+  }
+}
+
+static void
+grid_pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
+{
+  (void)time;
+
+  struct saber_sheet_grid *grid = data;
+
+  if (button != BTN_LEFT) {
+    return;
+  }
+
+  /* Action purpose: The press that opened the grid is often still in flight
+  when the popup maps, so a bare release cannot be trusted -- a pick needs a
+  press inside the grid first. */
+  if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (!grid->inside) {
+      sheet_grid_close(grid);
+
+      return;
+    }
+
+    grid->pressed = true;
+
+    return;
+  }
+
+  if (!grid->pressed) {
+    return;
+  }
+
+  grid->pressed = false;
+
+  if (!grid->inside) {
+    sheet_grid_close(grid);
+
+    return;
+  }
+
+  grid_activate(grid, grid->hovered);
+}
+
+static void
+grid_move(struct saber_sheet_grid *grid, int delta)
+{
+  int next = grid->selected < 0 ? (delta > 0 ? 0 : SABER_SHEET_COUNT - 1)
+                                : grid->selected + delta;
+
+  if (next < 0 || next >= SABER_SHEET_COUNT || next == grid->selected) {
+    return;
+  }
+
+  grid->selected = next;
+  grid->hovered = -1;
+  saber_popup_damage(grid->popup);
+}
+
+static void
+grid_key(void *data, uint32_t time, uint32_t key, uint32_t state)
+{
+  (void)time;
+
+  struct saber_sheet_grid *grid = data;
+
+  if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
+    return;
+  }
+
+  /* Action purpose: Wayland carries evdev keycodes, and every key that drives
+  a grid of numbers sits at a fixed physical position -- so these need no xkb
+  keymap, and none of them can be missing at the moment the grid opens. */
+  switch (key) {
+  case KEY_ESC:
+    sheet_grid_close(grid);
+    break;
+
+  case KEY_LEFT:
+    grid_move(grid, -1);
+    break;
+
+  case KEY_RIGHT:
+    grid_move(grid, 1);
+    break;
+
+  case KEY_UP:
+    grid_move(grid,
+        grid->selected > SABER_GRID_COLUMNS ? -SABER_GRID_COLUMNS : -1);
+    break;
+
+  case KEY_DOWN:
+    grid_move(grid, grid->selected == 0 ? 1 : SABER_GRID_COLUMNS);
+    break;
+
+  case KEY_ENTER:
+  case KEY_KPENTER:
+  case KEY_SPACE:
+    grid_activate(grid, grid->selected);
+    break;
+
+  case KEY_0:
+    grid_activate(grid, 0);
+    break;
+
+  default:
+    if (key >= KEY_1 && key <= KEY_9) {
+      grid_activate(grid, (int)(key - KEY_1) + 1);
+    }
+    break;
+  }
+}
+
+static void
+grid_configure(void *data, struct saber_popup *popup, int width, int height)
+{
+  (void)data;
+  (void)popup;
+  (void)width;
+  (void)height;
+}
+
+static void
+grid_done(void *data, struct saber_popup *popup)
+{
+  (void)popup;
+
+  sheet_grid_close(data);
+}
+
+static const struct saber_popup_listener grid_popup_listener = {
+  .configure = grid_configure,
+  .render = grid_render,
+  .done = grid_done,
+};
+
+static const struct saber_pointer_listener grid_pointer_listener = {
+  .enter = grid_pointer_enter,
+  .leave = grid_pointer_leave,
+  .motion = grid_pointer_motion,
+  .button = grid_pointer_button,
+};
+
+static const struct saber_keyboard_listener grid_keyboard_listener = {
+  .key = grid_key,
+};
+
+static void
+sheet_grid_close(struct saber_sheet_grid *grid)
+{
+  if (grid == NULL || grid->closing) {
+    return;
+  }
+
+  struct saber_panels *set = grid->set;
+
+  grid->closing = true;
+  set->grid = NULL;
+
+  saber_popup_destroy(grid->popup);
+
+  if (grid->held) {
+    saber_surface_hold_keyboard(grid->panel->surface, false);
+  }
+
+  if (grid->listening) {
+    saber_display_set_pointer_listener(set->deps.display, grid->prev_pointer,
+        grid->prev_pointer_data);
+    saber_display_set_keyboard_listener(set->deps.display, grid->prev_keyboard,
+        grid->prev_keyboard_data);
+  }
+
+  saber_display_flush(set->deps.display);
+
+  pango_font_description_free(grid->font);
+  pango_font_description_free(grid->small_font);
+
+  struct saber_panel *panel = set->pointer_panel;
+
+  if (panel != NULL) {
+    panel_set_hover(panel,
+        panel_slot_at(panel, panel->pointer_x, panel->pointer_y));
+  }
+
+  g_free(grid);
+}
+
+/* Function purpose: Pick a sheet rather than step to the next one. Stepping is
+what scroll already does, and nine of the ten sheets are unreachable that way
+without counting clicks. */
+static void
+panel_open_sheet_grid(struct saber_panel *panel, const struct saber_slot *slot)
+{
+  struct saber_panels *set = panel->set;
+  const struct saber_sheets_state *state =
+      saber_sheets_get_state(set->deps.sheets);
+
+  if (state == NULL) {
+    return;
+  }
+
+  panel_close_menu(set);
+
+  struct saber_sheet_grid *grid = g_new0(struct saber_sheet_grid, 1);
+
+  grid->set = set;
+  grid->panel = panel;
+  grid->current = state->current;
+  grid->hovered = -1;
+  grid->selected = state->current;
+  grid->font = pango_font_description_from_string(SABER_GRID_FONT);
+  grid->small_font = pango_font_description_from_string(SABER_GRID_SMALL_FONT);
+  grid->width = SABER_GRID_PAD * 2 + SABER_GRID_COLUMNS * SABER_GRID_CELL_W +
+      (SABER_GRID_COLUMNS - 1) * SABER_GRID_GAP;
+  grid->height = SABER_GRID_PAD * 2 + SABER_GRID_ZERO_H + SABER_GRID_GAP +
+      3 * SABER_GRID_CELL_H + 2 * SABER_GRID_GAP;
+
+  memcpy(grid->counts, state->counts, sizeof(grid->counts));
+  set->grid = grid;
+
+  struct saber_popup_params params;
+
+  saber_popup_menu_params(&params, set->deps.config->panel.edge, grid->width,
+      grid->height, 0, (int32_t)slot->y, (int32_t)panel->width,
+      (int32_t)slot->height);
+  params.grab = true;
+
+  /* Action purpose: Before the popup maps, not after -- a popup inherits the
+  keyboard interactivity its parent layer surface had at the time, so raising
+  it afterwards leaves a grid that is already on screen deaf. */
+  saber_surface_hold_keyboard(panel->surface, true);
+  grid->held = true;
+
+  grid->popup = saber_popup_create(panel->surface, &params,
+      &grid_popup_listener, grid);
+
+  if (grid->popup == NULL) {
+    sheet_grid_close(grid);
+
+    return;
+  }
+
+  /* Action purpose: The grid is modal and display.c holds one listener of each
+  kind. Taking both over for its lifetime and putting the previous pair back on
+  close is the only way to share them. */
+  grid->prev_pointer = set->deps.display->pointer_listener;
+  grid->prev_pointer_data = set->deps.display->pointer_data;
+  grid->prev_keyboard = set->deps.display->keyboard_listener;
+  grid->prev_keyboard_data = set->deps.display->keyboard_data;
+
+  saber_display_set_pointer_listener(set->deps.display, &grid_pointer_listener,
+      grid);
+  saber_display_set_keyboard_listener(set->deps.display,
+      &grid_keyboard_listener, grid);
+  grid->listening = true;
+
+  saber_display_flush(set->deps.display);
 }
 
 static void
@@ -774,8 +1948,9 @@ panel_cycle_windows(struct saber_item *item, int direction)
 }
 
 static void
-panel_click_app(struct saber_panels *set, struct saber_item *item)
+panel_click_app(struct saber_panel *panel, struct saber_item *item)
 {
+  struct saber_panels *set = panel->set;
   guint count = (guint)saber_item_window_count(item);
 
   if (count == 0) {
@@ -796,23 +1971,17 @@ panel_click_app(struct saber_panels *set, struct saber_item *item)
     return;
   }
 
-  /* TODO: spread, filtered to this application (BLUEPRINT.md 5.3). The spread
-  surface does not exist yet, so this cycles forward through the windows --
-  the same thing a second click on an already-focused tile would do in Unity
-  once the spread is dismissed. */
+  /* The spread, filtered to this application (BLUEPRINT.md 5.3). Until it is
+  wired in, this cycles forward through the windows -- the same thing a second
+  click on an already-focused tile would do in Unity once the spread has been
+  dismissed. */
+  if (set->spread != NULL) {
+    set->spread(item->id, panel->output, set->spread_user);
+
+    return;
+  }
+
   panel_cycle_windows(item, 1);
-}
-
-static void
-panel_click_sheet(struct saber_panels *set)
-{
-  const struct saber_sheets_state *state =
-      saber_sheets_get_state(set->deps.sheets);
-  int next = state != NULL ? (state->current + 1) % SABER_SHEET_COUNT : 1;
-
-  /* TODO: a sheet grid on click, so a sheet can be picked rather than stepped
-  through. Stepping is what scroll already does. */
-  saber_sheets_switch(set->deps.sheets, next, NULL, NULL);
 }
 
 static void
@@ -827,9 +1996,7 @@ panel_click_device(struct saber_panels *set, int sub, bool unmount)
   const struct saber_device *device = g_ptr_array_index(list, sub);
 
   if (!unmount) {
-    /* TODO: open the mount point. Saber has no file-manager binding yet, and
-    guessing one would produce a button that silently does nothing. */
-    g_message("saber: %s mounted at %s", device->device, device->mount_point);
+    panel_open_path(set, device->mount_point);
 
     return;
   }
@@ -846,10 +2013,15 @@ panel_click_device(struct saber_panels *set, int sub, bool unmount)
 }
 
 static void
-panel_click_tray(struct saber_panels *set, int sub, uint32_t button, int x, int y)
+panel_click_tray(struct saber_panel *panel,
+    const struct saber_slot *slot,
+    uint32_t button)
 {
+  struct saber_panels *set = panel->set;
   struct saber_sni_item *entry =
-      saber_sni_nth(set->deps.sni, (unsigned int)sub);
+      saber_sni_nth(set->deps.sni, (unsigned int)slot->sub);
+  int x = (int)panel->pointer_x;
+  int y = (int)panel->pointer_y;
 
   if (entry == NULL) {
     return;
@@ -860,14 +2032,19 @@ panel_click_tray(struct saber_panels *set, int sub, uint32_t button, int x, int 
     saber_sni_item_secondary_activate(entry, x, y);
     break;
 
-  /* TODO: render the item's DBusMenu ourselves (BLUEPRINT.md 5.4). Asking the
-  item for its context menu is the only thing available until the menu surface
-  exists, and most items answer it by doing nothing. */
+  /* Action purpose: The item's DBusMenu is drawn by the quicklist, in Saber's
+  own palette (BLUEPRINT.md 5.4). ItemIsMenu is advisory and is not the test;
+  saber_sni_item_has_menu is. */
   case SABER_BTN_RIGHT:
-    saber_sni_item_context_menu(entry, x, y);
+    panel_open_tray_menu(panel, slot, entry);
     break;
 
   default:
+    if (saber_sni_item_is_menu(entry) && saber_sni_item_has_menu(entry)) {
+      panel_open_tray_menu(panel, slot, entry);
+      break;
+    }
+
     saber_sni_item_activate(entry, x, y);
     break;
   }
@@ -894,15 +2071,15 @@ panel_activate_slot(struct saber_panel *panel, int index, uint32_t button)
     if (button == SABER_BTN_MIDDLE) {
       panel_launch(set, item);
     } else if (button == SABER_BTN_LEFT) {
-      panel_click_app(set, item);
+      panel_click_app(panel, item);
+    } else if (button == SABER_BTN_RIGHT) {
+      panel_open_app_menu(panel, slot, item);
     }
-    /* TODO: right click opens the quicklist -- the composition in
-    BLUEPRINT.md 5.4 -- which needs a menu surface Saber does not have yet. */
     break;
 
   case SABER_ITEM_SHEETS:
-    if (button == SABER_BTN_LEFT) {
-      panel_click_sheet(set);
+    if (button != SABER_BTN_MIDDLE) {
+      panel_open_sheet_grid(panel, slot);
     }
     break;
 
@@ -912,17 +2089,30 @@ panel_activate_slot(struct saber_panel *panel, int index, uint32_t button)
     }
     break;
 
-  case SABER_ITEM_TRAY:
-    panel_click_tray(set, slot->sub, button, (int)panel->pointer_x,
-        (int)panel->pointer_y);
+  case SABER_ITEM_TRASH:
+    if (button == SABER_BTN_RIGHT) {
+      panel_open_trash_menu(panel, slot);
+    } else if (button == SABER_BTN_LEFT) {
+      panel_open_path(set, saber_trash_path(set->deps.trash));
+    }
     break;
 
-  /* TODO: the BFB opens the Dash and the session tile opens the session menu.
-  Neither surface exists yet; both are deliberately inert rather than being
-  wired to something that half works. */
-  case SABER_ITEM_BFB:
-  case SABER_ITEM_TRASH:
+  case SABER_ITEM_TRAY:
+    panel_click_tray(panel, slot, button);
+    break;
+
   case SABER_ITEM_SESSION:
+    if (button != SABER_BTN_MIDDLE) {
+      panel_open_session_menu(panel, slot);
+    }
+    break;
+
+  case SABER_ITEM_BFB:
+    if (set->dash != NULL) {
+      set->dash(panel->output, set->dash_user);
+    }
+    break;
+
   default:
     break;
   }
@@ -1172,6 +2362,16 @@ panel_destroy(struct saber_panel *panel)
     return;
   }
 
+  /* A popup outlives its parent layer surface for exactly as long as it takes
+  the compositor to notice, which is a protocol error. */
+  if (panel->set->grid != NULL && panel->set->grid->panel == panel) {
+    sheet_grid_close(panel->set->grid);
+  }
+
+  if (panel->set->menu != NULL) {
+    saber_quicklist_close(panel->set->menu);
+  }
+
   if (panel->frame != NULL) {
     wl_callback_destroy(panel->frame);
   }
@@ -1268,6 +2468,7 @@ saber_panels_create(const struct saber_panel_deps *deps)
 
   panels->deps = *deps;
   panels->list = g_ptr_array_new();
+  panels->launches = g_ptr_array_new_with_free_func(launch_free);
 
   saber_render_init(&panels->render, deps->config, deps->theme, deps->icons);
 
@@ -1288,15 +2489,46 @@ saber_panels_destroy(struct saber_panels *panels)
     return;
   }
 
+  /* Before the listeners are dropped: closing a menu puts the panel's own pair
+  back, and doing that after they had been cleared would resurrect them. */
+  panel_close_menu(panels);
+
   saber_display_set_output_listener(panels->deps.display, NULL, NULL);
   saber_display_set_pointer_listener(panels->deps.display, NULL, NULL);
+  saber_display_set_keyboard_listener(panels->deps.display, NULL, NULL);
 
   for (guint i = 0; i < panels->list->len; i++) {
     panel_destroy(g_ptr_array_index(panels->list, i));
   }
 
+  if (panels->menu_ctx != NULL) {
+    g_free(panels->menu_ctx->id);
+    g_free(panels->menu_ctx);
+  }
+
+  g_ptr_array_free(panels->launches, TRUE);
+  g_strfreev(panels->filemanager.argv);
+  saber_appinfo_unref(panels->filemanager.app);
   g_ptr_array_free(panels->list, TRUE);
   g_free(panels);
+}
+
+void
+saber_panels_set_dash(struct saber_panels *panels,
+    saber_panel_dash_func func,
+    void *user)
+{
+  panels->dash = func;
+  panels->dash_user = user;
+}
+
+void
+saber_panels_set_spread(struct saber_panels *panels,
+    saber_panel_spread_func func,
+    void *user)
+{
+  panels->spread = func;
+  panels->spread_user = user;
 }
 
 void

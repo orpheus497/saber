@@ -80,11 +80,16 @@ struct saber_display {
   struct xdg_activation_v1 *activation;
   struct wl_data_device_manager *data_device_manager;
 
-  /* Bound here so all registry handling stays in one place, then OWNERSHIP
-  TRANSFERS to saber_toplevels_create(), which stops and destroys it. Do not
-  destroy it from saber_display_destroy() -- that is a double free. NULL on a
-  compositor that does not advertise it, which costs the window list only. */
+  /* Take this through saber_display_take_foreign_toplevels(), never by hand:
+  the field is cleared on the way out, and reading it directly is how a caller
+  ends up with a pointer another module has already destroyed. */
   struct zwlr_foreign_toplevel_manager_v1 *foreign_toplevel_manager;
+
+  /* The registry entry the manager is bound from, kept so the bind can happen
+  after the round trips rather than during them. */
+  uint32_t foreign_toplevel_global;
+  uint32_t foreign_toplevel_version;
+  bool foreign_toplevel_advertised;
 
   struct wl_list outputs; /* struct saber_output.link */
 
@@ -93,6 +98,12 @@ struct saber_display {
   uint32_t pointer_enter_serial;
   struct wl_surface *pointer_focus;
   struct wl_surface *keyboard_focus;
+
+  /* The keymap, cached so it can be replayed to a listener that registers
+  after the seat bound -- wl_keyboard.keymap fires only once. */
+  char *keymap_data;
+  size_t keymap_size;
+  uint32_t keymap_format;
 
   struct wl_cursor_theme *cursor_theme;
   struct wl_surface *cursor_surface;
@@ -162,6 +173,22 @@ saber_display_set_output_listener(struct saber_display *display,
 
 struct saber_output *
 saber_display_find_output(struct saber_display *display, const char *name);
+
+/* Function purpose: Hand the foreign-toplevel manager to whoever will listen on
+it, transferring ownership. NULL when the compositor does not advertise the
+protocol, and NULL on every call after the first.
+
+Action purpose: This exists because the compositor answers the bind by
+immediately sending one `toplevel` event per window that is already open. Bind
+the manager inside saber_display_create's round trips and that burst is
+dispatched before any listener exists, so every pre-existing window is lost and
+the column comes up empty -- silently, looking exactly like a compositor without
+the protocol. So the bind is deferred to the last statement of
+saber_display_create, after both round trips, and the proxy is handed out only
+through this call: the caller attaches its listener with no dispatch in between,
+and cannot take the same proxy twice. */
+struct zwlr_foreign_toplevel_manager_v1 *
+saber_display_take_foreign_toplevels(struct saber_display *display);
 
 /* Function purpose: Set the pointer image from the loaded theme. The compositor
 does not advertise wp_cursor_shape_v1, so this is the only route: the theme is

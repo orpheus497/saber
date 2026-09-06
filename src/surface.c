@@ -168,14 +168,20 @@ surface_buffer_released(void *data)
 static void
 surface_frame_done(void *data, struct wl_callback *callback, uint32_t time)
 {
-  (void)time;
-
   struct saber_surface *surface = data;
 
   wl_callback_destroy(callback);
   surface->frame_callback = NULL;
 
-  if (surface->dirty) {
+  /* Action purpose: Before the pending repaint, not after. The owner advances
+  its animation here and marks the surface dirty from inside the call, so the
+  paint below settles the whole frame at once instead of committing the old
+  values and then immediately committing again. */
+  if (surface->listener != NULL && surface->listener->frame != NULL) {
+    surface->listener->frame(surface->listener_data, time);
+  }
+
+  if (surface->dirty && surface->frame_callback == NULL) {
     surface_paint(surface);
   }
 }

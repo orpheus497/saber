@@ -98,10 +98,13 @@ anything — rendering is the host's job, and that is exactly what lets the pane
 
 ### The Dash
 
-`saberctl dash`, or click the BFB. A full-screen application grid with a search field and a
-category row. Typing filters; categories filter; the two compose. Ranking puts prefix matches
-above interior ones, across name, generic name and `Exec` basename. `Tab` cycles categories,
-arrows move, `Enter` launches, `Escape` dismisses.
+`saberctl dash`, or click the BFB. A panel docked to the same edge as the column, one third of
+the output wide and full height, with the desktop beside it left undimmed. The search field is
+top-left; the category strip runs along the bottom.
+
+Typing filters; categories filter; the two compose. Ranking puts prefix matches above interior
+ones, across name, generic name and `Exec` basename. `Tab` cycles categories, arrows move and
+scroll the grid, `Enter` launches, `Escape` dismisses — as does a click outside the panel.
 
 ### The window spread
 

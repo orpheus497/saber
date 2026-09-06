@@ -1,12 +1,18 @@
-/* Script function and purpose: The Dash -- the full-screen application grid the
-BFB opens and `saberctl dash` toggles. A zwlr_layer_shell_v1 surface on the
-OVERLAY layer with EXCLUSIVE keyboard interactivity, a search field, a row of
-XDG category filters, and a grid of desktop entries. The two filters intersect:
-a category narrows what is on screen and the query narrows it further.
+/* Script function and purpose: The Dash -- the application grid the BFB opens
+and `saberctl dash` toggles. A zwlr_layer_shell_v1 surface on the OVERLAY layer
+with EXCLUSIVE keyboard interactivity, carrying a search field at its top left,
+a grid of desktop entries, and a strip of XDG category filters along its bottom
+edge. The two filters intersect: a category narrows what is on screen and the
+query narrows it further.
 
-The backdrop is a translucent theme.overlay fill, never a blur: hikari does not
-advertise ext-background-effect and a Wayland client cannot read the screen
-behind itself (BLUEPRINT.md 5.7). */
+The surface covers the whole output -- that is what holds the seat's keyboard
+and catches the click that dismisses -- but only a third of it is painted: the
+dash is a panel docked against config->panel.edge, and the desktop beside it is
+left untouched rather than dimmed.
+
+That painted rectangle is a translucent theme.overlay fill, never a blur:
+hikari does not advertise ext-background-effect and a Wayland client cannot read
+the screen behind itself (BLUEPRINT.md 5.7). */
 
 #if !defined(SABER_DASH_H)
 #define SABER_DASH_H

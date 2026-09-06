@@ -1,11 +1,16 @@
-/* Script function and purpose: The Dash -- the full-screen application grid.
+/* Script function and purpose: The Dash -- the edge-docked application grid.
 Layout, cairo/pango drawing, the substring filter and its ranking, and the
 xkbcommon keyboard handling that makes the search field type.
 
 The surface is an OVERLAY layer surface anchored to all four edges with
 EXCLUSIVE keyboard interactivity, and it is CREATED on show and DESTROYED on
 hide rather than merely being unmapped: a layer surface holding the seat's
-keyboard exclusively goes on holding it for as long as it exists. */
+keyboard exclusively goes on holding it for as long as it exists.
+
+Only a third of that surface is PAINTED. Unity's dash is a panel docked to the
+launcher's edge over an undimmed desktop, so everything outside the dash
+rectangle is left fully transparent; the surface stays full-screen because that
+is what carries the exclusive keyboard and the click-away-to-dismiss path. */
 
 #include <math.h>
 #include <string.h>
@@ -24,15 +29,29 @@ keyboard exclusively goes on holding it for as long as it exists. */
 carries are stable and are spelled out rather than pulled in through a shim. */
 #define DASH_BTN_LEFT 0x110
 
-#define DASH_ICON 48
-#define DASH_CELL_WIDTH 148.0
-#define DASH_CELL_HEIGHT 118.0
-#define DASH_MARGIN 64.0
-#define DASH_SEARCH_HEIGHT 46.0
-#define DASH_SEARCH_MAX_WIDTH 560.0
-#define DASH_SEARCH_GAP 40.0
+#define DASH_ICON 44
+#define DASH_CELL_MIN_WIDTH 100.0
+#define DASH_CELL_HEIGHT 112.0
+#define DASH_PAD 20.0
+#define DASH_SEARCH_HEIGHT 40.0
+#define DASH_SEARCH_GAP 18.0
 #define DASH_RADIUS 8.0
 #define DASH_SCROLLBAR 4.0
+
+/* Action purpose: The scrollbar sits in a gutter of its own rather than over
+the last column, so a full row of cells is never partly hidden by the thumb. */
+#define DASH_GUTTER 14.0
+
+/* The dash rectangle: a third of the output, held between a width that still
+fits three columns on a laptop and one that stops an ultrawide handing the dash
+half the desktop. */
+#define DASH_PANEL_DIVISOR 3.0
+#define DASH_PANEL_MIN_WIDTH 420.0
+#define DASH_PANEL_MAX_WIDTH 700.0
+
+#define DASH_STRIP_HEIGHT 46.0
+#define DASH_STRIP_ICON 22.0
+#define DASH_STRIP_GAP 10.0 /* grid to the category strip */
 
 /* Weight of the second backdrop pass; see dash_render. */
 #define DASH_BACKDROP_PASS 0.7
@@ -44,34 +63,36 @@ the next row. Uncapped, a 3440px output lays twenty entries out as one line. */
 /* Saber's configuration carries no font key and the theme is colours only, so
 the dash asks fontconfig for the system sans at the sizes it wants. */
 #define DASH_FONT "Sans 9.5"
-#define DASH_SEARCH_FONT "Sans 13"
-#define DASH_CHIP_FONT "Sans 10"
+#define DASH_SEARCH_FONT "Sans 12"
+#define DASH_CHIP_FONT "Sans 8"
 
-#define DASH_CHIP_HEIGHT 28.0
-#define DASH_CHIP_PAD 14.0     /* inside a chip, each side */
-#define DASH_CHIP_GAP 8.0      /* between chips on a row */
-#define DASH_CHIP_ROW_GAP 6.0  /* between wrapped chip rows */
-#define DASH_CHIP_TOP_GAP 18.0 /* search field to the chip row */
-#define DASH_CHIP_BOTTOM_GAP 22.0
+/* The freedesktop menu main categories, in the order the filter strip shows
+them. The label is the category name verbatim -- the one exception is
+AudioVideo, which is unreadable run together and is nothing else anywhere.
 
-/* The freedesktop menu main categories, in the order the filter row shows them.
-The label is the category name verbatim -- the one exception is AudioVideo,
-which is unreadable run together and is nothing else anywhere. */
+`icon` is the freedesktop name for the category and `alt` a second name to try:
+an icon theme is free to inherit from one that carries only half the set, and a
+strip is not worth a hole in it. The label is the last resort. */
 static const struct {
   const char *key;
   const char *label;
+  const char *icon;
+  const char *alt;
 } dash_categories[] = {
-  { "AudioVideo", "Audio & Video" },
-  { "Development", "Development" },
-  { "Education", "Education" },
-  { "Game", "Game" },
-  { "Graphics", "Graphics" },
-  { "Network", "Network" },
-  { "Office", "Office" },
-  { "Science", "Science" },
-  { "Settings", "Settings" },
-  { "System", "System" },
-  { "Utility", "Utility" },
+  { "AudioVideo", "Audio & Video", "applications-multimedia",
+      "multimedia-player" },
+  { "Development", "Development", "applications-development",
+      "applications-engineering" },
+  { "Education", "Education", "applications-education",
+      "accessories-dictionary" },
+  { "Game", "Game", "applications-games", "input-gaming" },
+  { "Graphics", "Graphics", "applications-graphics", "image-x-generic" },
+  { "Network", "Network", "applications-internet", "network-workgroup" },
+  { "Office", "Office", "applications-office", "x-office-document" },
+  { "Science", "Science", "applications-science", "applications-engineering" },
+  { "Settings", "Settings", "preferences-desktop", "preferences-system" },
+  { "System", "System", "applications-system", "computer" },
+  { "Utility", "Utility", "applications-utilities", "applications-accessories" },
 };
 
 #define DASH_CATEGORY_COUNT ((int)G_N_ELEMENTS(dash_categories))
@@ -82,12 +103,14 @@ static const struct {
 /* The pseudo-filter the row opens on, and the only one that is not a bucket. */
 #define DASH_CATEGORY_ALL (-1)
 
-/* One filter in the row. `width` is the measured label plus its padding; the
-position is assigned by dash_layout, which is the only thing that knows how
-wide the output is. */
+/* One filter in the bottom strip. `icon` is NULL for All, which is drawn rather
+than looked up: no icon theme names "every category at once". The position and
+width are assigned by dash_layout, the only thing that knows how wide the dash
+rectangle is. */
 struct dash_chip {
   int category;
   const char *label;
+  const char *icon, *alt;
   double x, y, width;
 };
 
@@ -129,24 +152,32 @@ struct saber_dash {
   GPtrArray *entries; /* struct dash_entry *, owned */
   GPtrArray *results; /* struct dash_entry *, borrowed from entries */
 
-  /* The filter row: only the categories the index actually has entries for,
+  /* The filter strip: only the categories the index actually has entries for,
   always led by All. Rebuilt whenever the entries are. */
   GArray *chips; /* struct dash_chip */
   int category;  /* DASH_CATEGORY_ALL, a category index, or _OTHER */
   int chip_hovered;
   int chip_pressed;
-  int chip_rows;
-  double chips_y;
 
   int selected;
   int hovered;
   int pressed;
   int scroll; /* first visible row */
 
+  /* The painted rectangle inside the full-screen surface: full height, docked
+  against the panel's edge. */
+  double panel_x, panel_width;
+
   int columns, rows, visible_rows;
   double cell_width, cell_height;
   double grid_x, grid_y;
   double search_x, search_y, search_width;
+  double strip_y;
+
+  /* Where the pointer last was across the dash rectangle, kept so a release can
+  tell a dismissal from a click that merely missed a cell inside the dash. */
+  double pointer_x;
+  bool pressed_outside;
 
   PangoFontDescription *font;
   PangoFontDescription *search_font;
@@ -188,9 +219,16 @@ rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r)
 
 /* Function purpose: Paint a cached icon centred on (cx, cy) at `size` logical
 pixels. The cache hands back a surface measured in DEVICE pixels, so the scale
-factor is recovered from the surface itself rather than assumed. */
+factor is recovered from the surface itself rather than assumed. `alpha` is what
+holds an unselected category icon back from a selected one -- a themed pixmap
+cannot be retinted, so it is dimmed instead. */
 static void
-draw_icon(cairo_t *cr, cairo_surface_t *icon, double cx, double cy, double size)
+draw_icon(cairo_t *cr,
+    cairo_surface_t *icon,
+    double cx,
+    double cy,
+    double size,
+    double alpha)
 {
   double w = cairo_image_surface_get_width(icon);
   double h = cairo_image_surface_get_height(icon);
@@ -205,7 +243,7 @@ draw_icon(cairo_t *cr, cairo_surface_t *icon, double cx, double cy, double size)
   cairo_translate(cr, cx - w * k / 2.0, cy - h * k / 2.0);
   cairo_scale(cr, k, k);
   cairo_set_source_surface(cr, icon, 0.0, 0.0);
-  cairo_paint(cr);
+  cairo_paint_with_alpha(cr, alpha);
   cairo_restore(cr);
 }
 
@@ -213,6 +251,54 @@ static void
 set_source_alpha(cairo_t *cr, const struct saber_color *color, double alpha)
 {
   cairo_set_source_rgba(cr, color->r, color->g, color->b, color->a * alpha);
+}
+
+/* Function purpose: The search field's magnifier. Stroked rather than looked up
+so the search row reads the same whatever icon theme is installed; (cx, cy) is
+the centre of the lens, not of the whole glyph. */
+static void
+draw_magnifier(cairo_t *cr, double cx, double cy, double radius)
+{
+  cairo_new_path(cr);
+  cairo_arc(cr, cx, cy, radius, 0.0, 2.0 * G_PI);
+  cairo_move_to(cr, cx + radius * 0.72, cy + radius * 0.72);
+  cairo_line_to(cr, cx + radius * 1.7, cy + radius * 1.7);
+  cairo_set_line_width(cr, 1.6);
+  cairo_stroke(cr);
+}
+
+/* Three stacked rules of decreasing width -- the filter affordance at the right
+of the search row, naming whichever category the bottom strip has active. */
+static void
+draw_filter_glyph(cairo_t *cr, double x, double y, double width)
+{
+  for (int i = 0; i < 3; i++) {
+    double inset = i * width / 6.0;
+
+    cairo_move_to(cr, x + inset, y + i * 4.5);
+    cairo_line_to(cr, x + width - inset, y + i * 4.5);
+  }
+
+  cairo_set_line_width(cr, 1.4);
+  cairo_stroke(cr);
+}
+
+/* The All filter's glyph: four squares, the strip's only entry with no
+freedesktop category icon behind it. */
+static void
+draw_all_glyph(cairo_t *cr, double cx, double cy, double size)
+{
+  double cell = (size - 2.0) / 2.0;
+
+  for (int i = 0; i < 4; i++) {
+    int column = i % 2;
+    int row = i / 2;
+
+    cairo_rectangle(cr, cx - size / 2.0 + column * (cell + 2.0),
+        cy - size / 2.0 + row * (cell + 2.0), cell, cell);
+  }
+
+  cairo_fill(cr);
 }
 
 /* --------------------------------------------------------------- indexing */
@@ -279,10 +365,9 @@ entry_category(const struct saber_appinfo *app)
   return DASH_CATEGORY_OTHER;
 }
 
-/* Function purpose: Rebuild the filter row from what the entries actually are.
-An empty category is not offered: a row of twelve filters, nine of which match
-nothing, is worse than no row. Labels are measured here rather than at paint
-time because dash_layout has to place them and never holds a cairo context. */
+/* Function purpose: Rebuild the filter strip from what the entries actually
+are. An empty category is not offered: a strip of twelve filters, nine of which
+match nothing, is worse than no strip. */
 static void
 dash_rebuild_chips(struct saber_dash *dash)
 {
@@ -290,7 +375,7 @@ dash_rebuild_chips(struct saber_dash *dash)
 
   g_array_set_size(dash->chips, 0);
 
-  /* Nothing to filter: All on its own is a row that does nothing. */
+  /* Nothing to filter: All on its own is a strip that does nothing. */
   if (dash->entries->len == 0) {
     return;
   }
@@ -301,12 +386,6 @@ dash_rebuild_chips(struct saber_dash *dash)
     present[entry->category] = true;
   }
 
-  PangoContext *context =
-      pango_font_map_create_context(pango_cairo_font_map_get_default());
-  PangoLayout *layout = pango_layout_new(context);
-
-  pango_layout_set_font_description(layout, dash->chip_font);
-
   for (int i = DASH_CATEGORY_ALL; i <= DASH_CATEGORY_OTHER; i++) {
     if (i != DASH_CATEGORY_ALL && !present[i]) {
       continue;
@@ -316,19 +395,16 @@ dash_rebuild_chips(struct saber_dash *dash)
       .category = i,
       .label = i == DASH_CATEGORY_ALL ? "All"
           : (i == DASH_CATEGORY_OTHER ? "Other" : dash_categories[i].label),
+      .icon = i == DASH_CATEGORY_ALL ? NULL
+          : (i == DASH_CATEGORY_OTHER ? "applications-other"
+                                      : dash_categories[i].icon),
+      .alt = i == DASH_CATEGORY_ALL || i == DASH_CATEGORY_OTHER
+          ? NULL
+          : dash_categories[i].alt,
     };
-
-    int width;
-
-    pango_layout_set_text(layout, chip.label, -1);
-    pango_layout_get_pixel_size(layout, &width, NULL);
-    chip.width = width + 2.0 * DASH_CHIP_PAD;
 
     g_array_append_val(dash->chips, chip);
   }
-
-  g_object_unref(layout);
-  g_object_unref(context);
 }
 
 static void
@@ -465,61 +541,35 @@ dash_filter(struct saber_dash *dash)
 
 /* ----------------------------------------------------------------- layout */
 
-/* Function purpose: Place the filter row. Chips flow left to right and wrap
-onto further rows when the output is too narrow for them, and each row is
-centred on its own -- a single left-aligned row would sit off-centre under a
-centred search field on every wide output. */
+/* Function purpose: Spread the filter strip evenly across the bottom edge of
+the dash rectangle. The strip is a fixed set of small cells rather than measured
+chips: at a third of the output there is no width to wrap into, so every filter
+gets the same share and is drawn as an icon. */
 static void
-dash_layout_chips(struct saber_dash *dash)
+dash_layout_strip(struct saber_dash *dash)
 {
-  dash->chip_rows = 0;
-  dash->chips_y = dash->search_y + DASH_SEARCH_HEIGHT + DASH_CHIP_TOP_GAP;
+  dash->strip_y = (double)dash->height - DASH_STRIP_HEIGHT;
 
   if (dash->chips->len == 0) {
     return;
   }
 
-  double available = (double)dash->width - 2.0 * DASH_MARGIN;
+  double inner = dash->panel_width - 2.0 * DASH_PAD;
 
-  if (available < 1.0) {
-    available = 1.0;
+  if (inner < 1.0) {
+    inner = 1.0;
   }
 
-  guint start = 0;
+  double cell = inner / dash->chips->len;
+  double x = dash->panel_x + DASH_PAD;
 
-  while (start < dash->chips->len) {
-    guint end = start;
-    double used = 0.0;
+  for (guint i = 0; i < dash->chips->len; i++) {
+    struct dash_chip *chip = &g_array_index(dash->chips, struct dash_chip, i);
 
-    /* At least one chip per row, however narrow the output: a chip wider than
-    the whole row still has to be placed somewhere. */
-    while (end < dash->chips->len) {
-      struct dash_chip *chip = &g_array_index(dash->chips, struct dash_chip,
-          end);
-      double next = used + (end > start ? DASH_CHIP_GAP : 0.0) + chip->width;
-
-      if (end > start && next > available) {
-        break;
-      }
-
-      used = next;
-      end++;
-    }
-
-    double x = ((double)dash->width - used) / 2.0;
-    double y = dash->chips_y +
-        dash->chip_rows * (DASH_CHIP_HEIGHT + DASH_CHIP_ROW_GAP);
-
-    for (guint i = start; i < end; i++) {
-      struct dash_chip *chip = &g_array_index(dash->chips, struct dash_chip, i);
-
-      chip->x = x;
-      chip->y = y;
-      x += chip->width + DASH_CHIP_GAP;
-    }
-
-    dash->chip_rows++;
-    start = end;
+    chip->x = x;
+    chip->y = dash->strip_y;
+    chip->width = cell;
+    x += cell;
   }
 }
 
@@ -528,48 +578,51 @@ dash_layout(struct saber_dash *dash)
 {
   int count = (int)dash->results->len;
 
-  dash->cell_width = DASH_CELL_WIDTH;
+  /* Action purpose: The dash is docked against whichever edge carries the panel
+  column, so a right-hand panel gets a right-hand dash. The surface itself stays
+  full-screen -- only this rectangle is painted. */
+  dash->panel_width = CLAMP((double)dash->width / DASH_PANEL_DIVISOR,
+      DASH_PANEL_MIN_WIDTH, DASH_PANEL_MAX_WIDTH);
+
+  if (dash->panel_width > (double)dash->width) {
+    dash->panel_width = (double)dash->width;
+  }
+
+  bool right = dash->deps.config != NULL &&
+      dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
+
+  dash->panel_x = right ? (double)dash->width - dash->panel_width : 0.0;
+
+  double inner = dash->panel_width - 2.0 * DASH_PAD;
+
+  if (inner < 1.0) {
+    inner = 1.0;
+  }
+
+  dash->search_x = dash->panel_x + DASH_PAD;
+  dash->search_y = DASH_PAD;
+  dash->search_width = inner;
+
+  dash_layout_strip(dash);
+
   dash->cell_height = DASH_CELL_HEIGHT;
+  dash->grid_x = dash->panel_x + DASH_PAD;
+  dash->grid_y = dash->search_y + DASH_SEARCH_HEIGHT + DASH_SEARCH_GAP;
 
-  dash->search_width = MIN((double)dash->width - 2.0 * DASH_MARGIN,
-      DASH_SEARCH_MAX_WIDTH);
+  /* Action purpose: The column count comes from the width the dash actually
+  has, and the cells then stretch to fill it exactly -- a fixed cell width would
+  leave a ragged margin down one side of a panel this narrow. */
+  double available = inner - DASH_GUTTER;
 
-  if (dash->search_width < 120.0) {
-    dash->search_width = 120.0;
+  if (available < DASH_CELL_MIN_WIDTH) {
+    available = DASH_CELL_MIN_WIDTH;
   }
 
-  dash->search_x = ((double)dash->width - dash->search_width) / 2.0;
-  dash->search_y = DASH_MARGIN;
+  dash->columns = CLAMP((int)(available / DASH_CELL_MIN_WIDTH), 1,
+      DASH_MAX_COLUMNS);
+  dash->cell_width = available / dash->columns;
 
-  dash_layout_chips(dash);
-
-  double available = (double)dash->width - 2.0 * DASH_MARGIN;
-
-  if (available < dash->cell_width) {
-    available = dash->cell_width;
-  }
-
-  dash->columns = (int)(available / dash->cell_width);
-  dash->columns = CLAMP(dash->columns, 1, DASH_MAX_COLUMNS);
-
-  /* A short result set narrows the grid rather than leaving a ragged single
-  row hanging off the left of a full-width one. */
-  if (count > 0 && dash->columns > count) {
-    dash->columns = count;
-  }
-
-  dash->grid_x =
-      ((double)dash->width - dash->columns * dash->cell_width) / 2.0;
-
-  if (dash->chip_rows > 0) {
-    dash->grid_y = dash->chips_y +
-        dash->chip_rows * DASH_CHIP_HEIGHT +
-        (dash->chip_rows - 1) * DASH_CHIP_ROW_GAP + DASH_CHIP_BOTTOM_GAP;
-  } else {
-    dash->grid_y = dash->search_y + DASH_SEARCH_HEIGHT + DASH_SEARCH_GAP;
-  }
-
-  double room = (double)dash->height - dash->grid_y - DASH_MARGIN / 2.0;
+  double room = dash->strip_y - DASH_STRIP_GAP - dash->grid_y;
 
   dash->visible_rows = (int)(room / dash->cell_height);
 
@@ -578,6 +631,15 @@ dash_layout(struct saber_dash *dash)
   }
 
   dash->rows = count > 0 ? (count + dash->columns - 1) / dash->columns : 0;
+}
+
+/* Function purpose: Whether a point falls on the dash rectangle. The rectangle
+is full height, so only the horizontal span is asked -- and a point off it is a
+dismissal, since the rest of the surface is transparent desktop. */
+static bool
+dash_inside(const struct saber_dash *dash, double x)
+{
+  return x >= dash->panel_x && x < dash->panel_x + dash->panel_width;
 }
 
 static int
@@ -636,7 +698,7 @@ dash_chip_at(const struct saber_dash *dash, double x, double y)
         struct dash_chip, i);
 
     if (x >= chip->x && x < chip->x + chip->width && y >= chip->y &&
-        y < chip->y + DASH_CHIP_HEIGHT) {
+        y < chip->y + DASH_STRIP_HEIGHT) {
       return (int)i;
     }
   }
@@ -669,6 +731,28 @@ dash_cell_at(const struct saber_dash *dash, double x, double y)
 
 /* ---------------------------------------------------------------- drawing */
 
+/* Function purpose: The name of the filter the bottom strip has active, shown
+beside the filter glyph so a row of anonymous category icons still says which
+one is on. */
+static const char *
+dash_category_label(const struct saber_dash *dash)
+{
+  for (guint i = 0; i < dash->chips->len; i++) {
+    const struct dash_chip *chip = &g_array_index(dash->chips,
+        struct dash_chip, i);
+
+    if (chip->category == dash->category) {
+      return chip->label;
+    }
+  }
+
+  return "All";
+}
+
+/* Action purpose: The top row of the dash -- magnifier, then the query or its
+placeholder, then the filter affordance hard against the right edge. Everything
+is left-aligned from the magnifier rather than centred: this is a panel, and a
+centred field in a 480px column reads as a mistake. */
 static void
 dash_draw_search(struct saber_dash *dash, cairo_t *cr)
 {
@@ -690,24 +774,52 @@ dash_draw_search(struct saber_dash *dash, cairo_t *cr)
   cairo_set_line_width(cr, 1.5);
   cairo_stroke(cr);
 
-  bool empty = dash->query->len == 0;
+  bool filtered = dash->category != DASH_CATEGORY_ALL;
   PangoLayout *layout = pango_cairo_create_layout(cr);
+
+  pango_layout_set_font_description(layout, dash->chip_font);
+  pango_layout_set_text(layout, dash_category_label(dash), -1);
+
+  int filter_width, filter_height;
+
+  pango_layout_get_pixel_size(layout, &filter_width, &filter_height);
+
+  double glyph_width = 12.0;
+  double filter_x = x + w - 12.0 - filter_width;
+
+  set_source_alpha(cr, filtered ? &theme->accent : &theme->dim, 1.0);
+  cairo_move_to(cr, filter_x, y + (h - filter_height) / 2.0);
+  pango_cairo_show_layout(cr, layout);
+  draw_filter_glyph(cr, filter_x - 7.0 - glyph_width, y + h / 2.0 - 4.5,
+      glyph_width);
+
+  set_source_alpha(cr, &theme->dim, 1.0);
+  draw_magnifier(cr, x + 18.0, y + h / 2.0 - 1.5, 5.5);
+
+  double text_x = x + 32.0;
+  double text_room = filter_x - 7.0 - glyph_width - 10.0 - text_x;
+
+  if (text_room < 24.0) {
+    text_room = 24.0;
+  }
+
+  bool empty = dash->query->len == 0;
 
   pango_layout_set_font_description(layout, dash->search_font);
   pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_START);
-  pango_layout_set_width(layout, (int)((w - 32.0) * PANGO_SCALE));
+  pango_layout_set_width(layout, (int)(text_room * PANGO_SCALE));
   pango_layout_set_text(layout,
-      empty ? "Search applications\xe2\x80\xa6" : dash->query->str, -1);
+      empty ? "Search applications" : dash->query->str, -1);
 
   int text_width, text_height;
 
   pango_layout_get_pixel_size(layout, &text_width, &text_height);
   saber_theme_set_source(cr, empty ? &theme->dim : &theme->foreground);
-  cairo_move_to(cr, x + 16.0, y + (h - text_height) / 2.0);
+  cairo_move_to(cr, text_x, y + (h - text_height) / 2.0);
   pango_cairo_show_layout(cr, layout);
 
   if (!empty) {
-    double caret = x + 16.0 + MIN((double)text_width, w - 32.0) + 2.0;
+    double caret = text_x + MIN((double)text_width, text_room) + 2.0;
 
     saber_theme_set_source(cr, &theme->accent);
     cairo_rectangle(cr, caret, y + (h - text_height) / 2.0, 1.5, text_height);
@@ -717,50 +829,78 @@ dash_draw_search(struct saber_dash *dash, cairo_t *cr)
   g_object_unref(layout);
 }
 
-/* Action purpose: The selected chip is the accent role, the same fill and
-stroke weights the selected grid cell uses, so the two selections read as one
-idea. Every colour here is a theme role -- there are no literals to retint. */
+/* Action purpose: The category strip along the bottom edge. The selected cell
+is the accent role at the same fill and stroke weights the selected grid cell
+uses, so the two selections read as one idea. Every colour here is a theme role
+-- there are no literals to retint. */
 static void
-dash_draw_chips(struct saber_dash *dash, cairo_t *cr)
+dash_draw_strip(struct saber_dash *dash, cairo_t *cr)
 {
+  const struct saber_theme *theme = dash->deps.theme;
+
+  set_source_alpha(cr, &theme->dim, 0.35);
+  cairo_set_line_width(cr, 1.0);
+  cairo_move_to(cr, dash->panel_x + DASH_PAD, dash->strip_y + 0.5);
+  cairo_line_to(cr, dash->panel_x + dash->panel_width - DASH_PAD,
+      dash->strip_y + 0.5);
+  cairo_stroke(cr);
+
   if (dash->chips->len == 0) {
     return;
   }
 
-  const struct saber_theme *theme = dash->deps.theme;
+  int pixels = (int)lround(DASH_STRIP_ICON * dash->scale);
   PangoLayout *layout = pango_cairo_create_layout(cr);
 
   pango_layout_set_font_description(layout, dash->chip_font);
+  pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+  pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
 
   for (guint i = 0; i < dash->chips->len; i++) {
     const struct dash_chip *chip = &g_array_index(dash->chips,
         struct dash_chip, i);
     bool selected = chip->category == dash->category;
     bool hovered = (int)i == dash->chip_hovered;
-
-    rounded_rect(cr, chip->x, chip->y, chip->width, DASH_CHIP_HEIGHT,
-        DASH_CHIP_HEIGHT / 2.0);
+    double cy = chip->y + DASH_STRIP_HEIGHT / 2.0 + 1.0;
 
     if (selected || hovered) {
+      rounded_rect(cr, chip->x + 2.0, chip->y + 5.0, chip->width - 4.0,
+          DASH_STRIP_HEIGHT - 9.0, DASH_RADIUS);
       set_source_alpha(cr, &theme->accent,
           (int)i == dash->chip_pressed ? 0.55 : (selected ? 0.38 : 0.18));
       cairo_fill_preserve(cr);
       set_source_alpha(cr, &theme->accent, selected ? 1.0 : 0.5);
       cairo_set_line_width(cr, 1.5);
       cairo_stroke(cr);
-    } else {
-      set_source_alpha(cr, &theme->dim, 0.35);
-      cairo_fill(cr);
     }
 
-    int text_width, text_height;
+    cairo_surface_t *icon = chip->icon != NULL
+        ? saber_icons_lookup(dash->deps.icons, chip->icon, pixels)
+        : NULL;
 
-    pango_layout_set_text(layout, chip->label, -1);
-    pango_layout_get_pixel_size(layout, &text_width, &text_height);
-    saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
-    cairo_move_to(cr, chip->x + (chip->width - text_width) / 2.0,
-        chip->y + (DASH_CHIP_HEIGHT - text_height) / 2.0);
-    pango_cairo_show_layout(cr, layout);
+    if (icon == NULL && chip->alt != NULL) {
+      icon = saber_icons_lookup(dash->deps.icons, chip->alt, pixels);
+    }
+
+    if (chip->icon == NULL) {
+      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
+      draw_all_glyph(cr, chip->x + chip->width / 2.0, cy, DASH_STRIP_ICON - 6.0);
+    } else if (icon != NULL) {
+      draw_icon(cr, icon, chip->x + chip->width / 2.0, cy, DASH_STRIP_ICON,
+          selected ? 1.0 : 0.62);
+    } else {
+      /* No such name in the icon theme: the label, cut to the cell, so the
+      filter is still nameable rather than a gap in the strip. */
+      int text_width, text_height;
+
+      pango_layout_set_width(layout, (int)((chip->width - 4.0) * PANGO_SCALE));
+      pango_layout_set_text(layout, chip->label, -1);
+      pango_layout_get_pixel_size(layout, &text_width, &text_height);
+      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
+      cairo_move_to(cr, chip->x + (chip->width - text_width) / 2.0,
+          cy - text_height / 2.0);
+      pango_cairo_show_layout(cr, layout);
+    }
   }
 
   g_object_unref(layout);
@@ -806,7 +946,7 @@ dash_draw_cell(struct saber_dash *dash,
   double icon_cy = y + 14.0 + DASH_ICON / 2.0;
 
   if (icon != NULL) {
-    draw_icon(cr, icon, x + w / 2.0, icon_cy, DASH_ICON);
+    draw_icon(cr, icon, x + w / 2.0, icon_cy, DASH_ICON, 1.0);
   } else {
     /* The initial, so an entry whose icon resolves to nothing still reads as a
     distinct cell rather than as a gap in the grid. */
@@ -851,7 +991,7 @@ dash_draw_scrollbar(struct saber_dash *dash, cairo_t *cr)
 
   const struct saber_theme *theme = dash->deps.theme;
   double track_h = dash->visible_rows * dash->cell_height;
-  double x = dash->grid_x + dash->columns * dash->cell_width + 10.0;
+  double x = dash->panel_x + dash->panel_width - DASH_PAD - DASH_SCROLLBAR;
   double thumb_h = track_h * dash->visible_rows / (double)dash->rows;
   double thumb_y = dash->grid_y +
       (track_h - thumb_h) * dash->scroll / (double)max;
@@ -885,24 +1025,47 @@ dash_render(void *data,
     dash_reveal_selection(dash);
   }
 
-  /* Action purpose: A translucent palette fill, never a blur -- hikari does not
-  advertise ext-background-effect and a client cannot read the screen behind
-  itself (BLUEPRINT.md 5.7). SOURCE, not OVER: the buffer is recycled, so a
-  translucent paint over a stale frame would accumulate. */
+  /* Action purpose: Clear the whole surface to nothing first. SOURCE, not OVER:
+  the buffer is recycled, so a translucent paint over a stale frame would
+  accumulate -- and everything outside the dash rectangle must end up fully
+  transparent, because the desktop beside a docked dash is not dimmed. */
   cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-  saber_theme_set_source(cr, &theme->overlay);
+  cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
   cairo_paint(cr);
-  cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
-  /* Action purpose: The same role composited a second time. One pass of the
-  theme's overlay alpha is not enough to read fifty names over a bright desktop,
-  and inventing a colour here would break the rule that every colour in the
-  panel comes from a theme role. Two passes still leave the desktop showing. */
+  /* Action purpose: The dash rectangle itself: a palette fill, never a blur --
+  hikari does not advertise ext-background-effect and a client cannot read the
+  screen behind itself (BLUEPRINT.md 5.7). The background role is the panel
+  column's own and carries the user's opacity, laid down twice for the reason
+  the search field is: one pass of it over a bright desktop leaves the wallpaper
+  legible through the dash, and a backdrop that merely dimmed would do while the
+  dash covered the output but not beside an undimmed one. The overlay role goes
+  over the top for the dash's tint. */
+  cairo_rectangle(cr, dash->panel_x, 0.0, dash->panel_width, (double)height);
+  saber_theme_set_source(cr, &theme->background);
+  cairo_fill_preserve(cr);
+  cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+  cairo_fill_preserve(cr);
   set_source_alpha(cr, &theme->overlay, DASH_BACKDROP_PASS);
-  cairo_paint(cr);
+  cairo_fill_preserve(cr);
+
+  /* Nothing may spill onto the undimmed desktop beside the dash. */
+  cairo_save(cr);
+  cairo_clip(cr);
+
+  /* The inner edge, so the dash reads as a panel with a boundary rather than as
+  a darkened region of the wallpaper. */
+  double edge = dash->panel_x > 0.0 ? dash->panel_x + 0.5
+                                    : dash->panel_width - 0.5;
+
+  set_source_alpha(cr, &theme->dim, 0.5);
+  cairo_set_line_width(cr, 1.0);
+  cairo_move_to(cr, edge, 0.0);
+  cairo_line_to(cr, edge, (double)height);
+  cairo_stroke(cr);
 
   dash_draw_search(dash, cr);
-  dash_draw_chips(dash, cr);
+  dash_draw_strip(dash, cr);
 
   PangoLayout *layout = pango_cairo_create_layout(cr);
 
@@ -917,12 +1080,15 @@ dash_render(void *data,
   pango_layout_set_height(layout, -2);
 
   if (dash->results->len == 0) {
-    pango_layout_set_width(layout, (int)(dash->width * PANGO_SCALE));
+    pango_layout_set_width(layout,
+        (int)((dash->panel_width - 2.0 * DASH_PAD) * PANGO_SCALE));
+    pango_layout_set_height(layout, 0);
     pango_layout_set_text(layout, "No matching applications", -1);
     saber_theme_set_source(cr, &theme->dim);
-    cairo_move_to(cr, 0.0, dash->grid_y + 24.0);
+    cairo_move_to(cr, dash->panel_x + DASH_PAD, dash->grid_y + 24.0);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
+    cairo_restore(cr);
 
     return;
   }
@@ -937,6 +1103,7 @@ dash_render(void *data,
 
   g_object_unref(layout);
   dash_draw_scrollbar(dash, cr);
+  cairo_restore(cr);
 }
 
 static void
@@ -1023,6 +1190,8 @@ other's highlight as it leaves it. */
 static void
 dash_set_hover(struct saber_dash *dash, double x, double y)
 {
+  dash->pointer_x = x;
+
   int cell = dash_cell_at(dash, x, y);
   int chip = cell >= 0 ? -1 : dash_chip_at(dash, x, y);
 
@@ -1108,7 +1277,12 @@ dash_pointer_leave(void *data, struct wl_surface *surface)
 {
   (void)surface;
 
-  dash_clear_hover(data);
+  struct saber_dash *dash = data;
+
+  /* Off the surface entirely is off the dash rectangle, so a press that started
+  outside and left the output still dismisses. */
+  dash->pointer_x = -1.0;
+  dash_clear_hover(dash);
 }
 
 static void
@@ -1138,6 +1312,7 @@ dash_pointer_button(void *data,
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
     dash->pressed = dash->hovered;
     dash->chip_pressed = dash->chip_hovered;
+    dash->pressed_outside = !dash_inside(dash, dash->pointer_x);
     dash->selected = dash->hovered >= 0 ? dash->hovered : dash->selected;
     dash_damage(dash);
 
@@ -1146,9 +1321,11 @@ dash_pointer_button(void *data,
 
   int index = dash->pressed;
   int chip = dash->chip_pressed;
+  bool outside = dash->pressed_outside;
 
   dash->pressed = -1;
   dash->chip_pressed = -1;
+  dash->pressed_outside = false;
 
   if (chip >= 0) {
     if (chip == dash->chip_hovered) {
@@ -1161,10 +1338,13 @@ dash_pointer_button(void *data,
     return;
   }
 
-  /* A press on the backdrop is a dismissal: the dash covers the whole output,
-  so there is nowhere else for "click away to close" to happen. */
+  /* Action purpose: A click that both began and ended off the dash rectangle is
+  a dismissal. The surface still covers the whole output -- that is what carries
+  the exclusive keyboard -- so "click away to close" is a test against the
+  painted rectangle, not against the surface. A miss inside the dash, on the
+  search field or the gap between cells, changes nothing. */
   if (index < 0) {
-    if (dash->hovered < 0 && dash->chip_hovered < 0) {
+    if (outside && !dash_inside(dash, dash->pointer_x)) {
       saber_dash_hide(dash);
     }
 
@@ -1445,6 +1625,7 @@ saber_dash_create(const struct saber_dash_deps *deps)
   dash->selected = -1;
   dash->hovered = -1;
   dash->pressed = -1;
+  dash->pointer_x = -1.0;
   dash->scale = 1.0;
   dash->columns = 1;
   dash->visible_rows = 1;
@@ -1605,10 +1786,11 @@ saber_dash_hide(struct saber_dash *dash)
   dash->category = DASH_CATEGORY_ALL;
   dash->chip_hovered = -1;
   dash->chip_pressed = -1;
-  dash->chip_rows = 0;
   dash->selected = -1;
   dash->hovered = -1;
   dash->pressed = -1;
+  dash->pressed_outside = false;
+  dash->pointer_x = -1.0;
   dash->scroll = 0;
   dash->hiding = false;
 }

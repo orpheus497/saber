@@ -160,7 +160,10 @@ config_defaults(struct saber_config *config)
 
   config->panel.output = g_strdup("all");
   config->panel.edge = SABER_EDGE_LEFT;
-  config->panel.icon_size = 48;
+  /* 32 is a size every icon theme ships natively, so raster icons are used at
+  1:1 rather than resampled to an in-between number. With SABER_PANEL_PADDING
+  that gives a 44px column. */
+  config->panel.icon_size = 32;
   config->panel.autohide = SABER_AUTOHIDE_NEVER;
   config->panel.reveal_pressure = 240;
   config->panel.animation_ms = 180;

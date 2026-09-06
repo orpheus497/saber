@@ -96,7 +96,10 @@ struct saber_surface {
 };
 
 /* Icon plus a symmetric 8px gutter each side; the column's whole width. */
-#define SABER_PANEL_PADDING 16
+/* Tile width is icon_size + this. Padding scales with the icon rather than
+being fixed, so a smaller column stays proportioned rather than becoming an
+icon squeezed inside the same border. */
+#define SABER_PANEL_PADDING 12
 
 int
 saber_surface_panel_width(int icon_size);

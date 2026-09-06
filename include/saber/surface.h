@@ -1,7 +1,8 @@
 /* Script function and purpose: Layer-surface lifecycle -- creation on a given
 output, configure and closed handling, fractional-scale-exact buffer sizing
 through wp_viewporter, and the damage-and-commit entry point that asks the
-owner to paint. */
+owner to paint. Also the xdg_popup half: menus parented to a layer surface,
+which is the only way anything can be drawn outside the panel's column. */
 
 #if !defined(SABER_SURFACE_H)
 #define SABER_SURFACE_H
@@ -13,6 +14,7 @@ owner to paint. */
 #include <wayland-client.h>
 
 #include "wlr-layer-shell-unstable-v1-protocol.h"
+#include "xdg-shell-protocol.h"
 
 #include <saber/buffer.h>
 #include <saber/config.h>
@@ -79,6 +81,9 @@ struct saber_surface {
   bool closed;
   bool painting;
 
+  uint32_t keyboard_interactivity;
+  int keyboard_holds; /* see saber_surface_hold_keyboard */
+
   const struct saber_surface_listener *listener;
   void *listener_data;
 };
@@ -117,6 +122,15 @@ saber_surface_set_exclusive_zone(struct saber_surface *surface, int32_t zone);
 void
 saber_surface_set_keyboard_interactivity(struct saber_surface *surface,
     uint32_t interactivity);
+
+/* Function purpose: Raise the panel to ON_DEMAND for as long as a menu is up
+and drop it back to NONE afterwards. The panel is normally not keyboard
+focusable at all, and a popup parented to a layer surface inherits that
+setting -- so without this the menu maps and then silently swallows nothing,
+with no way to drive it from the keyboard. Nested calls are counted, so a
+submenu closing does not drop focus out from under its parent. */
+void
+saber_surface_hold_keyboard(struct saber_surface *surface, bool hold);
 
 void
 saber_surface_set_anchor(struct saber_surface *surface, uint32_t anchor);
@@ -160,5 +174,133 @@ saber_surface_commit(struct saber_surface *surface);
 /* The effective scale, 1.0 for an unscaled output. */
 double
 saber_surface_scale(const struct saber_surface *surface);
+
+/* Action purpose: An xdg_popup parented to the panel's layer surface through
+zwlr_layer_surface_v1.get_popup. This exists because the column is around 64
+logical pixels wide and a menu is not: a popup is constrained against the
+OUTPUT, not against its parent surface, so it is the only construct in either
+protocol that can paint outside the strip. */
+
+struct saber_popup;
+
+struct saber_popup_listener {
+  void (*configure)(void *data,
+      struct saber_popup *popup,
+      int width,
+      int height);
+
+  /* `cr` is already scaled; the owner draws in logical pixels. */
+  void (*render)(void *data,
+      struct saber_popup *popup,
+      cairo_t *cr,
+      int width,
+      int height);
+
+  /* xdg_popup.popup_done -- the compositor dismissed the popup, typically
+  because the user clicked elsewhere. It must be destroyed, not remapped. */
+  void (*done)(void *data, struct saber_popup *popup);
+};
+
+struct saber_popup_params {
+  int32_t width, height;
+
+  /* The rectangle the popup hangs off, in the PARENT's logical coordinates:
+  the tile for a menu, the row for a submenu. */
+  int32_t anchor_x, anchor_y, anchor_width, anchor_height;
+
+  uint32_t anchor;                /* enum xdg_positioner_anchor */
+  uint32_t gravity;               /* enum xdg_positioner_gravity */
+  uint32_t constraint_adjustment; /* enum xdg_positioner_constraint_adjustment */
+  int32_t offset_x, offset_y;
+
+  /* Take an explicit grab, which is what makes a click anywhere else dismiss
+  the menu and hands it the keyboard. A grab must quote the serial of the
+  input event that asked for the menu; 0 falls back to the last pointer enter,
+  which the compositor may refuse. */
+  bool grab;
+  uint32_t grab_serial;
+};
+
+struct saber_popup {
+  struct saber_display *display;
+  struct saber_surface *parent_surface; /* NULL for a nested popup */
+  struct saber_popup *parent_popup;     /* NULL for a menu on the panel */
+
+  struct wl_surface *wl_surface;
+  struct xdg_surface *xdg_surface;
+  struct xdg_popup *xdg_popup;
+  struct wp_viewport *viewport;
+  struct wp_fractional_scale_v1 *fractional_scale;
+  struct wl_callback *frame_callback;
+
+  struct saber_buffer_pool pool;
+
+  int width, height;                 /* logical, from the last acked configure */
+  int pending_width, pending_height; /* xdg_popup.configure, not yet acked */
+  int x, y;                          /* placement the compositor settled on */
+  int pending_x, pending_y;
+  int pixel_width, pixel_height;
+  uint32_t scale_120;
+  int32_t buffer_scale;
+  uint32_t reposition_token;
+
+  bool configured;
+  bool dirty;
+  bool done;
+  bool painting;
+
+  const struct saber_popup_listener *listener;
+  void *listener_data;
+};
+
+/* Function purpose: Fill in the positioner a panel menu wants. The menu is
+placed beside the column rather than over it -- anchored to the strip's inner
+edge and growing away from it -- and the constraint adjustment is the whole
+point of the call: FLIP_X sends the menu out the other side of a tile sitting
+against the screen edge, while SLIDE_Y then RESIZE_Y keep a long menu on
+screen near the bottom instead of letting the compositor clip it. Submenus use
+the same rules, with the parent row as the anchor rectangle. */
+void
+saber_popup_menu_params(struct saber_popup_params *params,
+    enum saber_edge edge,
+    int32_t width,
+    int32_t height,
+    int32_t anchor_x,
+    int32_t anchor_y,
+    int32_t anchor_width,
+    int32_t anchor_height);
+
+struct saber_popup *
+saber_popup_create(struct saber_surface *parent,
+    const struct saber_popup_params *params,
+    const struct saber_popup_listener *listener,
+    void *data);
+
+/* Function purpose: A submenu. Nested popups must be destroyed innermost
+first, or the compositor raises not_the_topmost_popup and kills the client. */
+struct saber_popup *
+saber_popup_create_nested(struct saber_popup *parent,
+    const struct saber_popup_params *params,
+    const struct saber_popup_listener *listener,
+    void *data);
+
+void
+saber_popup_destroy(struct saber_popup *popup);
+
+/* Function purpose: Move or resize a mapped popup, for a menu whose contents
+changed under it. False on an xdg_popup below version 3, where the request
+does not exist and the caller must live with the size it opened at. */
+bool
+saber_popup_reposition(struct saber_popup *popup,
+    const struct saber_popup_params *params);
+
+void
+saber_popup_damage(struct saber_popup *popup);
+
+bool
+saber_popup_commit(struct saber_popup *popup);
+
+double
+saber_popup_scale(const struct saber_popup *popup);
 
 #endif

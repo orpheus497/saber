@@ -53,10 +53,15 @@ OBJS = \
 	devices.o \
 	dbusmenu.o \
 	match.o \
+	anim.o \
 	model.o \
+	panel.o \
+	quicklist.o \
+	render.o \
 	sni.o \
 	unity.o \
 	display.o \
+	ipc.o \
 	main.o \
 	session.o \
 	sheets.o \
@@ -64,6 +69,16 @@ OBJS = \
 	theme.o \
 	toplevel.o \
 	trash.o
+
+# [COMMENT] Action purpose: saberctl(1) is a second binary, not a mode of the
+# first, and links NOTHING but libc. It runs on every bound keypress (D-008),
+# so linking wayland, cairo, pango, gdk-pixbuf and librsvg to print one line
+# would pay for the whole desktop's shared libraries per keystroke. It needs
+# the glib INCLUDE paths, because ipc.h declares the server API in terms of
+# GError -- but not one glib library, which is why it gets its own CFLAGS and
+# no LIBS at all. Verified: `saber` needs 17 shared libraries, `saberctl` needs
+# exactly libc.so.7.
+CTL_OBJS = saberctl.o
 
 WAYLAND_PROTOCOLS != ${PKG_CONFIG} --variable pkgdatadir wayland-protocols
 
@@ -217,7 +232,11 @@ PROTOCOL_OBJS = \
 	wlr-layer-shell-unstable-v1-protocol.o \
 	wlr-foreign-toplevel-management-unstable-v1-protocol.o
 
-all: saber
+# Must sit after every `CFLAGS +=` above. `:N-pthread` drops the single flag in
+# the pkg-config set that would otherwise drag libthr into saberctl.
+CTL_CFLAGS = ${CFLAGS:N-pthread}
+
+all: saber saberctl
 
 # [COMMENT] Action purpose: Regenerate version.h on every build. The phony
 # FORCE prerequisite keeps the target permanently out of date; the header is
@@ -238,6 +257,18 @@ config.o main.o: version.h
 
 saber: version.h ${PROTOCOL_HEADERS} ${PROTOCOL_OBJS} ${OBJS}
 	${CC} ${LDFLAGS} ${CFLAGS} -o ${.TARGET} ${OBJS} ${PROTOCOL_OBJS} ${LIBS}
+
+# [COMMENT] Action purpose: An explicit rule rather than the inferred .c.o one,
+# because saberctl.o is the only object in the tree NOT compiled with ${CFLAGS}.
+# It is deliberately absent from the ${OBJS} ${PROTOCOL_OBJS} dependency on
+# ${PROTOCOL_HEADERS} as well: it includes no generated protocol header, and
+# making it wait on wayland-scanner would tie the one binary that needs no
+# Wayland to the one tool that provides it.
+saberctl.o: src/saberctl.c version.h
+	${CC} ${CTL_CFLAGS} -c ${.CURDIR}/src/saberctl.c -o ${.TARGET}
+
+saberctl: version.h ${CTL_OBJS}
+	${CC} ${LDFLAGS} ${CTL_CFLAGS} -o ${.TARGET} ${CTL_OBJS}
 
 xdg-shell-protocol.h:
 	wayland-scanner client-header ${WAYLAND_PROTOCOLS}/stable/xdg-shell/xdg-shell.xml ${.TARGET}
@@ -288,7 +319,7 @@ clean:
 	@echo "cleaning headers"
 	@rm -f version.h
 	@echo "cleaning object files"
-	@rm -f ${OBJS} ${PROTOCOL_OBJS}
+	@rm -f ${OBJS} ${PROTOCOL_OBJS} ${CTL_OBJS}
 	@echo "cleaning executables"
 	@rm -f saber saberctl
 
@@ -301,6 +332,7 @@ saber-${VERSION}.tar.gz: version.h
 		src/*.c \
 		include/saber/*.h \
 		protocol/*.xml \
+		etc/saber/saber.conf \
 		Makefile \
 		compile_flags.txt \
 		.clang-format \
@@ -318,9 +350,15 @@ dist: distclean saber-${VERSION}.tar.gz
 # no sudoers fragment. Suspend, reboot and shut down work through FreeBSD's
 # existing `operator` group, which already owns /sbin/shutdown (setuid root,
 # group-executable) and /dev/acpi (group-writable). See DECISIONS_LOG D-013.
-install: saber
+install: saber saberctl
 	mkdir -p ${DESTDIR}${PREFIX}/bin
+	mkdir -p ${DESTDIR}${ETC_PREFIX}/etc/saber
+	mkdir -p ${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps
+	install -m 644 share/icons/saber.svg \
+		${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps
 	install -m 555 saber ${DESTDIR}${PREFIX}/bin
+	install -m 555 saberctl ${DESTDIR}${PREFIX}/bin
+	install -m 644 etc/saber/saber.conf ${DESTDIR}${ETC_PREFIX}/etc/saber
 	@${MAKE} -C${.CURDIR} groupcheck
 
 # [COMMENT] Action purpose: Report operator-group membership; never change it.
@@ -344,3 +382,6 @@ groupcheck:
 
 uninstall:
 	rm -f ${DESTDIR}${PREFIX}/bin/saber
+	rm -f ${DESTDIR}${PREFIX}/bin/saberctl
+	rm -f ${DESTDIR}${ETC_PREFIX}/etc/saber/saber.conf
+	rm -f ${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps/saber.svg

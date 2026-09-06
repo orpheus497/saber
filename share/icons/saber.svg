@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Script function and purpose: The BFB emblem - a winged orb. Flat fills
+  only: every colour is a class here so render.c can rewrite the block from the
+  active palette. Defaults are the Sakura reds and base. -->
+  <style>
+    /* Widths are set so adjacent feathers just overlap. Spaced any thinner
+    they read as separate sticks rather than one wing. */
+    .primary { stroke: #c96464; stroke-width: 4.4; }  /* color1  red       */
+    .covert  { stroke: #df8787; stroke-width: 3.8; }  /* color9  light red */
+    .lesser  { stroke: #df8787; stroke-width: 3.0; }
+    .orb     { fill: #c96464; }
+    .orb-rim { fill: #2b1e3a; }                       /* color0  base      */
+    .gloss   { fill: #df8787; }
+    #wing-left path { fill: none; stroke-linecap: round; }
+  </style>
+
+  <!-- Three tiers, which is what separates an angel wing from a fan of spikes:
+  long primaries sweeping to the tips, medium coverts over their roots, and
+  short lesser coverts stacked at the shoulder. Every feather is a round-capped
+  stroke, so the tip is rounded for free and holds down to 24px - a drawn taper
+  collapses to a point at that size and the wing turns back into a bat.
+
+  The wings rise in a V and the orb is small and nested at their base, as in the
+  reference: an orb that dominates leaves the wings as stubs. -->
+  <g id="wing-left">
+    <path class="primary" d="M 28,44 Q 19,27 13,10"/>
+    <path class="primary" d="M 27,44 Q 16,29 10,17"/>
+    <path class="primary" d="M 26,44 Q 15,33  8,24"/>
+    <path class="primary" d="M 26,45 Q 16,38  9,31"/>
+    <path class="primary" d="M 27,46 Q 19,42 13,37"/>
+
+    <path class="covert"  d="M 29,45 Q 23,34 19,24"/>
+    <path class="covert"  d="M 28,46 Q 21,38 17,31"/>
+    <path class="covert"  d="M 28,46 Q 22,42 17,37"/>
+
+    <path class="lesser"  d="M 30,46 Q 27,41 25,35"/>
+    <path class="lesser"  d="M 30,47 Q 27,44 24,40"/>
+  </g>
+  <use href="#wing-left" transform="translate(64,0) scale(-1,1)"/>
+
+  <!-- Rim as a filled ring, not a stroke: a stroke thins below one device pixel
+  at 24px and drops out. No centred highlight - a dot inside a ring reads as a
+  pupil and turns the emblem into a face. -->
+  <circle class="orb-rim" cx="32" cy="50" r="9.5"/>
+  <circle class="orb"     cx="32" cy="50" r="7.5"/>
+  <path class="gloss" opacity="0.55" d="M 27.5,48.5 Q 29.5,45 33.5,45.4 Q 30,46.5 28.8,50 Z"/>
+</svg>

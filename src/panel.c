@@ -1,0 +1,1330 @@
+/* Script function and purpose: One column per output -- layout, painting,
+hit testing and the pointer semantics of BLUEPRINT.md 5.3.
+
+The panel set owns the display's single pointer and output listeners and routes
+each event to the column whose surface received it, because the display layer
+deliberately has room for only one of each. */
+
+#include <math.h>
+#include <string.h>
+
+#include <glib.h>
+
+#include <saber/anim.h>
+#include <saber/appinfo.h>
+#include <saber/panel.h>
+#include <saber/surface.h>
+
+/* linux/input-event-codes.h is a Linux header; the three button codes the
+protocol actually carries are stable and are spelled out rather than pulled in
+through a compatibility shim. */
+#define SABER_BTN_LEFT 0x110
+#define SABER_BTN_RIGHT 0x111
+#define SABER_BTN_MIDDLE 0x112
+
+#define SABER_HOVER_MS 120
+#define SABER_THROB_MS 640
+#define SABER_WIGGLE_MS 360
+#define SABER_LAUNCH_TIMEOUT_MS 5000
+#define SABER_THROB_DEPTH 0.12
+#define SABER_WIGGLE_PIXELS 3.0
+#define SABER_SEPARATOR_GAP 8.0
+
+/* `sub` selects one device or one tray item within the single model entry that
+stands for the whole zone; -1 means the entry itself. */
+struct saber_slot {
+  size_t item;
+  int sub;
+  double y, height;
+};
+
+struct saber_anim_state {
+  struct saber_tween throb;
+  struct saber_tween wiggle;
+  int64_t launch_started;
+  bool throbbing, wiggling, seen;
+};
+
+struct saber_panel {
+  struct saber_panels *set;
+  struct saber_output *output;
+  struct saber_surface *surface;
+  struct wl_callback *frame;
+
+  struct saber_render render; /* per panel: each output has its own scale */
+  struct saber_clock *clock;
+  GHashTable *anim; /* char *item id -> struct saber_anim_state * */
+
+  GArray *slots; /* struct saber_slot */
+  double separator_y;
+  int width, height;
+
+  int hover;  /* slot index, or -1 */
+  int fading; /* slot index fading out, or -1 */
+  int pressed;
+  struct saber_tween hover_in, hover_out;
+
+  double pointer_x, pointer_y;
+};
+
+struct saber_panels {
+  struct saber_panel_deps deps;
+  struct saber_render render;
+  GPtrArray *list;
+  struct saber_panel *pointer_panel;
+};
+
+static void
+panel_schedule_frame(struct saber_panel *panel);
+
+static void
+panel_layout(struct saber_panel *panel);
+
+static void
+panel_sync_anim(struct saber_panel *panel);
+
+/* ------------------------------------------------------------- animation */
+
+static void
+anim_state_free(gpointer data)
+{
+  g_free(data);
+}
+
+static struct saber_anim_state *
+panel_anim(struct saber_panel *panel, const char *id)
+{
+  struct saber_anim_state *state = g_hash_table_lookup(panel->anim, id);
+
+  if (state != NULL) {
+    return state;
+  }
+
+  state = g_new0(struct saber_anim_state, 1);
+
+  saber_tween_init(&state->throb, 0.0);
+  saber_tween_init(&state->wiggle, 0.0);
+  saber_clock_add(panel->clock, &state->throb);
+  saber_clock_add(panel->clock, &state->wiggle);
+  g_hash_table_insert(panel->anim, g_strdup(id), state);
+
+  return state;
+}
+
+/* Phase tweens are stopped back at zero rather than at their target, so a tile
+that stops throbbing settles at its nominal size instead of at the top of the
+swing. */
+static void
+anim_phase_stop(struct saber_tween *tween)
+{
+  saber_tween_stop(tween);
+  tween->value = 0.0;
+}
+
+static void
+panel_sync_anim(struct saber_panel *panel)
+{
+  struct saber_model *model = panel->set->deps.model;
+  int64_t now = saber_clock_now(panel->clock);
+  size_t count = saber_model_size(model);
+
+  GHashTableIter iter;
+  gpointer value;
+
+  g_hash_table_iter_init(&iter, panel->anim);
+
+  while (g_hash_table_iter_next(&iter, NULL, &value)) {
+    ((struct saber_anim_state *)value)->seen = false;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    struct saber_item *item = saber_model_nth(model, i);
+
+    if (item->type != SABER_ITEM_APP || item->id == NULL) {
+      continue;
+    }
+
+    struct saber_anim_state *state = panel_anim(panel, item->id);
+
+    state->seen = true;
+
+    /* Action purpose: The throb has a five second ceiling (BLUEPRINT.md 5.2).
+    An application that never opens a window -- or one whose app_id never
+    matches -- must not leave a tile pulsing for the rest of the session. */
+    if (item->launching) {
+      if (!state->throbbing) {
+        state->throbbing = true;
+        state->launch_started = now;
+        saber_tween_start_repeating(&state->throb, 0.0, 1.0, SABER_THROB_MS,
+            SABER_EASE_LINEAR, now);
+      } else if (now - state->launch_started > SABER_LAUNCH_TIMEOUT_MS) {
+        state->throbbing = false;
+        anim_phase_stop(&state->throb);
+      }
+    } else if (state->throbbing) {
+      state->throbbing = false;
+      anim_phase_stop(&state->throb);
+    }
+
+    if (item->badge.urgent) {
+      if (!state->wiggling) {
+        state->wiggling = true;
+        saber_tween_start_repeating(&state->wiggle, 0.0, 1.0, SABER_WIGGLE_MS,
+            SABER_EASE_LINEAR, now);
+      }
+    } else if (state->wiggling) {
+      state->wiggling = false;
+      anim_phase_stop(&state->wiggle);
+    }
+  }
+
+  g_hash_table_iter_init(&iter, panel->anim);
+
+  while (g_hash_table_iter_next(&iter, NULL, &value)) {
+    struct saber_anim_state *state = value;
+
+    if (!state->seen) {
+      saber_clock_remove(panel->clock, &state->throb);
+      saber_clock_remove(panel->clock, &state->wiggle);
+      g_hash_table_iter_remove(&iter);
+    }
+  }
+}
+
+static void
+panel_damage(struct saber_panel *panel)
+{
+  if (panel->surface == NULL || panel->surface->closed) {
+    return;
+  }
+
+  if (saber_clock_busy(panel->clock)) {
+    panel_schedule_frame(panel);
+  } else {
+    saber_surface_damage(panel->surface);
+  }
+}
+
+static void
+panel_frame_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+  struct saber_panel *panel = data;
+
+  wl_callback_destroy(callback);
+  panel->frame = NULL;
+
+  if (panel->surface == NULL || panel->surface->closed) {
+    return;
+  }
+
+  int64_t now = saber_clock_stamp(panel->clock, time);
+
+  if (saber_clock_advance(panel->clock, now)) {
+    panel_schedule_frame(panel);
+  } else {
+    /* One last paint so the settled values reach the screen. */
+    saber_surface_damage(panel->surface);
+  }
+}
+
+static const struct wl_callback_listener panel_frame_listener = {
+  .done = panel_frame_done,
+};
+
+/* Action purpose: The surface layer owns its own frame callback and discards
+the timestamp, so the panel asks for one of its own -- Wayland allows any
+number per surface and delivers them all on the same frame. The request is made
+BEFORE the damage that triggers the commit, because a frame callback is only
+registered by the commit that follows it. */
+static void
+panel_schedule_frame(struct saber_panel *panel)
+{
+  if (panel->frame != NULL || panel->surface == NULL ||
+      panel->surface->closed || !panel->surface->configured) {
+    return;
+  }
+
+  panel->frame = wl_surface_frame(panel->surface->wl_surface);
+  wl_callback_add_listener(panel->frame, &panel_frame_listener, panel);
+
+  saber_surface_damage(panel->surface);
+}
+
+/* ----------------------------------------------------------------- layout */
+
+static bool
+item_is_head(enum saber_item_type type)
+{
+  return type == SABER_ITEM_BFB || type == SABER_ITEM_APP;
+}
+
+static bool
+item_is_zone(enum saber_item_type type)
+{
+  return type == SABER_ITEM_DEVICES || type == SABER_ITEM_TRAY;
+}
+
+/* How many tiles this model entry contributes. Zero hides it entirely, which
+is what an empty tray or an unavailable sheet socket must do -- a tile that
+answers nothing is worse than no tile. */
+static int
+panel_tile_count(const struct saber_panels *set, const struct saber_item *item)
+{
+  switch (item->type) {
+  case SABER_ITEM_SHEETS:
+    return set->deps.sheets != NULL && saber_sheets_available(set->deps.sheets)
+        ? 1
+        : 0;
+
+  case SABER_ITEM_DEVICES: {
+    if (set->deps.devices == NULL) {
+      return 0;
+    }
+
+    const GPtrArray *list = saber_devices_list(set->deps.devices);
+
+    return list != NULL ? (int)list->len : 0;
+  }
+
+  case SABER_ITEM_TRASH:
+    return set->deps.trash != NULL ? 1 : 0;
+
+  case SABER_ITEM_TRAY:
+    return set->deps.sni != NULL ? (int)saber_sni_count(set->deps.sni) : 0;
+
+  default:
+    return 1;
+  }
+}
+
+static void
+panel_push_slot(struct saber_panel *panel, size_t item, int sub, double y)
+{
+  struct saber_slot slot = {
+    .item = item,
+    .sub = sub,
+    .y = y,
+    .height = (double)panel->render.tile,
+  };
+
+  g_array_append_val(panel->slots, slot);
+}
+
+static void
+panel_layout(struct saber_panel *panel)
+{
+  struct saber_panels *set = panel->set;
+  struct saber_model *model = set->deps.model;
+  double tile = (double)panel->render.tile;
+  size_t count = saber_model_size(model);
+
+  g_array_set_size(panel->slots, 0);
+  panel->separator_y = -1.0;
+
+  if (panel->height <= 0) {
+    return;
+  }
+
+  size_t tail_begin = count;
+
+  for (size_t i = 0; i < count; i++) {
+    if (!item_is_head(saber_model_nth(model, i)->type)) {
+      tail_begin = i;
+      break;
+    }
+  }
+
+  /* Action purpose: The tail is anchored to the bottom rather than following
+  the applications. The session tile has to stay reachable however many windows
+  are open, and a column that scrolled its own power button off the screen
+  would be the first thing anyone noticed. */
+  int tail_tiles = 0;
+
+  for (size_t i = tail_begin; i < count; i++) {
+    tail_tiles += panel_tile_count(set, saber_model_nth(model, i));
+  }
+
+  double tail_top = (double)panel->height - tail_tiles * tile;
+  double head_limit = tail_tiles > 0 ? tail_top - SABER_SEPARATOR_GAP
+                                     : (double)panel->height;
+  double y = 0.0;
+
+  for (size_t i = 0; i < tail_begin; i++) {
+    if (y + tile > head_limit) {
+      break;
+    }
+
+    panel_push_slot(panel, i, -1, y);
+    y += tile;
+  }
+
+  if (tail_tiles > 0 && tail_begin > 0) {
+    panel->separator_y = floor(tail_top - SABER_SEPARATOR_GAP / 2.0) + 0.5;
+  }
+
+  y = tail_top;
+
+  for (size_t i = tail_begin; i < count; i++) {
+    struct saber_item *item = saber_model_nth(model, i);
+    int tiles = panel_tile_count(set, item);
+
+    for (int sub = 0; sub < tiles; sub++) {
+      panel_push_slot(panel, i, item_is_zone(item->type) ? sub : -1, y);
+      y += tile;
+    }
+  }
+}
+
+static int
+panel_slot_at(const struct saber_panel *panel, double x, double y)
+{
+  if (x < 0.0 || x > (double)panel->width) {
+    return -1;
+  }
+
+  for (guint i = 0; i < panel->slots->len; i++) {
+    const struct saber_slot *slot =
+        &g_array_index(panel->slots, struct saber_slot, i);
+
+    if (y >= slot->y && y < slot->y + slot->height) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+
+/* ---------------------------------------------------------------- painting */
+
+/* Function purpose: First name in the chain that resolves. Icon names in
+desktop entries and in SNI items are frequently absent from whichever theme is
+installed, so every tile has a fallback ladder ending in something hicolor is
+guaranteed to ship. */
+static cairo_surface_t *
+panel_icon(struct saber_panel *panel,
+    const char *const *names,
+    size_t count,
+    struct saber_tile *tile)
+{
+  int pixels = (int)lround((double)panel->render.icon_size * panel->render.scale);
+
+  for (size_t i = 0; i < count; i++) {
+    if (names[i] == NULL || *names[i] == '\0') {
+      continue;
+    }
+
+    cairo_surface_t *surface =
+        saber_icons_lookup(panel->set->deps.icons, names[i], pixels);
+
+    if (surface != NULL) {
+      tile->symbolic = g_str_has_suffix(names[i], "-symbolic");
+
+      return surface;
+    }
+  }
+
+  return NULL;
+}
+
+static void
+panel_fill_app_tile(struct saber_panel *panel,
+    struct saber_item *item,
+    struct saber_tile *tile,
+    char *initial)
+{
+  char *stem = NULL;
+  const char *names[3];
+  size_t count = 0;
+
+  if (item->app != NULL && item->app->icon != NULL) {
+    names[count++] = item->app->icon;
+  }
+
+  if (item->id != NULL) {
+    stem = g_str_has_suffix(item->id, ".desktop")
+        ? g_strndup(item->id, strlen(item->id) - strlen(".desktop"))
+        : g_strdup(item->id);
+    names[count++] = stem;
+  }
+
+  names[count++] = "application-x-executable";
+
+  tile->icon = panel_icon(panel, names, count, tile);
+
+  /* The first character of the visible name, so an entry with no icon at all
+  still reads as a distinct tile rather than as a blank square. */
+  const char *label = item->app != NULL && item->app->name != NULL
+      ? item->app->name
+      : item->id;
+
+  if (tile->icon == NULL && label != NULL && *label != '\0') {
+    g_utf8_strncpy(initial, label, 1);
+    *initial = (char)g_ascii_toupper(*initial);
+    tile->label = initial;
+  }
+
+  tile->windows = (int)saber_item_window_count(item);
+  tile->running = tile->windows > 0;
+  tile->focused = item->focused;
+  tile->badge = item->badge;
+
+  struct saber_anim_state *state =
+      item->id != NULL ? panel_anim(panel, item->id) : NULL;
+
+  if (state != NULL && state->throbbing) {
+    tile->throb = saber_anim_throb(saber_tween_value(&state->throb),
+        SABER_THROB_DEPTH);
+  }
+
+  if (state != NULL && state->wiggling) {
+    tile->wiggle = saber_anim_wiggle(saber_tween_value(&state->wiggle)) *
+        SABER_WIGGLE_PIXELS;
+  }
+
+  g_free(stem);
+}
+
+static void
+panel_fill_special_tile(struct saber_panel *panel,
+    const struct saber_slot *slot,
+    struct saber_item *item,
+    struct saber_tile *tile,
+    cairo_surface_t **owned,
+    char *scratch,
+    size_t scratch_size)
+{
+  struct saber_panels *set = panel->set;
+
+  switch (item->type) {
+  case SABER_ITEM_BFB: {
+    /* Action purpose: "saber" first so the shipped emblem wins over whatever
+    the user's icon theme happens to supply for start-here, which is usually
+    that distribution's logo. The rest stay as fallbacks for a tree installed
+    without its share/icons. */
+    static const char *const names[] = { "saber", "start-here",
+      "distributor-logo", "applications-other", "view-app-grid-symbolic",
+      "view-grid-symbolic" };
+
+    tile->icon = panel_icon(panel, names, G_N_ELEMENTS(names), tile);
+    tile->label = "S";
+    break;
+  }
+
+  case SABER_ITEM_SHEETS: {
+    const struct saber_sheets_state *state =
+        saber_sheets_get_state(set->deps.sheets);
+
+    g_snprintf(scratch, scratch_size, "%d", state != NULL ? state->current : 0);
+    tile->label = scratch;
+    tile->focused = state != NULL;
+    tile->running = state != NULL && state->current > 0;
+    break;
+  }
+
+  case SABER_ITEM_DEVICES: {
+    const GPtrArray *list = saber_devices_list(set->deps.devices);
+
+    if (list == NULL || slot->sub < 0 || (guint)slot->sub >= list->len) {
+      break;
+    }
+
+    const struct saber_device *device = g_ptr_array_index(list, slot->sub);
+    const char *names[] = { device->icon, "drive-removable-media",
+      "drive-harddisk", "drive-removable-media-symbolic" };
+
+    tile->icon = panel_icon(panel, names, G_N_ELEMENTS(names), tile);
+    tile->running = true;
+    break;
+  }
+
+  case SABER_ITEM_TRASH: {
+    unsigned int count = saber_trash_count(set->deps.trash);
+    const char *names[] = { count > 0 ? "user-trash-full" : "user-trash",
+      "user-trash", "edit-delete", "user-trash-symbolic" };
+
+    tile->icon = panel_icon(panel, names, G_N_ELEMENTS(names), tile);
+    tile->badge.count = count;
+    tile->badge.count_visible = count > 0;
+    break;
+  }
+
+  case SABER_ITEM_TRAY: {
+    struct saber_sni_item *entry =
+        saber_sni_nth(set->deps.sni, (unsigned int)slot->sub);
+
+    if (entry == NULL) {
+      break;
+    }
+
+    const char *names[] = { saber_sni_item_icon_name(entry) };
+
+    tile->icon = panel_icon(panel, names, G_N_ELEMENTS(names), tile);
+
+    /* Action purpose: An item that ships no themable icon name still has to
+    appear, so its decoded pixmap is wrapped for this frame only. sni.c owns
+    the decode; nothing is cached here. */
+    if (tile->icon == NULL) {
+      const uint8_t *data = NULL;
+      size_t length = 0;
+      int width = 0, height = 0;
+
+      if (saber_sni_item_icon_argb32(entry, &data, &length, &width, &height)) {
+        *owned = saber_icon_from_argb32(data, length, width, height);
+        tile->icon = *owned;
+      }
+    }
+
+    tile->badge.urgent =
+        saber_sni_item_status(entry) == SABER_SNI_NEEDS_ATTENTION;
+    break;
+  }
+
+  case SABER_ITEM_SESSION: {
+    static const char *const names[] = { "system-shutdown", "system-log-out",
+      "application-exit", "system-shutdown-symbolic",
+      "system-log-out-symbolic" };
+
+    tile->icon = panel_icon(panel, names, G_N_ELEMENTS(names), tile);
+    break;
+  }
+
+  default:
+    break;
+  }
+}
+
+static void
+panel_render_surface(void *data,
+    struct saber_surface *surface,
+    cairo_t *cr,
+    int width,
+    int height)
+{
+  struct saber_panel *panel = data;
+
+  panel->render.scale = saber_surface_scale(surface);
+
+  if (width != panel->width || height != panel->height) {
+    panel->width = width;
+    panel->height = height;
+    panel_layout(panel);
+  }
+
+  saber_render_column(&panel->render, cr, width, height);
+
+  if (panel->separator_y >= 0.0) {
+    saber_render_separator(&panel->render, cr, panel->separator_y,
+        (double)width);
+  }
+
+  struct saber_model *model = panel->set->deps.model;
+
+  for (guint i = 0; i < panel->slots->len; i++) {
+    const struct saber_slot *slot =
+        &g_array_index(panel->slots, struct saber_slot, i);
+    struct saber_item *item = saber_model_nth(model, slot->item);
+
+    if (item == NULL) {
+      continue;
+    }
+
+    cairo_surface_t *owned = NULL;
+    char scratch[16] = { 0 };
+    char initial[8] = { 0 };
+    struct saber_tile tile = {
+      .x = 0.0,
+      .y = slot->y,
+      .width = (double)width,
+      .height = slot->height,
+      .throb = 1.0,
+    };
+
+    if (item->type == SABER_ITEM_APP) {
+      panel_fill_app_tile(panel, item, &tile, initial);
+    } else {
+      panel_fill_special_tile(panel, slot, item, &tile, &owned, scratch,
+          sizeof(scratch));
+    }
+
+    if ((int)i == panel->hover) {
+      tile.hover = saber_tween_value(&panel->hover_in);
+      tile.pressed = panel->pressed == (int)i;
+    } else if ((int)i == panel->fading) {
+      tile.hover = saber_tween_value(&panel->hover_out);
+    }
+
+    saber_render_tile(&panel->render, cr, &tile);
+
+    if (owned != NULL) {
+      cairo_surface_destroy(owned);
+    }
+  }
+}
+
+static void
+panel_configure(void *data,
+    struct saber_surface *surface,
+    int width,
+    int height)
+{
+  (void)surface;
+
+  struct saber_panel *panel = data;
+
+  panel->width = width;
+  panel->height = height;
+  panel_layout(panel);
+  panel_sync_anim(panel);
+}
+
+static void
+panel_closed(void *data, struct saber_surface *surface)
+{
+  (void)surface;
+
+  struct saber_panel *panel = data;
+
+  /* The surface cannot be reused; it is torn down when the output that owned
+  it goes, which is the event that actually follows this one. */
+  panel->hover = -1;
+  panel->fading = -1;
+  panel->pressed = -1;
+}
+
+static const struct saber_surface_listener panel_surface_listener = {
+  .configure = panel_configure,
+  .render = panel_render_surface,
+  .closed = panel_closed,
+};
+
+/* ----------------------------------------------------------------- actions */
+
+static struct saber_toplevel *
+item_window(const struct saber_item *item, guint n)
+{
+  if (item->windows == NULL || n >= item->windows->len) {
+    return NULL;
+  }
+
+  return g_ptr_array_index(item->windows, n);
+}
+
+static int
+item_active_window(const struct saber_item *item)
+{
+  for (guint i = 0; item->windows != NULL && i < item->windows->len; i++) {
+    const struct saber_toplevel *toplevel = g_ptr_array_index(item->windows, i);
+
+    if (saber_toplevel_has_state(toplevel, SABER_TOPLEVEL_ACTIVATED)) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+
+static void
+window_raise(struct saber_toplevel *toplevel)
+{
+  if (toplevel == NULL) {
+    return;
+  }
+
+  /* Unminimise first: on hikari-sakura the bit usually means "on another
+  sheet", and activating without clearing it would raise a hidden view. */
+  saber_toplevel_unset_minimized(toplevel);
+  saber_toplevel_activate(toplevel);
+}
+
+static void
+panel_launch(struct saber_panels *set, struct saber_item *item)
+{
+  if (item->app == NULL) {
+    g_warning("saber: no desktop entry for '%s'; cannot launch", item->id);
+
+    return;
+  }
+
+  /* TODO: request an xdg_activation token first and hand it to the child, so
+  the compositor gives the new window focus rather than marking it urgent. */
+  if (!saber_appinfo_launch(item->app, NULL, NULL, NULL)) {
+    g_warning("saber: failed to launch '%s'", item->id);
+
+    return;
+  }
+
+  saber_model_note_launch(set->deps.model, item->id);
+}
+
+static void
+panel_cycle_windows(struct saber_item *item, int direction)
+{
+  guint count = (guint)saber_item_window_count(item);
+
+  if (count == 0) {
+    return;
+  }
+
+  int active = item_active_window(item);
+  int next = active < 0 ? 0 : active + direction;
+
+  next = ((next % (int)count) + (int)count) % (int)count;
+
+  window_raise(item_window(item, (guint)next));
+}
+
+static void
+panel_click_app(struct saber_panels *set, struct saber_item *item)
+{
+  guint count = (guint)saber_item_window_count(item);
+
+  if (count == 0) {
+    panel_launch(set, item);
+
+    return;
+  }
+
+  if (count == 1) {
+    struct saber_toplevel *toplevel = item_window(item, 0);
+
+    if (saber_toplevel_has_state(toplevel, SABER_TOPLEVEL_ACTIVATED)) {
+      saber_toplevel_set_minimized(toplevel);
+    } else {
+      window_raise(toplevel);
+    }
+
+    return;
+  }
+
+  /* TODO: spread, filtered to this application (BLUEPRINT.md 5.3). The spread
+  surface does not exist yet, so this cycles forward through the windows --
+  the same thing a second click on an already-focused tile would do in Unity
+  once the spread is dismissed. */
+  panel_cycle_windows(item, 1);
+}
+
+static void
+panel_click_sheet(struct saber_panels *set)
+{
+  const struct saber_sheets_state *state =
+      saber_sheets_get_state(set->deps.sheets);
+  int next = state != NULL ? (state->current + 1) % SABER_SHEET_COUNT : 1;
+
+  /* TODO: a sheet grid on click, so a sheet can be picked rather than stepped
+  through. Stepping is what scroll already does. */
+  saber_sheets_switch(set->deps.sheets, next, NULL, NULL);
+}
+
+static void
+panel_click_device(struct saber_panels *set, int sub, bool unmount)
+{
+  const GPtrArray *list = saber_devices_list(set->deps.devices);
+
+  if (list == NULL || sub < 0 || (guint)sub >= list->len) {
+    return;
+  }
+
+  const struct saber_device *device = g_ptr_array_index(list, sub);
+
+  if (!unmount) {
+    /* TODO: open the mount point. Saber has no file-manager binding yet, and
+    guessing one would produce a button that silently does nothing. */
+    g_message("saber: %s mounted at %s", device->device, device->mount_point);
+
+    return;
+  }
+
+  GError *error = NULL;
+
+  if (!saber_devices_unmount(set->deps.devices, device->mount_point, NULL, NULL,
+          &error)) {
+    g_warning("saber: unmount %s: %s", device->mount_point,
+        error != NULL ? error->message : "failed");
+  }
+
+  g_clear_error(&error);
+}
+
+static void
+panel_click_tray(struct saber_panels *set, int sub, uint32_t button, int x, int y)
+{
+  struct saber_sni_item *entry =
+      saber_sni_nth(set->deps.sni, (unsigned int)sub);
+
+  if (entry == NULL) {
+    return;
+  }
+
+  switch (button) {
+  case SABER_BTN_MIDDLE:
+    saber_sni_item_secondary_activate(entry, x, y);
+    break;
+
+  /* TODO: render the item's DBusMenu ourselves (BLUEPRINT.md 5.4). Asking the
+  item for its context menu is the only thing available until the menu surface
+  exists, and most items answer it by doing nothing. */
+  case SABER_BTN_RIGHT:
+    saber_sni_item_context_menu(entry, x, y);
+    break;
+
+  default:
+    saber_sni_item_activate(entry, x, y);
+    break;
+  }
+}
+
+static void
+panel_activate_slot(struct saber_panel *panel, int index, uint32_t button)
+{
+  if (index < 0 || (guint)index >= panel->slots->len) {
+    return;
+  }
+
+  struct saber_panels *set = panel->set;
+  const struct saber_slot *slot =
+      &g_array_index(panel->slots, struct saber_slot, index);
+  struct saber_item *item = saber_model_nth(set->deps.model, slot->item);
+
+  if (item == NULL) {
+    return;
+  }
+
+  switch (item->type) {
+  case SABER_ITEM_APP:
+    if (button == SABER_BTN_MIDDLE) {
+      panel_launch(set, item);
+    } else if (button == SABER_BTN_LEFT) {
+      panel_click_app(set, item);
+    }
+    /* TODO: right click opens the quicklist -- the composition in
+    BLUEPRINT.md 5.4 -- which needs a menu surface Saber does not have yet. */
+    break;
+
+  case SABER_ITEM_SHEETS:
+    if (button == SABER_BTN_LEFT) {
+      panel_click_sheet(set);
+    }
+    break;
+
+  case SABER_ITEM_DEVICES:
+    if (button == SABER_BTN_LEFT || button == SABER_BTN_MIDDLE) {
+      panel_click_device(set, slot->sub, button == SABER_BTN_MIDDLE);
+    }
+    break;
+
+  case SABER_ITEM_TRAY:
+    panel_click_tray(set, slot->sub, button, (int)panel->pointer_x,
+        (int)panel->pointer_y);
+    break;
+
+  /* TODO: the BFB opens the Dash and the session tile opens the session menu.
+  Neither surface exists yet; both are deliberately inert rather than being
+  wired to something that half works. */
+  case SABER_ITEM_BFB:
+  case SABER_ITEM_TRASH:
+  case SABER_ITEM_SESSION:
+  default:
+    break;
+  }
+}
+
+static void
+panel_scroll_slot(struct saber_panel *panel, int index, double value)
+{
+  if (index < 0 || (guint)index >= panel->slots->len || value == 0.0) {
+    return;
+  }
+
+  struct saber_panels *set = panel->set;
+  const struct saber_slot *slot =
+      &g_array_index(panel->slots, struct saber_slot, index);
+  struct saber_item *item = saber_model_nth(set->deps.model, slot->item);
+  int direction = value > 0.0 ? 1 : -1;
+
+  if (item == NULL) {
+    return;
+  }
+
+  if (item->type == SABER_ITEM_APP) {
+    panel_cycle_windows(item, direction);
+  } else if (item->type == SABER_ITEM_SHEETS) {
+    const struct saber_sheets_state *state =
+        saber_sheets_get_state(set->deps.sheets);
+    int current = state != NULL ? state->current : 0;
+    int next = ((current + direction) % SABER_SHEET_COUNT + SABER_SHEET_COUNT) %
+        SABER_SHEET_COUNT;
+
+    saber_sheets_switch(set->deps.sheets, next, NULL, NULL);
+  } else if (item->type == SABER_ITEM_TRAY) {
+    struct saber_sni_item *entry =
+        saber_sni_nth(set->deps.sni, (unsigned int)slot->sub);
+
+    if (entry != NULL) {
+      saber_sni_item_scroll(entry, (int)value, SABER_SNI_VERTICAL);
+    }
+  }
+}
+
+/* ----------------------------------------------------------------- pointer */
+
+static void
+panel_set_hover(struct saber_panel *panel, int slot)
+{
+  if (panel->hover == slot) {
+    return;
+  }
+
+  int64_t now = saber_clock_now(panel->clock);
+  int animation_ms = panel->set->deps.config->panel.animation_ms;
+  int duration = animation_ms > 0 ? MIN(animation_ms, SABER_HOVER_MS)
+                                  : SABER_HOVER_MS;
+
+  panel->fading = panel->hover;
+
+  if (panel->fading >= 0) {
+    saber_tween_start(&panel->hover_out, saber_tween_value(&panel->hover_in),
+        0.0, duration, SABER_EASE_OUT_CUBIC, now);
+  }
+
+  panel->hover = slot;
+  panel->pressed = -1;
+
+  if (slot >= 0) {
+    saber_tween_start(&panel->hover_in, 0.0, 1.0, duration,
+        SABER_EASE_OUT_CUBIC, now);
+  } else {
+    saber_tween_stop(&panel->hover_in);
+    panel->hover_in.value = 0.0;
+  }
+
+  panel_damage(panel);
+}
+
+static struct saber_panel *
+panel_for_surface(struct saber_panels *panels, struct wl_surface *surface)
+{
+  for (guint i = 0; i < panels->list->len; i++) {
+    struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    if (panel->surface != NULL && panel->surface->wl_surface == surface) {
+      return panel;
+    }
+  }
+
+  return NULL;
+}
+
+static void
+pointer_enter(void *data, struct wl_surface *surface, double x, double y)
+{
+  struct saber_panels *panels = data;
+  struct saber_panel *panel = panel_for_surface(panels, surface);
+
+  if (panel == NULL) {
+    return;
+  }
+
+  panels->pointer_panel = panel;
+  panel->pointer_x = x;
+  panel->pointer_y = y;
+
+  saber_display_set_cursor(panels->deps.display, "left_ptr");
+  panel_set_hover(panel, panel_slot_at(panel, x, y));
+}
+
+static void
+pointer_leave(void *data, struct wl_surface *surface)
+{
+  struct saber_panels *panels = data;
+  struct saber_panel *panel = panel_for_surface(panels, surface);
+
+  if (panel == NULL) {
+    return;
+  }
+
+  if (panels->pointer_panel == panel) {
+    panels->pointer_panel = NULL;
+  }
+
+  panel_set_hover(panel, -1);
+}
+
+static void
+pointer_motion(void *data, uint32_t time, double x, double y)
+{
+  (void)time;
+
+  struct saber_panels *panels = data;
+  struct saber_panel *panel = panels->pointer_panel;
+
+  if (panel == NULL) {
+    return;
+  }
+
+  panel->pointer_x = x;
+  panel->pointer_y = y;
+
+  panel_set_hover(panel, panel_slot_at(panel, x, y));
+}
+
+static void
+pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
+{
+  (void)time;
+
+  struct saber_panels *panels = data;
+  struct saber_panel *panel = panels->pointer_panel;
+
+  if (panel == NULL) {
+    return;
+  }
+
+  /* Action purpose: Press only marks the tile, release acts. Acting on press
+  would fire on a drag that was never meant to be a click, and reorder is a
+  drag gesture on exactly these tiles. */
+  if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    panel->pressed = panel->hover;
+    panel_damage(panel);
+
+    return;
+  }
+
+  int slot = panel->pressed;
+
+  panel->pressed = -1;
+  panel_damage(panel);
+
+  if (slot >= 0 && slot == panel->hover) {
+    panel_activate_slot(panel, slot, button);
+  }
+}
+
+static void
+pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
+{
+  (void)time;
+
+  struct saber_panels *panels = data;
+  struct saber_panel *panel = panels->pointer_panel;
+
+  if (panel == NULL || axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
+
+  panel_scroll_slot(panel, panel->hover, value);
+}
+
+static const struct saber_pointer_listener panel_pointer_listener = {
+  .enter = pointer_enter,
+  .leave = pointer_leave,
+  .motion = pointer_motion,
+  .button = pointer_button,
+  .axis = pointer_axis,
+};
+
+/* ------------------------------------------------------------- panel set */
+
+static struct saber_panel *
+panel_create(struct saber_panels *panels, struct saber_output *output)
+{
+  struct saber_panel *panel = g_new0(struct saber_panel, 1);
+
+  panel->set = panels;
+  panel->output = output;
+  panel->render = panels->render;
+  panel->clock = saber_clock_create();
+  panel->anim = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+      anim_state_free);
+  panel->slots = g_array_new(FALSE, FALSE, sizeof(struct saber_slot));
+  panel->separator_y = -1.0;
+  panel->hover = -1;
+  panel->fading = -1;
+  panel->pressed = -1;
+
+  saber_tween_init(&panel->hover_in, 0.0);
+  saber_tween_init(&panel->hover_out, 0.0);
+  saber_clock_add(panel->clock, &panel->hover_in);
+  saber_clock_add(panel->clock, &panel->hover_out);
+
+  struct saber_surface_params params;
+
+  saber_surface_panel_params(&params, panels->deps.config, output);
+
+  panel->surface = saber_surface_create(panels->deps.display, &params,
+      &panel_surface_listener, panel);
+
+  if (panel->surface == NULL) {
+    saber_clock_destroy(panel->clock);
+    g_hash_table_destroy(panel->anim);
+    g_array_free(panel->slots, TRUE);
+    g_free(panel);
+
+    return NULL;
+  }
+
+  return panel;
+}
+
+static void
+panel_destroy(struct saber_panel *panel)
+{
+  if (panel == NULL) {
+    return;
+  }
+
+  if (panel->frame != NULL) {
+    wl_callback_destroy(panel->frame);
+  }
+
+  saber_surface_destroy(panel->surface);
+  saber_clock_destroy(panel->clock);
+  g_hash_table_destroy(panel->anim);
+  g_array_free(panel->slots, TRUE);
+  g_free(panel);
+}
+
+/* "all" puts a column on every output, "primary" on the first to appear --
+Wayland has no notion of a primary output, so first-seen is the only honest
+reading -- and anything else is an output name. */
+static bool
+panels_wants_output(const struct saber_panels *panels,
+    const struct saber_output *output)
+{
+  const char *want = panels->deps.config->panel.output;
+
+  if (want == NULL || *want == '\0' || g_strcmp0(want, "all") == 0) {
+    return true;
+  }
+
+  if (g_strcmp0(want, "primary") == 0) {
+    return panels->list->len == 0;
+  }
+
+  return output->name != NULL && g_strcmp0(want, output->name) == 0;
+}
+
+static void
+output_added(void *data, struct saber_output *output)
+{
+  struct saber_panels *panels = data;
+
+  if (!panels_wants_output(panels, output)) {
+    return;
+  }
+
+  struct saber_panel *panel = panel_create(panels, output);
+
+  if (panel == NULL) {
+    g_warning("saber: could not create a panel surface on output '%s'",
+        output->name != NULL ? output->name : "?");
+
+    return;
+  }
+
+  g_ptr_array_add(panels->list, panel);
+}
+
+static void
+output_removed(void *data, struct saber_output *output)
+{
+  struct saber_panels *panels = data;
+
+  for (guint i = 0; i < panels->list->len; i++) {
+    struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    if (panel->output != output) {
+      continue;
+    }
+
+    if (panels->pointer_panel == panel) {
+      panels->pointer_panel = NULL;
+    }
+
+    g_ptr_array_remove_index(panels->list, i);
+    panel_destroy(panel);
+
+    return;
+  }
+}
+
+static void
+output_changed(void *data, struct saber_output *output)
+{
+  (void)output;
+
+  saber_panels_refresh(data);
+}
+
+static const struct saber_output_listener panel_output_listener = {
+  .added = output_added,
+  .removed = output_removed,
+  .changed = output_changed,
+};
+
+struct saber_panels *
+saber_panels_create(const struct saber_panel_deps *deps)
+{
+  struct saber_panels *panels = g_new0(struct saber_panels, 1);
+
+  panels->deps = *deps;
+  panels->list = g_ptr_array_new();
+
+  saber_render_init(&panels->render, deps->config, deps->theme, deps->icons);
+
+  saber_display_set_pointer_listener(deps->display, &panel_pointer_listener,
+      panels);
+  /* Fires immediately for every output already known, so no output that
+  arrived during startup is missed. */
+  saber_display_set_output_listener(deps->display, &panel_output_listener,
+      panels);
+
+  return panels;
+}
+
+void
+saber_panels_destroy(struct saber_panels *panels)
+{
+  if (panels == NULL) {
+    return;
+  }
+
+  saber_display_set_output_listener(panels->deps.display, NULL, NULL);
+  saber_display_set_pointer_listener(panels->deps.display, NULL, NULL);
+
+  for (guint i = 0; i < panels->list->len; i++) {
+    panel_destroy(g_ptr_array_index(panels->list, i));
+  }
+
+  g_ptr_array_free(panels->list, TRUE);
+  g_free(panels);
+}
+
+void
+saber_panels_refresh(struct saber_panels *panels)
+{
+  for (guint i = 0; i < panels->list->len; i++) {
+    struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    panel_layout(panel);
+    panel_sync_anim(panel);
+
+    /* The list changed under the pointer; whatever was hovered may now be a
+    different tile or none at all. */
+    if (panels->pointer_panel == panel) {
+      int slot = panel_slot_at(panel, panel->pointer_x, panel->pointer_y);
+
+      if (slot != panel->hover) {
+        panel_set_hover(panel, slot);
+        continue;
+      }
+    }
+
+    panel_damage(panel);
+  }
+}
+
+unsigned int
+saber_panels_count(const struct saber_panels *panels)
+{
+  return panels->list->len;
+}

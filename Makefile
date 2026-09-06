@@ -256,6 +256,27 @@ FORCE:
 # this an object could compile before wayland-scanner has written the header it
 # includes.
 ${OBJS} ${PROTOCOL_OBJS}: ${PROTOCOL_HEADERS}
+
+# [COMMENT] Action purpose: Every object also depends on every project header,
+# and this is not a nicety -- its absence produced a SIGSEGV.
+#
+# Without it, editing a struct in include/saber/*.h recompiles nothing. Adding a
+# field to `struct saber_display` then leaves every object built before the edit
+# holding the OLD layout while newly built ones hold the new one, so the same
+# struct is read at two different sets of offsets in one binary. The observed
+# failure was pointer_handle_frame() calling through a garbage function pointer,
+# because `pointer_listener` was reading what the stale objects thought was
+# `cursor_theme_name` -- a heap pointer to the string "left_ptr".
+#
+# It is silent, it survives a successful build, and it only bites on an
+# INCREMENTAL build, which is why `make clean && make` appeared to fix it.
+#
+# The dependency is deliberately coarse -- one header changes, everything
+# rebuilds. Twenty-six objects cost a few seconds; getting this subtly wrong
+# costs an afternoon in a debugger.
+SABER_HEADERS != ls ${.CURDIR}/include/saber/*.h
+
+${OBJS} ${CTL_OBJS}: ${SABER_HEADERS}
 config.o main.o: version.h
 
 saber: version.h ${PROTOCOL_HEADERS} ${PROTOCOL_OBJS} ${OBJS}

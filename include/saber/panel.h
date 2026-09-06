@@ -37,9 +37,10 @@ struct saber_panel_deps {
   struct saber_trash *trash;
   struct saber_devices *devices;
   struct saber_sni *sni;
-  /* Only for resolving the desktop entry registered against inode/directory,
-  when neither $FILEMANAGER nor xdg-open answers. NULL costs that last resort
-  and nothing else. */
+  /* Also how a folder-opening tile finds a real file manager: the entry
+  carrying the FileManager category, else the one registered against
+  inode/directory, both filtered so a terminal can never answer. NULL leaves
+  only $FILEMANAGER and xdg-open, and xdg-open applies no such filter. */
   struct saber_appinfo_index *index;
 };
 

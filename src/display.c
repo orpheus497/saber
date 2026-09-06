@@ -527,6 +527,10 @@ keymap_replay_fd(struct saber_display *display)
   return fd;
 }
 
+/* Action purpose: The keymap and the modifier state travel together. Handing a
+listener the keymap alone leaves it compiling a fresh xkb_state -- group 0, no
+lock, nothing latched -- while the seat may be on a second layout group or have
+Caps Lock down, and every keystroke it then resolves is the wrong character. */
 static void
 keymap_deliver(struct saber_display *display)
 {
@@ -541,8 +545,19 @@ keymap_deliver(struct saber_display *display)
     return;
   }
 
-  display->keyboard_listener->keymap(display->keyboard_data,
-      display->keymap_format, fd, (uint32_t)display->keymap_size);
+  /* Snapshotted, because the keymap handler is entitled to install a different
+  listener and the modifiers must not then be handed to it with the previous
+  listener's data. */
+  const struct saber_keyboard_listener *listener = display->keyboard_listener;
+  void *listener_data = display->keyboard_data;
+
+  listener->keymap(listener_data, display->keymap_format, fd,
+      (uint32_t)display->keymap_size);
+
+  if (display->mods_seen && listener->modifiers != NULL) {
+    listener->modifiers(listener_data, display->mods_depressed,
+        display->mods_latched, display->mods_locked, display->mods_group);
+  }
 }
 
 static void
@@ -556,16 +571,22 @@ keyboard_handle_keymap(void *data,
 
   struct saber_display *display = data;
 
-  /* Cache before forwarding: the listener owns the fd once it has it and is
-  entitled to close it. */
-  void *mapped = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  /* Action purpose: Cache only a real keymap. A seat left with no keyboard --
+  which happens whenever a virtual-keyboard client comes and goes -- announces
+  itself as NO_KEYMAP with size 0, and mmapping that is invalid; caching it
+  would replace the good keymap every later listener depends on with nothing.
+  Cache before forwarding, because the listener owns the fd once it has it and
+  is entitled to close it. */
+  if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && size > 0) {
+    void *mapped = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
 
-  if (mapped != MAP_FAILED) {
-    g_free(display->keymap_data);
-    display->keymap_data = g_memdup2(mapped, size);
-    display->keymap_size = size;
-    display->keymap_format = format;
-    munmap(mapped, size);
+    if (mapped != MAP_FAILED) {
+      g_free(display->keymap_data);
+      display->keymap_data = g_memdup2(mapped, size);
+      display->keymap_size = size;
+      display->keymap_format = format;
+      munmap(mapped, size);
+    }
   }
 
   if (display->keyboard_listener != NULL &&
@@ -647,6 +668,12 @@ keyboard_handle_modifiers(void *data,
   (void)serial;
 
   struct saber_display *display = data;
+
+  display->mods_depressed = depressed;
+  display->mods_latched = latched;
+  display->mods_locked = locked;
+  display->mods_group = group;
+  display->mods_seen = true;
 
   if (display->keyboard_listener != NULL &&
       display->keyboard_listener->modifiers != NULL) {

@@ -45,6 +45,51 @@ the next row. Uncapped, a 3440px output lays twenty entries out as one line. */
 the dash asks fontconfig for the system sans at the sizes it wants. */
 #define DASH_FONT "Sans 9.5"
 #define DASH_SEARCH_FONT "Sans 13"
+#define DASH_CHIP_FONT "Sans 10"
+
+#define DASH_CHIP_HEIGHT 28.0
+#define DASH_CHIP_PAD 14.0     /* inside a chip, each side */
+#define DASH_CHIP_GAP 8.0      /* between chips on a row */
+#define DASH_CHIP_ROW_GAP 6.0  /* between wrapped chip rows */
+#define DASH_CHIP_TOP_GAP 18.0 /* search field to the chip row */
+#define DASH_CHIP_BOTTOM_GAP 22.0
+
+/* The freedesktop menu main categories, in the order the filter row shows them.
+The label is the category name verbatim -- the one exception is AudioVideo,
+which is unreadable run together and is nothing else anywhere. */
+static const struct {
+  const char *key;
+  const char *label;
+} dash_categories[] = {
+  { "AudioVideo", "Audio & Video" },
+  { "Development", "Development" },
+  { "Education", "Education" },
+  { "Game", "Game" },
+  { "Graphics", "Graphics" },
+  { "Network", "Network" },
+  { "Office", "Office" },
+  { "Science", "Science" },
+  { "Settings", "Settings" },
+  { "System", "System" },
+  { "Utility", "Utility" },
+};
+
+#define DASH_CATEGORY_COUNT ((int)G_N_ELEMENTS(dash_categories))
+
+/* Not a main category: the bucket for an entry that names none of them. */
+#define DASH_CATEGORY_OTHER DASH_CATEGORY_COUNT
+
+/* The pseudo-filter the row opens on, and the only one that is not a bucket. */
+#define DASH_CATEGORY_ALL (-1)
+
+/* One filter in the row. `width` is the measured label plus its padding; the
+position is assigned by dash_layout, which is the only thing that knows how
+wide the output is. */
+struct dash_chip {
+  int category;
+  const char *label;
+  double x, y, width;
+};
 
 /* Rank ladder: a prefix hit on any field beats an interior hit on every field.
 Within each half the fields are ordered by how much the user meant them. */
@@ -70,6 +115,7 @@ struct dash_entry {
   char *sort_key;
 
   int rank;
+  int category;
 };
 
 struct saber_dash {
@@ -83,6 +129,15 @@ struct saber_dash {
   GPtrArray *entries; /* struct dash_entry *, owned */
   GPtrArray *results; /* struct dash_entry *, borrowed from entries */
 
+  /* The filter row: only the categories the index actually has entries for,
+  always led by All. Rebuilt whenever the entries are. */
+  GArray *chips; /* struct dash_chip */
+  int category;  /* DASH_CATEGORY_ALL, a category index, or _OTHER */
+  int chip_hovered;
+  int chip_pressed;
+  int chip_rows;
+  double chips_y;
+
   int selected;
   int hovered;
   int pressed;
@@ -95,6 +150,7 @@ struct saber_dash {
 
   PangoFontDescription *font;
   PangoFontDescription *search_font;
+  PangoFontDescription *chip_font;
 
   struct xkb_context *xkb;
   struct xkb_keymap *keymap;
@@ -200,6 +256,81 @@ exec_basename(const char *exec)
   return base;
 }
 
+/* Function purpose: The bucket an entry belongs to -- the FIRST name in its own
+Categories list that is a main category, so a desktop file that leads with
+"AudioVideo;Audio;Player" lands under Audio & Video rather than under whichever
+of its keys happens to come first in our table. An entry naming no main category
+at all, or carrying no Categories key, is Other. */
+static int
+entry_category(const struct saber_appinfo *app)
+{
+  if (app->categories == NULL) {
+    return DASH_CATEGORY_OTHER;
+  }
+
+  for (char **name = app->categories; *name != NULL; name++) {
+    for (int i = 0; i < DASH_CATEGORY_COUNT; i++) {
+      if (strcmp(*name, dash_categories[i].key) == 0) {
+        return i;
+      }
+    }
+  }
+
+  return DASH_CATEGORY_OTHER;
+}
+
+/* Function purpose: Rebuild the filter row from what the entries actually are.
+An empty category is not offered: a row of twelve filters, nine of which match
+nothing, is worse than no row. Labels are measured here rather than at paint
+time because dash_layout has to place them and never holds a cairo context. */
+static void
+dash_rebuild_chips(struct saber_dash *dash)
+{
+  bool present[DASH_CATEGORY_COUNT + 1] = { false };
+
+  g_array_set_size(dash->chips, 0);
+
+  /* Nothing to filter: All on its own is a row that does nothing. */
+  if (dash->entries->len == 0) {
+    return;
+  }
+
+  for (guint i = 0; i < dash->entries->len; i++) {
+    const struct dash_entry *entry = g_ptr_array_index(dash->entries, i);
+
+    present[entry->category] = true;
+  }
+
+  PangoContext *context =
+      pango_font_map_create_context(pango_cairo_font_map_get_default());
+  PangoLayout *layout = pango_layout_new(context);
+
+  pango_layout_set_font_description(layout, dash->chip_font);
+
+  for (int i = DASH_CATEGORY_ALL; i <= DASH_CATEGORY_OTHER; i++) {
+    if (i != DASH_CATEGORY_ALL && !present[i]) {
+      continue;
+    }
+
+    struct dash_chip chip = {
+      .category = i,
+      .label = i == DASH_CATEGORY_ALL ? "All"
+          : (i == DASH_CATEGORY_OTHER ? "Other" : dash_categories[i].label),
+    };
+
+    int width;
+
+    pango_layout_set_text(layout, chip.label, -1);
+    pango_layout_get_pixel_size(layout, &width, NULL);
+    chip.width = width + 2.0 * DASH_CHIP_PAD;
+
+    g_array_append_val(dash->chips, chip);
+  }
+
+  g_object_unref(layout);
+  g_object_unref(context);
+}
+
 static void
 dash_build_entries(struct saber_dash *dash)
 {
@@ -230,10 +361,13 @@ dash_build_entries(struct saber_dash *dash)
     entry->fold_generic = fold(app->generic_name);
     entry->fold_exec = fold(exec);
     entry->sort_key = g_utf8_collate_key(label, -1);
+    entry->category = entry_category(app);
 
     g_free(exec);
     g_ptr_array_add(dash->entries, entry);
   }
+
+  dash_rebuild_chips(dash);
 }
 
 /* Function purpose: Where `needle` sits in `haystack`, expressed as the ladder
@@ -299,8 +433,16 @@ dash_filter(struct saber_dash *dash)
 
   g_ptr_array_set_size(dash->results, 0);
 
+  /* Action purpose: The two filters intersect. The category is checked first
+  because it is one integer compare against three substring searches, and it is
+  the one that usually rejects. */
   for (guint i = 0; i < dash->entries->len; i++) {
     struct dash_entry *entry = g_ptr_array_index(dash->entries, i);
+
+    if (dash->category != DASH_CATEGORY_ALL &&
+        entry->category != dash->category) {
+      continue;
+    }
 
     entry->rank = needle != NULL ? entry_rank(entry, needle)
                                  : DASH_RANK_NAME_PREFIX;
@@ -323,6 +465,64 @@ dash_filter(struct saber_dash *dash)
 
 /* ----------------------------------------------------------------- layout */
 
+/* Function purpose: Place the filter row. Chips flow left to right and wrap
+onto further rows when the output is too narrow for them, and each row is
+centred on its own -- a single left-aligned row would sit off-centre under a
+centred search field on every wide output. */
+static void
+dash_layout_chips(struct saber_dash *dash)
+{
+  dash->chip_rows = 0;
+  dash->chips_y = dash->search_y + DASH_SEARCH_HEIGHT + DASH_CHIP_TOP_GAP;
+
+  if (dash->chips->len == 0) {
+    return;
+  }
+
+  double available = (double)dash->width - 2.0 * DASH_MARGIN;
+
+  if (available < 1.0) {
+    available = 1.0;
+  }
+
+  guint start = 0;
+
+  while (start < dash->chips->len) {
+    guint end = start;
+    double used = 0.0;
+
+    /* At least one chip per row, however narrow the output: a chip wider than
+    the whole row still has to be placed somewhere. */
+    while (end < dash->chips->len) {
+      struct dash_chip *chip = &g_array_index(dash->chips, struct dash_chip,
+          end);
+      double next = used + (end > start ? DASH_CHIP_GAP : 0.0) + chip->width;
+
+      if (end > start && next > available) {
+        break;
+      }
+
+      used = next;
+      end++;
+    }
+
+    double x = ((double)dash->width - used) / 2.0;
+    double y = dash->chips_y +
+        dash->chip_rows * (DASH_CHIP_HEIGHT + DASH_CHIP_ROW_GAP);
+
+    for (guint i = start; i < end; i++) {
+      struct dash_chip *chip = &g_array_index(dash->chips, struct dash_chip, i);
+
+      chip->x = x;
+      chip->y = y;
+      x += chip->width + DASH_CHIP_GAP;
+    }
+
+    dash->chip_rows++;
+    start = end;
+  }
+}
+
 static void
 dash_layout(struct saber_dash *dash)
 {
@@ -341,6 +541,8 @@ dash_layout(struct saber_dash *dash)
   dash->search_x = ((double)dash->width - dash->search_width) / 2.0;
   dash->search_y = DASH_MARGIN;
 
+  dash_layout_chips(dash);
+
   double available = (double)dash->width - 2.0 * DASH_MARGIN;
 
   if (available < dash->cell_width) {
@@ -358,7 +560,14 @@ dash_layout(struct saber_dash *dash)
 
   dash->grid_x =
       ((double)dash->width - dash->columns * dash->cell_width) / 2.0;
-  dash->grid_y = dash->search_y + DASH_SEARCH_HEIGHT + DASH_SEARCH_GAP;
+
+  if (dash->chip_rows > 0) {
+    dash->grid_y = dash->chips_y +
+        dash->chip_rows * DASH_CHIP_HEIGHT +
+        (dash->chip_rows - 1) * DASH_CHIP_ROW_GAP + DASH_CHIP_BOTTOM_GAP;
+  } else {
+    dash->grid_y = dash->search_y + DASH_SEARCH_HEIGHT + DASH_SEARCH_GAP;
+  }
 
   double room = (double)dash->height - dash->grid_y - DASH_MARGIN / 2.0;
 
@@ -417,6 +626,22 @@ dash_cell_rect(const struct saber_dash *dash,
   *y = dash->grid_y + row * dash->cell_height;
 
   return true;
+}
+
+static int
+dash_chip_at(const struct saber_dash *dash, double x, double y)
+{
+  for (guint i = 0; i < dash->chips->len; i++) {
+    const struct dash_chip *chip = &g_array_index(dash->chips,
+        struct dash_chip, i);
+
+    if (x >= chip->x && x < chip->x + chip->width && y >= chip->y &&
+        y < chip->y + DASH_CHIP_HEIGHT) {
+      return (int)i;
+    }
+  }
+
+  return -1;
 }
 
 static int
@@ -487,6 +712,55 @@ dash_draw_search(struct saber_dash *dash, cairo_t *cr)
     saber_theme_set_source(cr, &theme->accent);
     cairo_rectangle(cr, caret, y + (h - text_height) / 2.0, 1.5, text_height);
     cairo_fill(cr);
+  }
+
+  g_object_unref(layout);
+}
+
+/* Action purpose: The selected chip is the accent role, the same fill and
+stroke weights the selected grid cell uses, so the two selections read as one
+idea. Every colour here is a theme role -- there are no literals to retint. */
+static void
+dash_draw_chips(struct saber_dash *dash, cairo_t *cr)
+{
+  if (dash->chips->len == 0) {
+    return;
+  }
+
+  const struct saber_theme *theme = dash->deps.theme;
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+
+  pango_layout_set_font_description(layout, dash->chip_font);
+
+  for (guint i = 0; i < dash->chips->len; i++) {
+    const struct dash_chip *chip = &g_array_index(dash->chips,
+        struct dash_chip, i);
+    bool selected = chip->category == dash->category;
+    bool hovered = (int)i == dash->chip_hovered;
+
+    rounded_rect(cr, chip->x, chip->y, chip->width, DASH_CHIP_HEIGHT,
+        DASH_CHIP_HEIGHT / 2.0);
+
+    if (selected || hovered) {
+      set_source_alpha(cr, &theme->accent,
+          (int)i == dash->chip_pressed ? 0.55 : (selected ? 0.38 : 0.18));
+      cairo_fill_preserve(cr);
+      set_source_alpha(cr, &theme->accent, selected ? 1.0 : 0.5);
+      cairo_set_line_width(cr, 1.5);
+      cairo_stroke(cr);
+    } else {
+      set_source_alpha(cr, &theme->dim, 0.35);
+      cairo_fill(cr);
+    }
+
+    int text_width, text_height;
+
+    pango_layout_set_text(layout, chip->label, -1);
+    pango_layout_get_pixel_size(layout, &text_width, &text_height);
+    saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
+    cairo_move_to(cr, chip->x + (chip->width - text_width) / 2.0,
+        chip->y + (DASH_CHIP_HEIGHT - text_height) / 2.0);
+    pango_cairo_show_layout(cr, layout);
   }
 
   g_object_unref(layout);
@@ -628,6 +902,7 @@ dash_render(void *data,
   cairo_paint(cr);
 
   dash_draw_search(dash, cr);
+  dash_draw_chips(dash, cr);
 
   PangoLayout *layout = pango_cairo_create_layout(cr);
 
@@ -742,15 +1017,77 @@ dash_launch(struct saber_dash *dash, int index)
 
 /* ----------------------------------------------------------------- pointer */
 
+/* Function purpose: One place for both hover states, because the pointer is
+over at most one of the grid and the filter row and each has to clear the
+other's highlight as it leaves it. */
 static void
-dash_set_hover(struct saber_dash *dash, int index)
+dash_set_hover(struct saber_dash *dash, double x, double y)
 {
-  if (dash->hovered == index) {
+  int cell = dash_cell_at(dash, x, y);
+  int chip = cell >= 0 ? -1 : dash_chip_at(dash, x, y);
+
+  if (dash->hovered == cell && dash->chip_hovered == chip) {
     return;
   }
 
-  dash->hovered = index;
+  dash->hovered = cell;
+  dash->chip_hovered = chip;
   dash_damage(dash);
+}
+
+static void
+dash_clear_hover(struct saber_dash *dash)
+{
+  if (dash->hovered < 0 && dash->chip_hovered < 0) {
+    return;
+  }
+
+  dash->hovered = -1;
+  dash->chip_hovered = -1;
+  dash_damage(dash);
+}
+
+/* Function purpose: Switch the filter and re-run both halves of it. The query
+is deliberately kept: a category is a narrowing of what is already on screen,
+not a fresh start. */
+static void
+dash_set_category(struct saber_dash *dash, int category)
+{
+  if (dash->category == category) {
+    return;
+  }
+
+  dash->category = category;
+  dash_filter(dash);
+  dash_damage(dash);
+}
+
+/* Function purpose: Move the filter along the row by `delta`, wrapping. This is
+what Tab and Shift+Tab drive -- the row has to be reachable without a pointer,
+and Left/Right belong to the grid, where they move the selection one cell. */
+static void
+dash_cycle_category(struct saber_dash *dash, int delta)
+{
+  int count = (int)dash->chips->len;
+
+  if (count == 0) {
+    return;
+  }
+
+  int current = 0;
+
+  for (int i = 0; i < count; i++) {
+    if (g_array_index(dash->chips, struct dash_chip, i).category ==
+        dash->category) {
+      current = i;
+      break;
+    }
+  }
+
+  int next = ((current + delta) % count + count) % count;
+
+  dash_set_category(dash,
+      g_array_index(dash->chips, struct dash_chip, next).category);
 }
 
 static void
@@ -763,7 +1100,7 @@ dash_pointer_enter(void *data, struct wl_surface *surface, double x, double y)
   }
 
   saber_display_set_cursor(dash->deps.display, "left_ptr");
-  dash_set_hover(dash, dash_cell_at(dash, x, y));
+  dash_set_hover(dash, x, y);
 }
 
 static void
@@ -771,7 +1108,7 @@ dash_pointer_leave(void *data, struct wl_surface *surface)
 {
   (void)surface;
 
-  dash_set_hover(data, -1);
+  dash_clear_hover(data);
 }
 
 static void
@@ -781,7 +1118,7 @@ dash_pointer_motion(void *data, uint32_t time, double x, double y)
 
   struct saber_dash *dash = data;
 
-  dash_set_hover(dash, dash_cell_at(dash, x, y));
+  dash_set_hover(dash, x, y);
 }
 
 static void
@@ -800,6 +1137,7 @@ dash_pointer_button(void *data,
 
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
     dash->pressed = dash->hovered;
+    dash->chip_pressed = dash->chip_hovered;
     dash->selected = dash->hovered >= 0 ? dash->hovered : dash->selected;
     dash_damage(dash);
 
@@ -807,13 +1145,26 @@ dash_pointer_button(void *data,
   }
 
   int index = dash->pressed;
+  int chip = dash->chip_pressed;
 
   dash->pressed = -1;
+  dash->chip_pressed = -1;
+
+  if (chip >= 0) {
+    if (chip == dash->chip_hovered) {
+      dash_set_category(dash,
+          g_array_index(dash->chips, struct dash_chip, chip).category);
+    } else {
+      dash_damage(dash);
+    }
+
+    return;
+  }
 
   /* A press on the backdrop is a dismissal: the dash covers the whole output,
   so there is nowhere else for "click away to close" to happen. */
   if (index < 0) {
-    if (dash->hovered < 0) {
+    if (dash->hovered < 0 && dash->chip_hovered < 0) {
       saber_dash_hide(dash);
     }
 
@@ -1004,6 +1355,26 @@ dash_key(void *data, uint32_t time, uint32_t key, uint32_t state)
 
     return;
 
+  /* Action purpose: Tab walks the category row and Shift+Tab walks it back --
+  the row's only keyboard reach, chosen over Left/Right at the grid edge
+  because the grid wraps rows there and "one more Right" is how a user crosses
+  from the end of a row to the start of the next, not how they leave the grid.
+  A layout that reports Shift+Tab as ISO_Left_Tab is the common case; one that
+  reports a plain Tab with Shift down is not, so both are read. */
+  case XKB_KEY_ISO_Left_Tab:
+    dash_cycle_category(dash, -1);
+
+    return;
+
+  case XKB_KEY_Tab:
+    dash_cycle_category(dash,
+        xkb_state_mod_name_is_active(dash->xkb_state, XKB_MOD_NAME_SHIFT,
+            XKB_STATE_MODS_EFFECTIVE) > 0
+            ? -1
+            : 1);
+
+    return;
+
   case XKB_KEY_Left:
     dash_move(dash, -1);
     break;
@@ -1067,6 +1438,10 @@ saber_dash_create(const struct saber_dash_deps *deps)
   dash->query = g_string_new(NULL);
   dash->entries = g_ptr_array_new_with_free_func(entry_free);
   dash->results = g_ptr_array_new();
+  dash->chips = g_array_new(FALSE, FALSE, sizeof(struct dash_chip));
+  dash->category = DASH_CATEGORY_ALL;
+  dash->chip_hovered = -1;
+  dash->chip_pressed = -1;
   dash->selected = -1;
   dash->hovered = -1;
   dash->pressed = -1;
@@ -1076,14 +1451,15 @@ saber_dash_create(const struct saber_dash_deps *deps)
 
   dash->font = pango_font_description_from_string(DASH_FONT);
   dash->search_font = pango_font_description_from_string(DASH_SEARCH_FONT);
+  dash->chip_font = pango_font_description_from_string(DASH_CHIP_FONT);
 
   dash->xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
   /* Action purpose: wl_keyboard.keymap fires once, when the seat's keyboard is
-  bound -- long before any dash exists -- and display.c does not cache it, so a
-  listener installed later never sees one. The compiled default layout is what
-  makes the search field type at all; a real keymap replaces it if the event
-  does arrive. */
+  bound -- long before any dash exists. display.c caches it and replays it when
+  this listener registers, but a seat that has no keyboard at that moment sends
+  nothing to cache, so the compiled default layout is still what makes the
+  search field type at all until a real keymap arrives. */
   if (dash->xkb != NULL) {
     dash->keymap = xkb_keymap_new_from_names(dash->xkb, NULL,
         XKB_KEYMAP_COMPILE_NO_FLAGS);
@@ -1107,10 +1483,12 @@ saber_dash_destroy(struct saber_dash *dash)
 
   g_ptr_array_free(dash->results, TRUE);
   g_ptr_array_unref(dash->entries);
+  g_array_unref(dash->chips);
   g_string_free(dash->query, TRUE);
 
   pango_font_description_free(dash->font);
   pango_font_description_free(dash->search_font);
+  pango_font_description_free(dash->chip_font);
 
   xkb_state_unref(dash->xkb_state);
   xkb_keymap_unref(dash->keymap);
@@ -1137,6 +1515,7 @@ saber_dash_show(struct saber_dash *dash, struct saber_output *output)
   }
 
   g_string_truncate(dash->query, 0);
+  dash->category = DASH_CATEGORY_ALL;
   dash_build_entries(dash);
 
   /* The output's own size, so the first frame is laid out correctly rather than
@@ -1220,8 +1599,13 @@ saber_dash_hide(struct saber_dash *dash)
 
   g_ptr_array_set_size(dash->results, 0);
   g_ptr_array_set_size(dash->entries, 0);
+  g_array_set_size(dash->chips, 0);
   g_string_truncate(dash->query, 0);
 
+  dash->category = DASH_CATEGORY_ALL;
+  dash->chip_hovered = -1;
+  dash->chip_pressed = -1;
+  dash->chip_rows = 0;
   dash->selected = -1;
   dash->hovered = -1;
   dash->pressed = -1;

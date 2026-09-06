@@ -100,10 +100,17 @@ struct saber_display {
   struct wl_surface *keyboard_focus;
 
   /* The keymap, cached so it can be replayed to a listener that registers
-  after the seat bound -- wl_keyboard.keymap fires only once. */
+  after the seat bound -- wl_keyboard.keymap fires only once. Only ever holds
+  a real XKB_V1 keymap; a NO_KEYMAP seat leaves the last good one in place. */
   char *keymap_data;
   size_t keymap_size;
   uint32_t keymap_format;
+
+  /* The last modifier state, replayed with the keymap: a listener handed a
+  fresh xkb_state would otherwise sit at group 0 with nothing latched, and
+  type the wrong characters until the user next touched a modifier. */
+  uint32_t mods_depressed, mods_latched, mods_locked, mods_group;
+  bool mods_seen;
 
   struct wl_cursor_theme *cursor_theme;
   struct wl_surface *cursor_surface;

@@ -1,7 +1,8 @@
 /* Script function and purpose: The Dash -- the full-screen application grid the
 BFB opens and `saberctl dash` toggles. A zwlr_layer_shell_v1 surface on the
-OVERLAY layer with EXCLUSIVE keyboard interactivity, a search field, and a grid
-of desktop entries filtered by what is typed.
+OVERLAY layer with EXCLUSIVE keyboard interactivity, a search field, a row of
+XDG category filters, and a grid of desktop entries. The two filters intersect:
+a category narrows what is on screen and the query narrows it further.
 
 The backdrop is a translucent theme.overlay fill, never a blur: hikari does not
 advertise ext-background-effect and a Wayland client cannot read the screen

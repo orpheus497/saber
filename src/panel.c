@@ -663,8 +663,13 @@ panel_fill_special_tile(struct saber_panel *panel,
   }
 
   case SABER_ITEM_SESSION: {
-    static const char *const names[] = { "system-shutdown", "system-log-out",
-      "application-exit", "system-shutdown-symbolic",
+    /* Action purpose: The symbolic power glyph leads deliberately. Adwaita
+    carries Inherits=AdwaitaLegacy, and AdwaitaLegacy is the only theme in that
+    chain holding a plain `system-shutdown` -- the GNOME-2 light switch, which
+    would otherwise win on the first name and render a skeuomorphic switch
+    beside the flat icons around it. */
+    static const char *const names[] = { "system-shutdown-symbolic",
+      "system-shutdown", "system-log-out", "application-exit",
       "system-log-out-symbolic" };
 
     tile->icon = panel_icon(panel, names, G_N_ELEMENTS(names), tile);
@@ -942,6 +947,59 @@ panel_launch(struct saber_panels *set, struct saber_item *item)
 
 /* ------------------------------------------------------------ file manager */
 
+/* Function purpose: Case-sensitive membership in a desktop entry's Categories,
+which the spec's registered names are. */
+static bool
+appinfo_has_category(const struct saber_appinfo *app, const char *category)
+{
+  if (app == NULL || app->categories == NULL) {
+    return false;
+  }
+
+  for (guint i = 0; app->categories[i] != NULL; i++) {
+    if (g_strcmp0(app->categories[i], category) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/* Function purpose: An entry that runs in a terminal, or is one, is never a
+file manager. Both passes below need this: kitty registers inode/directory as a
+URL handler, and yazi carries the FileManager category with Terminal=true, so
+either preference alone would still land the user in a terminal. */
+static bool
+filemanager_usable(const struct saber_appinfo *app)
+{
+  return app != NULL && !app->terminal &&
+      !appinfo_has_category(app, "TerminalEmulator");
+}
+
+/* Function purpose: The first indexed entry that calls itself a file manager
+and survives the terminal test. Preferred over the inode/directory association,
+because that association is exactly what goes wrong -- it is stale or absent far
+more often than a FileManager entry is miscategorised. Borrowed. */
+static struct saber_appinfo *
+filemanager_from_categories(struct saber_panels *set)
+{
+  if (set->deps.index == NULL) {
+    return NULL;
+  }
+
+  size_t count = saber_appinfo_index_size(set->deps.index);
+
+  for (size_t i = 0; i < count; i++) {
+    struct saber_appinfo *app = saber_appinfo_index_nth(set->deps.index, i);
+
+    if (appinfo_has_category(app, "FileManager") && filemanager_usable(app)) {
+      return app;
+    }
+  }
+
+  return NULL;
+}
+
 /* Function purpose: The desktop entry registered as the default for
 inode/directory, read from the mimeapps.list files in XDG order. The panel's own
 index is asked rather than GIO's, so a folder opens in the same application the
@@ -982,7 +1040,14 @@ filemanager_from_index(struct saber_panels *set)
           "inode/directory", NULL, NULL);
 
       for (guint n = 0; ids != NULL && ids[n] != NULL && app == NULL; n++) {
-        app = saber_appinfo_index_lookup(set->deps.index, ids[n]);
+        struct saber_appinfo *candidate =
+            saber_appinfo_index_lookup(set->deps.index, ids[n]);
+
+        /* Action purpose: A registered handler that is a terminal is worse
+        than none; skipping it lets a later id in the same list answer. */
+        if (filemanager_usable(candidate)) {
+          app = candidate;
+        }
       }
 
       g_strfreev(ids);
@@ -997,10 +1062,13 @@ filemanager_from_index(struct saber_panels *set)
 }
 
 /* Function purpose: Whatever can open a directory on this system, worked out
-once and kept. $FILEMANAGER is the user's explicit answer and wins, xdg-open is
-the portable one, and the inode/directory handler is the last resort. Nothing
-is guessed by name: a tile that shells out to a browser nobody installed is
-worse than one that says it cannot. */
+once and kept. $FILEMANAGER is the user's explicit answer and wins; then a real
+file manager from the index; then the inode/directory handler; and only then
+xdg-open. xdg-open is last, not first, because it answers from the same
+association chain with none of the terminal test applied -- it will happily
+resolve a directory to a terminal emulator and hang there. Nothing is guessed
+by name: a tile that shells out to a browser nobody installed is worse than one
+that says it cannot. */
 static void
 filemanager_resolve(struct saber_panels *set)
 {
@@ -1031,16 +1099,24 @@ filemanager_resolve(struct saber_panels *set)
     g_strfreev(argv);
   }
 
+  struct saber_appinfo *app = filemanager_from_categories(set);
+
+  if (app == NULL) {
+    app = filemanager_from_index(set);
+  }
+
+  if (app != NULL) {
+    fm->app = saber_appinfo_ref(app);
+
+    return;
+  }
+
   char *program = g_find_program_in_path("xdg-open");
 
   if (program != NULL) {
     fm->argv = g_new0(char *, 2);
     fm->argv[0] = program;
-
-    return;
   }
-
-  fm->app = saber_appinfo_ref(filemanager_from_index(set));
 }
 
 /* Function purpose: fork/exec an argv the panel assembled itself -- never a

@@ -1,0 +1,46 @@
+# Describes the style the tree is actually written in: 2-space indent, spaces
+# never tabs, 80 columns, return type on its own line.
+#
+# hikari-sakura's .clang-format declares 8-wide tabs and does not describe its
+# own sources, which are 2-space like these. Copying it verbatim would have
+# meant shipping a formatter that reformats every file on first run, so this is
+# written from the code instead of inherited.
+BasedOnStyle: LLVM
+
+IndentWidth: 2
+TabWidth: 8
+UseTab: Never
+ContinuationIndentWidth: 4
+ColumnLimit: 80
+
+# `static bool` on one line, the function name on the next -- the form used
+# throughout this tree and in hikari-sakura.
+AlwaysBreakAfterReturnType: All
+
+# NOTE: this config is close to the tree's style but not yet exact -- files
+# still report residual argument-wrapping differences under --dry-run. It is
+# committed as-is rather than reformatting every source, because AGENTS.md
+# forbids mass-editing files for cosmetics. Tune it against the code; do not
+# run it over the code.
+
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeElse: false
+  SplitEmptyFunction: false
+
+IndentCaseLabels: false
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SortIncludes: false
+ReflowComments: false
+InsertNewlineAtEOF: true

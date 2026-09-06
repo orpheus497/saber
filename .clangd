@@ -1,0 +1,36 @@
+CompileFlags:
+  Add:
+    # Saber's own headers, and the repository root -- wayland-scanner writes
+    # the generated *-protocol.h files there, not into include/.
+    - "-Iinclude"
+    - "-I."
+    # The dependency set from BLUEPRINT.md section 7, as pkg-config resolves it
+    # on this host. Regenerate with:
+    #   pkg-config --cflags wayland-client wayland-cursor cairo pangocairo \
+    #              gio-2.0 gdk-pixbuf-2.0 librsvg-2.0 libucl xkbcommon
+    - "-I/usr/local/include"
+    - "-I/usr/local/include/cairo"
+    - "-I/usr/local/include/pango-1.0"
+    - "-I/usr/local/include/glib-2.0"
+    - "-I/usr/local/lib/glib-2.0/include"
+    - "-I/usr/local/include/gdk-pixbuf-2.0"
+    - "-I/usr/local/include/librsvg-2.0"
+    - "-I/usr/local/include/pixman-1"
+    - "-I/usr/local/include/freetype2"
+    - "-I/usr/local/include/fribidi"
+    - "-I/usr/local/include/harfbuzz"
+    - "-I/usr/local/include/libpng16"
+    - "-I/usr/local/include/libxml2"
+    - "-I/usr/local/include/libepoll-shim"
+    - "-D_THREAD_SAFE"
+    - "-DSABER_PREFIX=\"/usr/local\""
+    - "-DSABER_ETC_PREFIX=\"/usr/local\""
+    # Do NOT define _POSIX_C_SOURCE or _XOPEN_SOURCE here. On FreeBSD
+    # sys/cdefs.h sets __BSD_VISIBLE to 0 whenever either is defined, which
+    # hides BSD-only declarations Saber legitimately uses -- getfsstat(2) and
+    # struct statfs via sys/mount.h, u_int via sys/types.h -- and, at 200809L
+    # specifically, usleep, which POSIX removed in the 2008 revision. Defining
+    # one makes clangd stricter than the actual build and reports errors for
+    # code that compiles cleanly. This is the same trap hikari-sakura documents
+    # in its own .clangd.
+    - "-std=gnu11"

@@ -4,9 +4,14 @@
 
 ---
 
-> **Status: design phase.** Nothing is built yet. This repository currently contains the
-> architecture, the decisions behind it and the implementation roadmap, under
-> [`.devdocs/`](.devdocs/). Start with [`.devdocs/BLUEPRINT.md`](.devdocs/BLUEPRINT.md).
+> **Status: early scaffolding.** The panel is not implemented. What builds today is the
+> build itself — `make` produces a `saber` binary that reports its build configuration and
+> exits, which is how the dependency set and the `WITH_*` switches are verified. The
+> architecture, the decisions behind it and the phase roadmap are written and settled;
+> they live outside this repository, alongside it, and are not published.
+>
+> `saber --build` prints the compiled feature set, the linked library versions and whether
+> the invoking user can carry out the session actions.
 
 ## What Saber is
 
@@ -157,9 +162,11 @@ client**: it asks `hikari-sakura` for nothing that is not already published.
 
 ## Documentation
 
-* [`.devdocs/BLUEPRINT.md`](.devdocs/BLUEPRINT.md) — the authoritative architecture
-* [`.devdocs/DECISIONS_LOG.md`](.devdocs/DECISIONS_LOG.md) — every decision, with its reasoning
-* [`.devdocs/PLANS.md`](.devdocs/PLANS.md) — the implementation roadmap
+* `man saber` — the complete reference: configuration, every key, the control surfaces
+* This file — what Saber is, how it fits, and what it deliberately does not do
+
+Design notes, the decision log and the phase roadmap are development artefacts and are not
+part of the distribution, the same treatment `hikari-sakura` gives its own.
 
 ## License
 

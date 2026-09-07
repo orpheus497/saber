@@ -5,6 +5,7 @@ connection from a GLib GSource. */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -470,9 +471,15 @@ pointer_handle_axis_source(void *data,
     struct wl_pointer *wl_pointer,
     uint32_t axis_source)
 {
-  (void)data;
   (void)wl_pointer;
-  (void)axis_source;
+
+  struct saber_display *display = data;
+
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->axis_source != NULL) {
+    display->pointer_target->listener->axis_source(
+        display->pointer_target->data, axis_source);
+  }
 }
 
 static void
@@ -481,22 +488,70 @@ pointer_handle_axis_stop(void *data,
     uint32_t time,
     uint32_t axis)
 {
-  (void)data;
   (void)wl_pointer;
-  (void)time;
-  (void)axis;
+
+  struct saber_display *display = data;
+
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->axis_stop != NULL) {
+    display->pointer_target->listener->axis_stop(display->pointer_target->data,
+        time, axis);
+  }
 }
 
+/* Action purpose: A v5 notch and a v8 v120 delta say the same thing in
+different units, and a compositor sends exactly one of the two -- v8 replaces
+axis_discrete with axis_value120 outright. Both are converted here so no module
+has to know which version it is talking to; 120 is one detent by definition. */
 static void
 pointer_handle_axis_discrete(void *data,
     struct wl_pointer *wl_pointer,
     uint32_t axis,
     int32_t discrete)
 {
+  (void)wl_pointer;
+
+  struct saber_display *display = data;
+
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->axis_value120 != NULL) {
+    display->pointer_target->listener->axis_value120(
+        display->pointer_target->data, axis, discrete * 120);
+  }
+}
+
+static void
+pointer_handle_axis_value120(void *data,
+    struct wl_pointer *wl_pointer,
+    uint32_t axis,
+    int32_t value120)
+{
+  (void)wl_pointer;
+
+  struct saber_display *display = data;
+
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->axis_value120 != NULL) {
+    display->pointer_target->listener->axis_value120(
+        display->pointer_target->data, axis, value120);
+  }
+}
+
+/* Action purpose: Present but empty, and deliberately so. This is a v9 event
+and the seat is bound at 8, so it cannot arrive -- but libwayland dispatches by
+opcode without checking the handler for NULL, so the slot being filled is what
+stands between a later version bump and a SIGSEGV. Whether the wheel is
+physically inverted changes nothing here: every scroll target is relative. */
+static void
+pointer_handle_axis_relative_direction(void *data,
+    struct wl_pointer *wl_pointer,
+    uint32_t axis,
+    uint32_t direction)
+{
   (void)data;
   (void)wl_pointer;
   (void)axis;
-  (void)discrete;
+  (void)direction;
 }
 
 static const struct wl_pointer_listener pointer_listener = {
@@ -509,7 +564,88 @@ static const struct wl_pointer_listener pointer_listener = {
   .axis_source = pointer_handle_axis_source,
   .axis_stop = pointer_handle_axis_stop,
   .axis_discrete = pointer_handle_axis_discrete,
+  .axis_value120 = pointer_handle_axis_value120,
+  .axis_relative_direction = pointer_handle_axis_relative_direction,
 };
+
+/* -- scroll accumulation -------------------------------------------------- */
+
+/* One wheel detent, as every source without high-resolution detail reports it
+on wl_pointer.axis. This is the constant that converts a continuous value into
+the same v120 currency axis_value120 already speaks. */
+#define SABER_SCROLL_NOTCH 10.0
+
+void
+saber_scroll_detail(struct saber_scroll_accum *accum,
+    uint32_t axis,
+    int32_t value120)
+{
+  accum->detail = value120;
+  accum->detail_axis = axis;
+  accum->has_detail = true;
+}
+
+int32_t
+saber_scroll_delta(struct saber_scroll_accum *accum,
+    uint32_t axis,
+    double value)
+{
+  bool matched = accum->has_detail && accum->detail_axis == axis;
+  int32_t detail = accum->detail;
+
+  /* Action purpose: Cleared either way. The detail belongs to the frame that
+  announced it, and a frame that described the horizontal axis must not leave
+  its delta sitting there for the next vertical event to pick up. */
+  accum->has_detail = false;
+  accum->detail = 0;
+
+  if (matched) {
+    return detail;
+  }
+
+  return (int32_t)lround(value * 120.0 / SABER_SCROLL_NOTCH);
+}
+
+int
+saber_scroll_steps(struct saber_scroll_accum *accum,
+    int32_t value120,
+    int32_t per_step)
+{
+  if (per_step <= 0) {
+    per_step = 120;
+  }
+
+  if (value120 == 0) {
+    return 0;
+  }
+
+  /* Action purpose: A change of direction throws the remainder away. Carried
+  over, half a notch of travel one way would have to be paid back before the
+  first step the other way -- which reads as a scroll that ignores the user. */
+  if ((value120 > 0) != (accum->pending > 0) && accum->pending != 0) {
+    accum->pending = 0;
+  }
+
+  accum->pending += value120;
+
+  /* Integer division truncates toward zero in C, so this rounds a negative
+  total the same way it rounds a positive one and the remainder keeps its
+  sign. */
+  int steps = accum->pending / per_step;
+
+  accum->pending -= steps * per_step;
+
+  return steps;
+}
+
+void
+saber_scroll_reset(struct saber_scroll_accum *accum)
+{
+  accum->detail = 0;
+  accum->detail_axis = 0;
+  accum->has_detail = false;
+  accum->pending = 0;
+}
 
 /* Function purpose: Re-create a mappable fd holding the cached keymap, so a
 listener registered after the seat bound still receives one.
@@ -825,8 +961,14 @@ registry_handle_global(void *data,
     display->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
   } else if (strcmp(interface, wl_seat_interface.name) == 0 &&
       display->seat == NULL) {
+    /* Action purpose: 8, not 7, for wl_pointer.axis_value120 -- without it a
+    high-resolution wheel is only ever seen through the coarse axis value and a
+    notch cannot be told from a nudge. The cap is COUPLED to
+    `pointer_listener`: libwayland dispatches by opcode and does not check a
+    handler for NULL, so every event this version can deliver must have a slot
+    filled in there before the number is raised again. */
     display->seat = wl_registry_bind(registry, name, &wl_seat_interface,
-        version_min(version, 7));
+        version_min(version, 8));
     wl_seat_add_listener(display->seat, &seat_listener, display);
   } else if (strcmp(interface, wl_output_interface.name) == 0) {
     struct saber_output *output = g_new0(struct saber_output, 1);

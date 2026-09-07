@@ -84,6 +84,19 @@ struct saber_panel {
   double separator_y;
   int width, height;
 
+  /* Action purpose: The application band scrolls. Until Phase 12 panel_layout
+  simply stopped pushing head tiles once they ran past the tail, so on a short
+  output the applications beyond the fold were not drawn, not hit-testable and
+  not reachable by any gesture at all. `head_scroll` counts application tiles
+  hidden above the fold -- the BFB is not among them, see panel_layout -- and
+  the rest is what that function worked out about the band, kept so the clamp
+  and the overflow arrows agree with the layout rather than re-deriving it. */
+  int head_scroll;
+  int head_count;    /* scrollable head tiles the model holds */
+  int head_visible;  /* scrollable head tiles the band has room for */
+  double head_top;   /* where the scrolling part of the band starts */
+  double head_limit; /* and where it ends */
+
   int hover;  /* slot index, or -1 */
   int fading; /* slot index fading out, or -1 */
   int pressed;
@@ -146,7 +159,18 @@ struct saber_panels {
   void *spread_user;
   saber_panel_dash_func dash;
   void *dash_user;
+
+  /* Action purpose: One accumulator, keyed to what is being scrolled rather
+  than to the slot under the pointer -- the head band keeps its sub-notch
+  remainder while its own tiles slide past, and moving onto a different tile
+  drops it instead of spending it there. SABER_SCROLL_HEAD is the band itself,
+  which is what everything with no scroll of its own falls back to. */
+  struct saber_scroll_accum scroll;
+  size_t scroll_item;
+  int scroll_sub;
 };
+
+#define SABER_SCROLL_HEAD G_MAXSIZE
 
 static void
 panel_schedule_frame(struct saber_panel *panel);
@@ -336,12 +360,6 @@ panel_schedule_frame(struct saber_panel *panel)
 /* ----------------------------------------------------------------- layout */
 
 static bool
-item_is_head(enum saber_item_type type)
-{
-  return type == SABER_ITEM_BFB || type == SABER_ITEM_APP;
-}
-
-static bool
 item_is_zone(enum saber_item_type type)
 {
   return type == SABER_ITEM_DEVICES || type == SABER_ITEM_TRAY;
@@ -393,6 +411,18 @@ panel_push_slot(struct saber_panel *panel, size_t item, int sub, double y)
   g_array_append_val(panel->slots, slot);
 }
 
+/* Function purpose: How far the head band can be scrolled, in whole tiles.
+Reads only what panel_layout last worked out, so it is safe to ask before the
+first layout -- it answers 0 there, which is the truth about a column with no
+size yet. */
+static int
+panel_head_max_scroll(const struct saber_panel *panel)
+{
+  int max = panel->head_count - panel->head_visible;
+
+  return max > 0 ? max : 0;
+}
+
 static void
 panel_layout(struct saber_panel *panel)
 {
@@ -408,13 +438,15 @@ panel_layout(struct saber_panel *panel)
     return;
   }
 
-  size_t tail_begin = count;
+  /* Action purpose: Where the column splits is the configuration's answer, not
+  a test on what kind of tile happens to lead the list: items { order } says
+  which portions come before the application band and which come after it, and
+  the model hands both boundaries over. */
+  size_t apps_begin = saber_model_apps_begin(model);
+  size_t tail_begin = saber_model_apps_end(model);
 
-  for (size_t i = 0; i < count; i++) {
-    if (!item_is_head(saber_model_nth(model, i)->type)) {
-      tail_begin = i;
-      break;
-    }
+  if (tail_begin > count) {
+    tail_begin = count;
   }
 
   /* Action purpose: The tail is anchored to the bottom rather than following
@@ -430,14 +462,55 @@ panel_layout(struct saber_panel *panel)
   double tail_top = (double)panel->height - tail_tiles * tile;
   double head_limit = tail_tiles > 0 ? tail_top - SABER_SEPARATOR_GAP
                                      : (double)panel->height;
-  double y = 0.0;
 
-  for (size_t i = 0; i < tail_begin; i++) {
+  /* Action purpose: What does not fit is scrolled to, not thrown away. The band
+  shows whole tiles only -- a half tile clipped by the separator reads as a
+  rendering fault, and quantising the offset to the tile pitch is also what lets
+  the arrows and the clamp be exact rather than approximate. */
+  panel->head_limit = head_limit;
+
+  double y = 0.0;
+  size_t head = 0;
+
+  /* Action purpose: The portions configured ahead of the application band --
+  by default just the BFB -- are pinned and do not scroll. The BFB is the only
+  route to the Dash, and the argument the tail is anchored for is the same one:
+  a column able to scroll its own launcher button off the top would be the
+  first thing anyone noticed. They contribute tiles the same way the tail's do,
+  because items { order } may now put a zone or a hideable tile up here, and
+  one of those is worth zero tiles or several rather than always exactly one. */
+  for (; head < apps_begin; head++) {
+    struct saber_item *item = saber_model_nth(model, head);
+    int tiles = panel_tile_count(set, item);
+    int sub = 0;
+
+    for (; sub < tiles && y + tile <= head_limit; sub++) {
+      panel_push_slot(panel, head, item_is_zone(item->type) ? sub : -1, y);
+      y += tile;
+    }
+
+    if (sub < tiles) {
+      break;
+    }
+  }
+
+  panel->head_top = y;
+  panel->head_count = (int)(tail_begin - head);
+  panel->head_visible = tile > 0.0 ? (int)floor((head_limit - y) / tile) : 0;
+
+  if (panel->head_visible < 0) {
+    panel->head_visible = 0;
+  }
+
+  panel->head_scroll =
+      CLAMP(panel->head_scroll, 0, panel_head_max_scroll(panel));
+
+  for (head += (size_t)panel->head_scroll; head < tail_begin; head++) {
     if (y + tile > head_limit) {
       break;
     }
 
-    panel_push_slot(panel, i, -1, y);
+    panel_push_slot(panel, head, -1, y);
     y += tile;
   }
 
@@ -681,6 +754,48 @@ panel_fill_special_tile(struct saber_panel *panel,
   }
 }
 
+/* Function purpose: Say that the head band has more above or below. Without it
+a scrolled column is indistinguishable from one that has simply lost tiles --
+which is exactly the failure this replaced, so leaving the state invisible would
+have fixed nothing a user could see. Drawn over the band's own edges, in the
+foreground role, because there is no gutter in a column this narrow. */
+static void
+panel_draw_head_arrows(struct saber_panel *panel, cairo_t *cr, double width)
+{
+  int max = panel_head_max_scroll(panel);
+
+  if (max <= 0 || panel->head_limit <= panel->head_top) {
+    return;
+  }
+
+  const struct saber_theme *theme = panel->render.theme;
+  double cx = width / 2.0;
+  double arm = 4.0;
+
+  saber_theme_set_source(cr, &theme->foreground);
+  cairo_set_line_width(cr, 1.5);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+  cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+
+  if (panel->head_scroll > 0) {
+    double base = panel->head_top;
+
+    cairo_move_to(cr, cx - arm, base + 6.0);
+    cairo_line_to(cr, cx, base + 2.0);
+    cairo_line_to(cr, cx + arm, base + 6.0);
+    cairo_stroke(cr);
+  }
+
+  if (panel->head_scroll < max) {
+    double base = panel->head_limit;
+
+    cairo_move_to(cr, cx - arm, base - 6.0);
+    cairo_line_to(cr, cx, base - 2.0);
+    cairo_line_to(cr, cx + arm, base - 6.0);
+    cairo_stroke(cr);
+  }
+}
+
 static void
 panel_render_surface(void *data,
     struct saber_surface *surface,
@@ -747,6 +862,8 @@ panel_render_surface(void *data,
       cairo_surface_destroy(owned);
     }
   }
+
+  panel_draw_head_arrows(panel, cr, (double)width);
 }
 
 static void
@@ -1547,6 +1664,8 @@ struct saber_sheet_grid {
   const struct saber_keyboard_listener *prev_keyboard;
   void *prev_keyboard_data;
 
+  struct saber_scroll_accum scroll;
+
   bool inside, pressed, closing, held, listening;
 };
 
@@ -1812,6 +1931,48 @@ grid_move(struct saber_sheet_grid *grid, int delta)
   saber_popup_damage(grid->popup);
 }
 
+/* Action purpose: The grid had no axis handler at all, so a wheel over an open
+grid did nothing while the same wheel over the tile behind it stepped sheets --
+the one gesture the grid exists to replace. Scroll moves the cursor rather than
+switching, because the grid is a picker: the switch is the click. */
+static void
+grid_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
+{
+  (void)time;
+
+  struct saber_sheet_grid *grid = data;
+
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
+
+  int steps = saber_scroll_steps(&grid->scroll,
+      saber_scroll_delta(&grid->scroll, axis, value), 120);
+
+  if (steps != 0) {
+    grid_move(grid, steps);
+  }
+}
+
+static void
+grid_pointer_axis_value120(void *data, uint32_t axis, int32_t value120)
+{
+  struct saber_sheet_grid *grid = data;
+
+  saber_scroll_detail(&grid->scroll, axis, value120);
+}
+
+static void
+grid_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
+{
+  (void)time;
+  (void)axis;
+
+  struct saber_sheet_grid *grid = data;
+
+  saber_scroll_reset(&grid->scroll);
+}
+
 static void
 grid_key(void *data, uint32_t time, uint32_t key, uint32_t state)
 {
@@ -1905,6 +2066,9 @@ static const struct saber_pointer_listener grid_pointer_listener = {
   .leave = grid_pointer_leave,
   .motion = grid_pointer_motion,
   .button = grid_pointer_button,
+  .axis = grid_pointer_axis,
+  .axis_value120 = grid_pointer_axis_value120,
+  .axis_stop = grid_pointer_axis_stop,
 };
 
 static const struct saber_keyboard_listener grid_keyboard_listener = {
@@ -2209,40 +2373,131 @@ panel_activate_slot(struct saber_panel *panel, int index, uint32_t button)
   }
 }
 
+/* Function purpose: Point the accumulator at a target, dropping any remainder
+that belonged to the last one. Called on every scroll event rather than only on
+a change, because a target is identified by what it is and not by when it was
+last seen. */
 static void
-panel_scroll_slot(struct saber_panel *panel, int index, double value)
+panel_scroll_arm(struct saber_panels *set, size_t item, int sub)
 {
-  if (index < 0 || (guint)index >= panel->slots->len || value == 0.0) {
+  if (set->scroll_item == item && set->scroll_sub == sub) {
+    return;
+  }
+
+  set->scroll_item = item;
+  set->scroll_sub = sub;
+  saber_scroll_reset(&set->scroll);
+}
+
+static void
+panel_scroll_head(struct saber_panel *panel, int steps)
+{
+  int next = CLAMP(panel->head_scroll + steps, 0,
+      panel_head_max_scroll(panel));
+
+  if (next == panel->head_scroll) {
+    return;
+  }
+
+  panel->head_scroll = next;
+  panel_layout(panel);
+
+  /* The tiles moved under a pointer that did not, so the hover has to be
+  re-resolved or the highlight stays on a tile that is now somewhere else. */
+  panel_set_hover(panel,
+      panel_slot_at(panel, panel->pointer_x, panel->pointer_y));
+  panel_damage(panel);
+}
+
+/* Function purpose: Everything a scroll over the column can mean. `value120`
+is the event's delta in v120 units, where 120 is one wheel notch -- NOT a bare
+direction: a touchpad emits dozens of fractional events per gesture, and the
+sign alone fired a sheet switch or a window cycle for every one of them. */
+static void
+panel_scroll_slot(struct saber_panel *panel, int index, int32_t value120)
+{
+  if (value120 == 0) {
     return;
   }
 
   struct saber_panels *set = panel->set;
   const struct saber_slot *slot =
-      &g_array_index(panel->slots, struct saber_slot, index);
-  struct saber_item *item = saber_model_nth(set->deps.model, slot->item);
-  int direction = value > 0.0 ? 1 : -1;
+      index >= 0 && (guint)index < panel->slots->len
+      ? &g_array_index(panel->slots, struct saber_slot, index)
+      : NULL;
+  struct saber_item *item =
+      slot != NULL ? saber_model_nth(set->deps.model, slot->item) : NULL;
 
-  if (item == NULL) {
-    return;
-  }
-
-  if (item->type == SABER_ITEM_APP) {
-    panel_cycle_windows(item, direction);
-  } else if (item->type == SABER_ITEM_SHEETS) {
-    const struct saber_sheets_state *state =
-        saber_sheets_get_state(set->deps.sheets);
-    int current = state != NULL ? state->current : 0;
-    int next = ((current + direction) % SABER_SHEET_COUNT + SABER_SHEET_COUNT) %
-        SABER_SHEET_COUNT;
-
-    saber_sheets_switch(set->deps.sheets, next, NULL, NULL);
-  } else if (item->type == SABER_ITEM_TRAY) {
+  if (item != NULL && item->type == SABER_ITEM_TRAY) {
     struct saber_sni_item *entry =
         saber_sni_nth(set->deps.sni, (unsigned int)slot->sub);
 
+    panel_scroll_arm(set, slot->item, slot->sub);
+
+    /* Action purpose: Forwarded whole and negated, not truncated to an int and
+    not stepped. StatusNotifierItem inherits Qt's wheel units, so 120 is one
+    notch and the applet on the other end divides by 120 itself -- casting the
+    raw axis value to int threw every sub-notch touchpad delta away as zero.
+    The sign is Qt's too: positive is away from the user, the opposite of
+    wl_pointer.axis, so an uninverted delta scrolled every tray applet the
+    wrong way relative to every other client on the desktop. */
     if (entry != NULL) {
-      saber_sni_item_scroll(entry, (int)value, SABER_SNI_VERTICAL);
+      saber_sni_item_scroll(entry, -value120, SABER_SNI_VERTICAL);
     }
+
+    return;
+  }
+
+  /* Action purpose: An application tile only claims the wheel while it has
+  something to cycle THROUGH. With one window cycling re-raises the same window
+  and with none it does nothing at all, and either way the gesture is dead --
+  so those tiles fall through to the band below, which is what makes scrolling
+  the launcher work over most of its own length instead of only over the BFB. */
+  if (item != NULL && item->type == SABER_ITEM_APP &&
+      saber_item_window_count(item) > 1) {
+    panel_scroll_arm(set, slot->item, -1);
+
+    int steps = saber_scroll_steps(&set->scroll, value120, 120);
+
+    if (steps != 0) {
+      panel_cycle_windows(item, steps);
+    }
+
+    return;
+  }
+
+  if (item != NULL && item->type == SABER_ITEM_SHEETS) {
+    panel_scroll_arm(set, slot->item, -1);
+
+    int steps = saber_scroll_steps(&set->scroll, value120, 120);
+
+    if (steps == 0) {
+      return;
+    }
+
+    const struct saber_sheets_state *state =
+        saber_sheets_get_state(set->deps.sheets);
+    int current = state != NULL ? state->current : 0;
+    int next = ((current + steps) % SABER_SHEET_COUNT + SABER_SHEET_COUNT) %
+        SABER_SHEET_COUNT;
+
+    saber_sheets_switch(set->deps.sheets, next, NULL, NULL);
+
+    return;
+  }
+
+  /* Action purpose: Everything else scrolls the column. The BFB, the devices,
+  the trash and the session tile have no per-tile scroll that is both useful
+  and safe -- stepping a power action under the pointer is not something a
+  stray wheel event should be able to do -- and the launcher's own band is the
+  one thing a scroll anywhere on the strip can usefully mean. The empty gap
+  between the band and the tail arrives here too, with no slot at all. */
+  panel_scroll_arm(set, SABER_SCROLL_HEAD, -1);
+
+  int steps = saber_scroll_steps(&set->scroll, value120, 120);
+
+  if (steps != 0) {
+    panel_scroll_head(panel, steps);
   }
 }
 
@@ -2392,7 +2647,27 @@ pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
     return;
   }
 
-  panel_scroll_slot(panel, panel->hover, value);
+  panel_scroll_slot(panel, panel->hover,
+      saber_scroll_delta(&panels->scroll, axis, value));
+}
+
+static void
+pointer_axis_value120(void *data, uint32_t axis, int32_t value120)
+{
+  struct saber_panels *panels = data;
+
+  saber_scroll_detail(&panels->scroll, axis, value120);
+}
+
+static void
+pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
+{
+  (void)time;
+  (void)axis;
+
+  struct saber_panels *panels = data;
+
+  saber_scroll_reset(&panels->scroll);
 }
 
 /* The set owns one surface per output, and panel_for_surface is already the
@@ -2413,6 +2688,8 @@ static const struct saber_pointer_listener panel_pointer_listener = {
   .motion = pointer_motion,
   .button = pointer_button,
   .axis = pointer_axis,
+  .axis_value120 = pointer_axis_value120,
+  .axis_stop = pointer_axis_stop,
 };
 
 /* ------------------------------------------------------------- panel set */
@@ -2572,6 +2849,8 @@ saber_panels_create(const struct saber_panel_deps *deps)
   panels->deps = *deps;
   panels->list = g_ptr_array_new();
   panels->launches = g_ptr_array_new_with_free_func(launch_free);
+  panels->scroll_item = SABER_SCROLL_HEAD;
+  panels->scroll_sub = -1;
 
   saber_render_init(&panels->render, deps->config, deps->theme, deps->icons);
 

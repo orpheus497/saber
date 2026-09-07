@@ -78,12 +78,31 @@ struct saber_dbusmenu {
   guint layout_sub;
   guint properties_sub;
   guint refresh_source;
+  GCancellable *cancellable;
 
   uint32_t revision;
   struct saber_dbusmenu_item *root;
 
   saber_dbusmenu_updated_func cb;
   void *user;
+};
+
+/* Action purpose: An asynchronous reply can outlive the menu it was issued
+for -- a tray application exiting, or the user dismissing the popup, frees the
+menu from one main-loop source while the reply is already queued on another.
+Cancelling a GCancellable does NOT retract a call that has already completed,
+so testing the reply for G_IO_ERROR_CANCELLED proves nothing about whether the
+menu is still alive. Holding a reference to the cancellable, which
+saber_dbusmenu_close cancels before it frees anything, gives the callback
+something it can safely ask. Same shape as sni.c's prop_fetch, for the same
+reason. */
+struct menu_call {
+  struct saber_dbusmenu *menu;
+  GCancellable *cancellable;
+
+  saber_dbusmenu_done_func done;
+  void *user;
+  GDestroyNotify notify;
 };
 
 static void item_destroy(gpointer data);
@@ -288,37 +307,15 @@ find_in(const struct saber_dbusmenu_item *item, int32_t id)
   return NULL;
 }
 
-bool
-saber_dbusmenu_refresh(struct saber_dbusmenu *menu)
+/* Function purpose: Turn one GetLayout reply into the live tree, whichever way
+the reply arrived. The swap is the whole reason this is a function of its own:
+it is the single point at which every non-owning pointer handed out by
+saber_dbusmenu_root and saber_dbusmenu_find stops being valid, and it must
+happen in exactly one place now that a reply can land from the main loop rather
+than from the caller's frame. */
+static void
+refresh_apply(struct saber_dbusmenu *menu, GVariant *reply)
 {
-  if (menu == NULL) {
-    return false;
-  }
-
-  GError *error = NULL;
-  GVariant *reply = g_dbus_connection_call_sync(menu->connection,
-      menu->bus_name,
-      menu->object_path,
-      MENU_INTERFACE,
-      "GetLayout",
-      g_variant_new("(ii^as)",
-          0,
-          MENU_LAYOUT_DEPTH,
-          (char **)wanted_properties),
-      G_VARIANT_TYPE("(u(ia{sv}av))"),
-      G_DBUS_CALL_FLAGS_NO_AUTO_START,
-      MENU_CALL_TIMEOUT_MS,
-      NULL,
-      &error);
-
-  if (reply == NULL) {
-    g_warning("saber: cannot read the menu at %s: %s",
-        menu->object_path,
-        error != NULL ? error->message : "unknown error");
-    g_clear_error(&error);
-    return false;
-  }
-
   guint32 revision = 0;
   GVariant *layout = NULL;
 
@@ -335,13 +332,193 @@ saber_dbusmenu_refresh(struct saber_dbusmenu *menu)
   }
 
   g_variant_unref(layout);
-  g_variant_unref(reply);
 
   item_destroy(menu->root);
   menu->root = root;
   menu->revision = revision;
+}
+
+/* GetLayout's arguments never vary, and there is a synchronous and an
+asynchronous caller to keep in step. */
+static GVariant *
+layout_arguments(void)
+{
+  return g_variant_new("(ii^as)",
+      0,
+      MENU_LAYOUT_DEPTH,
+      (char **)wanted_properties);
+}
+
+bool
+saber_dbusmenu_refresh(struct saber_dbusmenu *menu)
+{
+  if (menu == NULL) {
+    return false;
+  }
+
+  GError *error = NULL;
+  GVariant *reply = g_dbus_connection_call_sync(menu->connection,
+      menu->bus_name,
+      menu->object_path,
+      MENU_INTERFACE,
+      "GetLayout",
+      layout_arguments(),
+      G_VARIANT_TYPE("(u(ia{sv}av))"),
+      G_DBUS_CALL_FLAGS_NO_AUTO_START,
+      MENU_CALL_TIMEOUT_MS,
+      menu->cancellable,
+      &error);
+
+  if (reply == NULL) {
+    g_warning("saber: cannot read the menu at %s: %s",
+        menu->object_path,
+        error != NULL ? error->message : "unknown error");
+    g_clear_error(&error);
+    return false;
+  }
+
+  refresh_apply(menu, reply);
+  g_variant_unref(reply);
 
   return true;
+}
+
+static struct menu_call *
+menu_call_new(struct saber_dbusmenu *menu,
+    saber_dbusmenu_done_func done,
+    void *user,
+    GDestroyNotify notify)
+{
+  struct menu_call *call = g_new0(struct menu_call, 1);
+
+  call->menu = menu;
+  call->cancellable = g_object_ref(menu->cancellable);
+  call->done = done;
+  call->user = user;
+  call->notify = notify;
+
+  return call;
+}
+
+/* Function purpose: Release one in-flight call's context. The caller's `user`
+is released here and nowhere else, so it is freed exactly once whether the
+reply arrived, failed, or was orphaned by the menu closing underneath it. */
+static void
+menu_call_free(struct menu_call *call)
+{
+  if (call->notify != NULL && call->user != NULL) {
+    call->notify(call->user);
+  }
+
+  g_object_unref(call->cancellable);
+  g_free(call);
+}
+
+/* Whether the menu this call was issued for has since been closed. Sound
+because saber_dbusmenu_close and this callback run on the same main loop: if
+the cancel got there first the menu is gone, and if it did not the menu is
+alive for the duration of the callback. */
+static bool
+menu_call_orphaned(const struct menu_call *call)
+{
+  return g_cancellable_is_cancelled(call->cancellable);
+}
+
+static void
+menu_call_finish(struct menu_call *call, bool refreshed)
+{
+  if (call->done != NULL) {
+    call->done(call->menu, refreshed, call->user);
+  }
+
+  menu_call_free(call);
+}
+
+static void
+on_get_layout(GObject *source, GAsyncResult *res, gpointer data)
+{
+  struct menu_call *call = data;
+  GError *error = NULL;
+  GVariant *reply =
+      g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
+
+  /* Action purpose: Orphan check first, and on both paths -- a reply that
+  succeeded is every bit as capable of arriving after the menu was freed as one
+  that failed. call->menu is dead memory here, so nothing below this may touch
+  it, and neither may the caller's callback, which is why it is not run. */
+  if (menu_call_orphaned(call)) {
+    g_clear_error(&error);
+    g_clear_pointer(&reply, g_variant_unref);
+    menu_call_free(call);
+
+    return;
+  }
+
+  if (reply == NULL) {
+    g_warning("saber: cannot read the menu at %s: %s",
+        call->menu->object_path,
+        error != NULL ? error->message : "unknown error");
+    g_clear_error(&error);
+
+    /* The previous tree stays: a peer that stops answering shows a stale menu
+    rather than an empty one. */
+    menu_call_finish(call, false);
+
+    return;
+  }
+
+  refresh_apply(call->menu, reply);
+  g_variant_unref(reply);
+
+  menu_call_finish(call, true);
+}
+
+/* Function purpose: Issue GetLayout and hand an already-built context to the
+reply. Split out because AboutToShow chains into exactly this when the
+application says it rebuilt its tree, passing the caller's completion straight
+on rather than reporting twice. */
+static void
+layout_call(struct saber_dbusmenu *menu, struct menu_call *call)
+{
+  g_dbus_connection_call(menu->connection,
+      menu->bus_name,
+      menu->object_path,
+      MENU_INTERFACE,
+      "GetLayout",
+      layout_arguments(),
+      G_VARIANT_TYPE("(u(ia{sv}av))"),
+      G_DBUS_CALL_FLAGS_NO_AUTO_START,
+      MENU_CALL_TIMEOUT_MS,
+      menu->cancellable,
+      on_get_layout,
+      call);
+}
+
+void
+saber_dbusmenu_refresh_async(struct saber_dbusmenu *menu,
+    saber_dbusmenu_done_func done,
+    void *user,
+    GDestroyNotify notify)
+{
+  if (menu == NULL) {
+    if (notify != NULL && user != NULL) {
+      notify(user);
+    }
+
+    return;
+  }
+
+  layout_call(menu, menu_call_new(menu, done, user, notify));
+}
+
+static void
+on_refresh_done(struct saber_dbusmenu *menu, bool refreshed, void *user)
+{
+  (void)user;
+
+  if (refreshed && menu->cb != NULL) {
+    menu->cb(menu, menu->user);
+  }
 }
 
 static gboolean
@@ -351,9 +528,7 @@ on_refresh_due(gpointer data)
 
   menu->refresh_source = 0;
 
-  if (saber_dbusmenu_refresh(menu) && menu->cb != NULL) {
-    menu->cb(menu, menu->user);
-  }
+  saber_dbusmenu_refresh_async(menu, on_refresh_done, NULL, NULL);
 
   return G_SOURCE_REMOVE;
 }
@@ -433,6 +608,7 @@ saber_dbusmenu_open(GDBusConnection *connection,
   menu->connection = owned != NULL ? owned : g_object_ref(connection);
   menu->bus_name = g_strdup(bus_name);
   menu->object_path = g_strdup(object_path);
+  menu->cancellable = g_cancellable_new();
   menu->cb = cb;
   menu->user = user;
 
@@ -458,6 +634,12 @@ saber_dbusmenu_open(GDBusConnection *connection,
       menu,
       NULL);
 
+  /* Action purpose: The one read that stays synchronous. A quicklist whose
+  only rows come from this menu -- a tray item's context menu -- is abandoned
+  as empty if it composes before any layout has arrived, so there is nothing
+  useful to map until this reply is in hand. It is a single blocking read on
+  the click that opens the menu, not one per pointer motion, which is what the
+  async form exists to keep off the main loop. */
   saber_dbusmenu_refresh(menu);
 
   return menu;
@@ -470,6 +652,14 @@ saber_dbusmenu_close(struct saber_dbusmenu *menu)
     return;
   }
 
+  /* Action purpose: Cancel first. A call in flight holds this menu as its user
+  data, and completing after the free would be a use-after-free driven by
+  whichever application happened to be slow. Everything below is only safe
+  because this ran. */
+  g_cancellable_cancel(menu->cancellable);
+
+  /* A debounced refresh still pending holds the pointer just as a call in
+  flight does, and a GSource is not cancelled by the GCancellable. */
   g_clear_handle_id(&menu->refresh_source, g_source_remove);
 
   if (menu->layout_sub != 0) {
@@ -483,6 +673,7 @@ saber_dbusmenu_close(struct saber_dbusmenu *menu)
 
   item_destroy(menu->root);
 
+  g_object_unref(menu->cancellable);
   g_object_unref(menu->connection);
   g_free(menu->bus_name);
   g_free(menu->object_path);
@@ -535,6 +726,78 @@ saber_dbusmenu_about_to_show(struct saber_dbusmenu *menu, int32_t id)
   /* TRUE is the application saying it just rebuilt the tree -- drawing the
   layout fetched before the call would show the menu it had a moment ago. */
   return changed ? saber_dbusmenu_refresh(menu) : false;
+}
+
+static void
+on_about_to_show(GObject *source, GAsyncResult *res, gpointer data)
+{
+  struct menu_call *call = data;
+  GVariant *reply =
+      g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, NULL);
+
+  /* Orphan check before anything reads call->menu -- see struct menu_call. */
+  if (menu_call_orphaned(call)) {
+    g_clear_pointer(&reply, g_variant_unref);
+    menu_call_free(call);
+
+    return;
+  }
+
+  /* Many applications do not implement AboutToShow at all, so a failure here
+  is ordinary and not worth a diagnostic: the layout already in hand is what
+  gets drawn. */
+  if (reply == NULL) {
+    menu_call_finish(call, false);
+
+    return;
+  }
+
+  gboolean changed = FALSE;
+
+  g_variant_get(reply, "(b)", &changed);
+  g_variant_unref(reply);
+
+  if (!changed) {
+    menu_call_finish(call, false);
+
+    return;
+  }
+
+  /* Action purpose: TRUE is the application saying it just rebuilt the tree,
+  so the caller must not be told to re-read the children yet -- the layout in
+  hand is still the one from before the call. Handing the context to GetLayout
+  rather than completing here is what makes `refreshed` mean "the new tree has
+  landed", which is the ordering the synchronous form had. */
+  layout_call(call->menu, call);
+}
+
+void
+saber_dbusmenu_about_to_show_async(struct saber_dbusmenu *menu,
+    int32_t id,
+    saber_dbusmenu_done_func done,
+    void *user,
+    GDestroyNotify notify)
+{
+  if (menu == NULL) {
+    if (notify != NULL && user != NULL) {
+      notify(user);
+    }
+
+    return;
+  }
+
+  g_dbus_connection_call(menu->connection,
+      menu->bus_name,
+      menu->object_path,
+      MENU_INTERFACE,
+      "AboutToShow",
+      g_variant_new("(i)", id),
+      G_VARIANT_TYPE("(b)"),
+      G_DBUS_CALL_FLAGS_NO_AUTO_START,
+      MENU_CALL_TIMEOUT_MS,
+      menu->cancellable,
+      on_about_to_show,
+      menu_call_new(menu, done, user, notify));
 }
 
 void

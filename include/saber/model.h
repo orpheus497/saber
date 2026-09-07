@@ -1,7 +1,7 @@
 /* Script function and purpose: The launcher item list -- what the column shows,
 in what order. Favourites in their stored order, then running-but-unpinned
-applications in launch order, with the special tiles fixed around them
-(BLUEPRINT.md 5.1). */
+applications in launch order, with the special tiles placed around them by
+config->items.order (BLUEPRINT.md 5.1). */
 
 #if !defined(SABER_MODEL_H)
 #define SABER_MODEL_H
@@ -67,8 +67,8 @@ struct saber_model;
 typedef void (*saber_model_changed_func)(void *user_data);
 
 /* Function purpose: Build the list from the favourites actually in force and
-the special tiles the configuration enables. Borrows `config`, `index` and
-`match`; all three must outlive the model. */
+the portions config->items.order names, in the sequence it names them. Borrows
+`config`, `index` and `match`; all three must outlive the model. */
 struct saber_model *
 saber_model_create(const struct saber_config *config,
     struct saber_appinfo_index *index,
@@ -87,6 +87,18 @@ saber_model_size(const struct saber_model *model);
 
 struct saber_item *
 saber_model_nth(const struct saber_model *model, size_t n);
+
+/* Function purpose: Where the application band sits in the list. The portions
+the configuration placed before SABER_PORTION_APPS lead it and the ones placed
+after it trail it, and panel.c pins the first group to the top of the column
+and anchors the second to the bottom -- so it asks these rather than testing an
+item's type, which would make the split this file's opinion instead of the
+user's. The band itself is [begin, end) and may be empty. */
+size_t
+saber_model_apps_begin(const struct saber_model *model);
+
+size_t
+saber_model_apps_end(const struct saber_model *model);
 
 struct saber_item *
 saber_model_find(const struct saber_model *model, const char *id);

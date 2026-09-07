@@ -38,6 +38,14 @@ paint somebody else's menu in Saber's own theme. */
 #define QL_MAX_WIDTH 460
 #define QL_TEXT_MAX 340
 
+/* Breathing room kept between a full-height menu and the edges of the output.
+A menu flush against both is indistinguishable from one the compositor has
+clipped. */
+#define QL_SCREEN_MARGIN 8
+
+/* Rows per wheel notch, the desktop's usual figure for a menu. */
+#define QL_SCROLL_ROWS 3
+
 /* Saber's configuration carries no font key and the theme is colours only, so
 the menu asks fontconfig for the system sans at the size a menu wants. */
 #define QL_FONT "Sans 10"
@@ -78,11 +86,38 @@ struct ql_level {
   GPtrArray *entries; /* struct ql_entry * */
 
   int width, height;
+
+  /* Action purpose: Three heights, because a menu can be taller than the
+  screen. `content_height` is what the rows need; `height` is what was ASKED of
+  the compositor, clamped to the output because level_layout used to clamp the
+  width and not this, so a long tray menu asked for a popup taller than the
+  display; `view_height` is what the compositor actually gave, which its
+  RESIZE_Y correction can make shorter still. `scroll` is how far the rows are
+  slid up inside that view -- applied in level_render AND in level_at, or the
+  highlight lands on a different row from the one under the pointer. */
+  int content_height;
+  int view_height;
+  int scroll;
+
   int mark_column, icon_column, arrow_column; /* 0 when the level has none */
+
+  /* Kept so the level can be moved when its rows change size under an open
+  popup; a nested level's anchor is a row of its parent. */
+  int32_t anchor_x, anchor_y, anchor_width, anchor_height;
 
   int hovered;  /* pointer */
   int selected; /* keyboard cursor */
   int open;     /* the row whose submenu is showing */
+
+  /* Action purpose: AboutToShow is answered off the main loop now, so a reply
+  can arrive for a submenu the pointer has already left. This counts the times
+  this level has been asked to open something; a reply quoting an older value
+  is answering a question nobody is asking any more and is dropped. */
+  guint open_serial;
+
+  /* Cancelled by level_destroy before anything is freed, so a reply in flight
+  has something safe to ask about a level that may no longer exist. */
+  GCancellable *cancellable;
 };
 
 struct ql_window {
@@ -122,6 +157,10 @@ struct saber_quicklist {
   void *user;
 
   struct ql_level *pointer_level;
+  /* The pointer's last row-local position, kept so a scroll can re-resolve the
+  hover without waiting for the pointer to move. */
+  double pointer_y;
+  struct saber_scroll_accum scroll;
   uint32_t serial;
   bool pressed;
   bool closing;
@@ -389,6 +428,41 @@ quicklist_compose(struct saber_quicklist *ql)
 
 /* Layout ----------------------------------------------------------------- */
 
+static int
+level_max_scroll(const struct ql_level *level)
+{
+  int max = level->content_height - level->view_height;
+
+  return max > 0 ? max : 0;
+}
+
+/* Function purpose: The tallest popup worth asking the compositor for. The
+panel's layer surface spans the output top to bottom, so its own logical height
+is the screen's; the output is the fallback for the window between creation and
+the first configure. 0 means "no usable reading" -- better an over-tall request
+the compositor corrects than a menu clamped to a number that was never a
+height. */
+static int
+level_height_limit(const struct ql_level *level)
+{
+  const struct saber_surface *parent = level->ql->parent;
+  int limit = 0;
+
+  if (parent == NULL) {
+    return 0;
+  }
+
+  if (parent->height > 0) {
+    limit = parent->height;
+  } else if (parent->output != NULL && parent->output->scale > 0) {
+    limit = parent->output->height / parent->output->scale;
+  }
+
+  limit -= QL_SCREEN_MARGIN * 2;
+
+  return limit >= QL_ROW_HEIGHT * 3 ? limit : 0;
+}
+
 static void
 level_layout(struct ql_level *level)
 {
@@ -439,8 +513,23 @@ level_layout(struct ql_level *level)
   int width = QL_PAD_X * 2 + level->mark_column + level->icon_column + text +
       level->arrow_column;
 
+  int content = y + QL_PAD_Y;
+  int limit = level_height_limit(level);
+
   level->width = CLAMP(width, QL_MIN_WIDTH, QL_MAX_WIDTH);
-  level->height = y + QL_PAD_Y;
+  level->content_height = content;
+  level->height = limit > 0 && content > limit ? limit : content;
+
+  /* Action purpose: Before any configure, what was asked for is the best guess
+  at what will be shown. After one, a correction the compositor already made is
+  kept -- saber_popup_reposition answers false below xdg_popup v3, so a reflow
+  that overwrote it there would restore the belief that the whole menu fits and
+  put the bottom rows back out of reach. */
+  if (level->view_height <= 0 || level->view_height > level->height) {
+    level->view_height = level->height;
+  }
+
+  level->scroll = CLAMP(level->scroll, 0, level_max_scroll(level));
 }
 
 /* Drawing ---------------------------------------------------------------- */
@@ -541,6 +630,16 @@ level_render(void *data,
   cairo_rectangle(cr, 0.5, 0.5, width - 1.0, height - 1.0);
   cairo_stroke(cr);
 
+  /* Action purpose: Rows are laid out in content coordinates and slid up by the
+  offset here, clipped to the inside of the frame so a half-scrolled row cannot
+  paint over the border. level_at applies the SAME offset -- the two disagreeing
+  is what makes a menu whose highlight sits on a different row from the pointer,
+  and it is why the offset must never be applied in only one of them. */
+  cairo_save(cr);
+  cairo_rectangle(cr, 1.0, 1.0, width - 2.0, height - 2.0);
+  cairo_clip(cr);
+  cairo_translate(cr, 0.0, -(double)level->scroll);
+
   PangoLayout *layout = pango_cairo_create_layout(cr);
   pango_layout_set_font_description(layout, level->ql->font);
   pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
@@ -611,6 +710,7 @@ level_render(void *data,
   }
 
   g_object_unref(layout);
+  cairo_restore(cr);
 }
 
 /* Levels ----------------------------------------------------------------- */
@@ -618,6 +718,14 @@ level_render(void *data,
 static void
 level_close_children(struct ql_level *level)
 {
+  /* Action purpose: Bumped even when there is no child. A row whose AboutToShow
+  is still in flight has no child yet, and its reply must be dropped just the
+  same once the pointer has moved on or the rows have been recomposed
+  underneath it -- the index it recorded would otherwise name a different row.
+  Every path that closes a submenu or replaces a level's rows comes through
+  here, which is what makes the serial sufficient on its own. */
+  level->open_serial++;
+
   if (level->child == NULL) {
     return;
   }
@@ -625,6 +733,50 @@ level_close_children(struct ql_level *level)
   level_destroy(level->child);
   level->child = NULL;
   level->open = -1;
+}
+
+/* Function purpose: The one way a level's offset changes. Everything that can
+scroll -- the wheel, the keyboard cursor leaving the view -- comes through here
+so the clamp and the submenu teardown cannot be forgotten at one of them. */
+static void
+level_scroll_to(struct ql_level *level, int scroll)
+{
+  int next = CLAMP(scroll, 0, level_max_scroll(level));
+
+  if (next == level->scroll) {
+    return;
+  }
+
+  /* Action purpose: A submenu is anchored to the parent row it hangs off, and
+  that row has just moved. Repositioning it would need the anchor recomputed on
+  every scroll step; closing it is both honest and what leaving the row would
+  have done anyway. */
+  level_close_children(level);
+
+  level->scroll = next;
+  saber_popup_damage(level->popup);
+}
+
+/* Function purpose: Bring a row inside the view. The keyboard cursor can now
+walk off the bottom of a clamped menu, and a selection that cannot be seen is a
+menu that looks frozen. */
+static void
+level_reveal(struct ql_level *level, int index)
+{
+  if (index < 0 || index >= (int)level->entries->len) {
+    return;
+  }
+
+  const struct ql_entry *entry = g_ptr_array_index(level->entries, index);
+  int scroll = level->scroll;
+
+  if (entry->y < scroll) {
+    scroll = entry->y;
+  } else if (entry->y + entry->height > scroll + level->view_height) {
+    scroll = entry->y + entry->height - level->view_height;
+  }
+
+  level_scroll_to(level, scroll);
 }
 
 /* Action purpose: Nested popups must be destroyed innermost first, or the
@@ -638,6 +790,13 @@ level_destroy(struct ql_level *level)
 
   level_destroy(level->child);
 
+  /* Action purpose: Cancel before anything is freed. An AboutToShow issued for
+  this level holds it as its user data and can still complete afterwards, so
+  this is the only thing standing between a slow application and a write into
+  freed memory. */
+  g_cancellable_cancel(level->cancellable);
+  g_object_unref(level->cancellable);
+
   if (level->ql->pointer_level == level) {
     level->ql->pointer_level = NULL;
   }
@@ -647,13 +806,29 @@ level_destroy(struct ql_level *level)
   g_free(level);
 }
 
+/* Function purpose: Take the size the compositor settled on. The positioner
+asks for SLIDE_Y then RESIZE_Y, so a menu that would run off the bottom comes
+back SHORTER than it asked for -- and this discarded that answer entirely until
+Phase 12, leaving the level convinced it had its full height and every row past
+the real bottom edge drawn outside the buffer, invisible and unclickable. */
 static void
 level_configure(void *data, struct saber_popup *popup, int width, int height)
 {
   (void)popup;
   (void)width;
-  (void)height;
-  (void)data;
+
+  struct ql_level *level = data;
+
+  if (height <= 0 || height == level->view_height) {
+    return;
+  }
+
+  level->view_height = height;
+  level->scroll = CLAMP(level->scroll, 0, level_max_scroll(level));
+
+  if (level->popup != NULL) {
+    saber_popup_damage(level->popup);
+  }
 }
 
 static void
@@ -703,6 +878,11 @@ level_create(struct saber_quicklist *ql,
   level->hovered = -1;
   level->selected = -1;
   level->open = -1;
+  level->cancellable = g_cancellable_new();
+  level->anchor_x = anchor_x;
+  level->anchor_y = anchor_y;
+  level->anchor_width = anchor_width;
+  level->anchor_height = anchor_height;
 
   level_layout(level);
 
@@ -723,12 +903,162 @@ level_create(struct saber_quicklist *ql,
             &level_popup_listener, level);
 
   if (level->popup == NULL) {
+    g_object_unref(level->cancellable);
     g_ptr_array_unref(entries);
     g_free(level);
     return NULL;
   }
 
   return level;
+}
+
+/* Function purpose: Re-measure a level whose rows have just been replaced and
+move its popup to match. A level that grew or shrank and was left at its old
+size is either clipped or padded with empty space, and a nested one has to be
+re-anchored against the parent row it hangs off. */
+static void
+level_reflow(struct ql_level *level)
+{
+  struct saber_quicklist *ql = level->ql;
+
+  level_layout(level);
+
+  struct saber_popup_params params;
+  saber_popup_menu_params(&params, ql->edge, level->width, level->height,
+      level->anchor_x, level->anchor_y, level->anchor_width,
+      level->anchor_height);
+  saber_popup_reposition(level->popup, &params);
+
+  saber_popup_damage(level->popup);
+}
+
+/* Action purpose: One AboutToShow in flight. The cancellable is the level's
+own, held by reference so this can still be asked after the level is gone --
+the shape sni.c's prop_fetch uses, for the same reason. `serial` and `index`
+answer the softer question the cancellable cannot: the level is alive, but is
+it still opening the row this call was issued for? */
+struct ql_submenu_request {
+  struct ql_level *level;
+  GCancellable *cancellable;
+
+  guint serial;
+  int index;
+  int32_t dbusmenu_id;
+};
+
+static struct ql_submenu_request *
+submenu_request_new(struct ql_level *level, int index, int32_t dbusmenu_id)
+{
+  struct ql_submenu_request *request = g_new0(struct ql_submenu_request, 1);
+
+  request->level = level;
+  request->cancellable = g_object_ref(level->cancellable);
+  request->serial = level->open_serial;
+  request->index = index;
+  request->dbusmenu_id = dbusmenu_id;
+
+  return request;
+}
+
+static void
+submenu_request_free(gpointer data)
+{
+  struct ql_submenu_request *request = data;
+
+  g_object_unref(request->cancellable);
+  g_free(request);
+}
+
+/* Function purpose: Apply an AboutToShow reply that re-read the layout. The
+submenu is usually already on screen with the children the old tree held, so
+the new ones replace its rows in place rather than replacing the popup -- which
+is what makes an application that answers TRUE on every open look no different
+from one that answers FALSE. */
+static void
+submenu_apply(struct ql_submenu_request *request,
+    const struct saber_dbusmenu_item *item)
+{
+  struct ql_level *level = request->level;
+  GPtrArray *entries = item != NULL
+      ? entries_from_children(item)
+      : g_ptr_array_new_with_free_func(entry_free);
+
+  if (level->child != NULL) {
+    if (entries->len == 0) {
+      /* The row lost its children outright; leaving the old ones up would be a
+      menu that lies about what it will do. */
+      g_ptr_array_unref(entries);
+      level_close_children(level);
+      saber_popup_damage(level->popup);
+
+      return;
+    }
+
+    struct ql_level *child = level->child;
+
+    /* A grandchild was opened from rows that are about to be thrown away, and
+    closing it here is also what invalidates any reply still in flight for
+    it. */
+    level_close_children(child);
+
+    g_ptr_array_unref(child->entries);
+    child->entries = entries;
+    child->hovered = -1;
+    child->selected = -1;
+
+    level_reflow(child);
+
+    return;
+  }
+
+  /* Nothing was drawn when the call went out -- an application that populates
+  lazily has only now said what the row contains. */
+  if (entries->len == 0) {
+    g_ptr_array_unref(entries);
+
+    return;
+  }
+
+  const struct ql_entry *entry =
+      g_ptr_array_index(level->entries, request->index);
+
+  /* The anchor is where the row is DRAWN, not where it sits in the content, or
+  a submenu opened from a scrolled menu points at empty space. */
+  level->child = level_create(level->ql, level, entries, 0,
+      entry->y - level->scroll, level->width, entry->height);
+
+  if (level->child != NULL) {
+    level->open = request->index;
+  }
+}
+
+static void
+on_about_to_show(struct saber_dbusmenu *menu, bool refreshed, void *user)
+{
+  struct ql_submenu_request *request = user;
+
+  /* Action purpose: Orphan check before anything reads request->level. The
+  level, or the whole quicklist under it, can be destroyed while an application
+  takes its time answering, and request->level is dead memory when that has
+  happened. */
+  if (g_cancellable_is_cancelled(request->cancellable)) {
+    return;
+  }
+
+  /* Not refreshed means the application either declined AboutToShow or said
+  the tree is unchanged; the children already on screen are the right ones. */
+  if (!refreshed) {
+    return;
+  }
+
+  struct ql_level *level = request->level;
+
+  if (request->serial != level->open_serial ||
+      request->index >= (int)level->entries->len) {
+    return;
+  }
+
+  submenu_apply(request, saber_dbusmenu_find(menu, request->dbusmenu_id));
 }
 
 static void
@@ -747,32 +1077,37 @@ level_open_submenu(struct ql_level *level, int index)
 
   level_close_children(level);
 
-  /* Action purpose: AboutToShow is the one notice an application that builds
-  its menu lazily ever gets, and a TRUE reply means it changed the tree -- the
-  layout has already been re-read by then, so the children must be looked up
-  again afterwards rather than before. */
-  saber_dbusmenu_about_to_show(ql->menu, entry->dbusmenu_id);
-
+  /* Action purpose: Draw what the layout already holds before asking, not
+  after. AboutToShow is a round trip to an arbitrary application, and a submenu
+  that waited for it would take that application's reply time to appear -- on
+  every hover, since this is reached from pointer motion. The reply can only
+  correct what goes up here, never contradict the fact that a submenu opened.
+  A row whose children the application has not published yet still draws
+  nothing until they arrive, because there is nothing to draw. */
   const struct saber_dbusmenu_item *item =
       saber_dbusmenu_find(ql->menu, entry->dbusmenu_id);
+  GPtrArray *entries = item != NULL
+      ? entries_from_children(item)
+      : g_ptr_array_new_with_free_func(entry_free);
 
-  if (item == NULL || item->children == NULL || item->children->len == 0) {
-    return;
-  }
+  if (entries->len > 0) {
+    level->child = level_create(ql, level, entries, 0,
+        entry->y - level->scroll, level->width, entry->height);
 
-  GPtrArray *entries = entries_from_children(item);
-
-  if (entries->len == 0) {
+    if (level->child != NULL) {
+      level->open = index;
+    }
+  } else {
     g_ptr_array_unref(entries);
-    return;
   }
 
-  level->child = level_create(ql, level, entries, 0, entry->y, level->width,
-      entry->height);
-
-  if (level->child != NULL) {
-    level->open = index;
-  }
+  /* Action purpose: AboutToShow is the one notice an application that builds
+  its menu lazily ever gets, and a TRUE reply means it changed the tree -- the
+  layout is re-read before `refreshed` comes back true, so the children are
+  looked up again in the callback rather than here. */
+  saber_dbusmenu_about_to_show_async(ql->menu, entry->dbusmenu_id,
+      on_about_to_show, submenu_request_new(level, index, entry->dbusmenu_id),
+      submenu_request_free);
 }
 
 /* Activation ------------------------------------------------------------- */
@@ -866,10 +1201,15 @@ level_deepest(struct saber_quicklist *ql)
 static int
 level_at(const struct ql_level *level, double y)
 {
+  /* The same offset level_render slides the rows by, in the other direction:
+  the caller's `y` is where the pointer is on the popup, the entries are laid
+  out in content coordinates. */
+  double content_y = y + level->scroll;
+
   for (guint i = 0; i < level->entries->len; i++) {
     const struct ql_entry *entry = g_ptr_array_index(level->entries, i);
 
-    if (y >= entry->y && y < entry->y + entry->height) {
+    if (content_y >= entry->y && content_y < entry->y + entry->height) {
       return entry->kind == QL_SEPARATOR ? -1 : (int)i;
     }
   }
@@ -915,6 +1255,8 @@ quicklist_pointer_enter(void *data,
   struct ql_level *level = level_from_surface(ql, surface);
 
   ql->pointer_level = level;
+  ql->pointer_y = y;
+  saber_scroll_reset(&ql->scroll);
 
   if (level != NULL) {
     level_hover(level, y);
@@ -945,9 +1287,64 @@ quicklist_pointer_motion(void *data, uint32_t time, double x, double y)
 
   struct saber_quicklist *ql = data;
 
+  ql->pointer_y = y;
+
   if (ql->pointer_level != NULL) {
     level_hover(ql->pointer_level, y);
   }
+}
+
+/* Action purpose: The menu had no axis handler at all, so the rows a clamped
+level could not show were unreachable by every route at once -- off the bottom
+of the popup, out of the buffer, and with nothing bound to move them. Three rows
+a notch, and the hover is re-resolved afterwards because the rows moved under a
+pointer that did not. */
+static void
+quicklist_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
+{
+  (void)time;
+
+  struct saber_quicklist *ql = data;
+  struct ql_level *level = ql->pointer_level;
+
+  if (level == NULL || axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
+
+  int steps = saber_scroll_steps(&ql->scroll,
+      saber_scroll_delta(&ql->scroll, axis, value), 120);
+
+  if (steps == 0) {
+    return;
+  }
+
+  int before = level->scroll;
+
+  level_scroll_to(level, before + steps * QL_SCROLL_ROWS * QL_ROW_HEIGHT);
+
+  if (level->scroll != before) {
+    level->hovered = -1;
+    level_hover(level, ql->pointer_y);
+  }
+}
+
+static void
+quicklist_pointer_axis_value120(void *data, uint32_t axis, int32_t value120)
+{
+  struct saber_quicklist *ql = data;
+
+  saber_scroll_detail(&ql->scroll, axis, value120);
+}
+
+static void
+quicklist_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
+{
+  (void)time;
+  (void)axis;
+
+  struct saber_quicklist *ql = data;
+
+  saber_scroll_reset(&ql->scroll);
 }
 
 static void
@@ -1011,6 +1408,9 @@ static const struct saber_pointer_listener quicklist_pointer_listener = {
   .leave = quicklist_pointer_leave,
   .motion = quicklist_pointer_motion,
   .button = quicklist_pointer_button,
+  .axis = quicklist_pointer_axis,
+  .axis_value120 = quicklist_pointer_axis_value120,
+  .axis_stop = quicklist_pointer_axis_stop,
 };
 
 static void
@@ -1097,6 +1497,7 @@ level_move(struct ql_level *level, int delta)
 
   level->selected = index;
   level->hovered = -1;
+  level_reveal(level, index);
   saber_popup_damage(level->popup);
 }
 
@@ -1187,14 +1588,7 @@ quicklist_menu_updated(struct saber_dbusmenu *menu, void *user)
   ql->root->hovered = -1;
   ql->root->selected = -1;
 
-  level_layout(ql->root);
-
-  struct saber_popup_params params;
-  saber_popup_menu_params(&params, ql->edge, ql->root->width, ql->root->height,
-      ql->anchor_x, ql->anchor_y, ql->anchor_width, ql->anchor_height);
-  saber_popup_reposition(ql->root->popup, &params);
-
-  saber_popup_damage(ql->root->popup);
+  level_reflow(ql->root);
 }
 
 static void

@@ -146,12 +146,32 @@ persist(struct saber_model *model)
   }
 }
 
+/* The tile each portion contributes. SABER_PORTION_APPS is deliberately absent:
+it is the application band, not a tile, and saber_model_create fills it from the
+favourites instead. */
+static const struct {
+  enum saber_portion portion;
+  enum saber_item_type type;
+  const char *id;
+} portion_tiles[] = {
+  { SABER_PORTION_BFB, SABER_ITEM_BFB, "bfb" },
+  { SABER_PORTION_SHEETS, SABER_ITEM_SHEETS, "sheets" },
+  { SABER_PORTION_DEVICES, SABER_ITEM_DEVICES, "devices" },
+  { SABER_PORTION_TRASH, SABER_ITEM_TRASH, "trash" },
+  { SABER_PORTION_TRAY, SABER_ITEM_TRAY, "tray" },
+  { SABER_PORTION_SESSION, SABER_ITEM_SESSION, "session" },
+};
+
 static void
-add_special(struct saber_model *model, bool enabled, enum saber_item_type type,
-    const char *id)
+add_portion(struct saber_model *model, enum saber_portion portion)
 {
-  if (enabled) {
-    g_ptr_array_add(model->items, item_new(type, id));
+  for (size_t i = 0; i < G_N_ELEMENTS(portion_tiles); i++) {
+    if (portion_tiles[i].portion == portion) {
+      g_ptr_array_add(model->items,
+          item_new(portion_tiles[i].type, portion_tiles[i].id));
+
+      return;
+    }
   }
 }
 
@@ -167,7 +187,19 @@ saber_model_create(const struct saber_config *config,
   model->items = g_ptr_array_new();
   model->loading = true;
 
-  add_special(model, config->items.bfb, SABER_ITEM_BFB, "bfb");
+  const enum saber_portion *order = config->items.order;
+  size_t order_len = order != NULL ? config->items.order_len : 0;
+  size_t at = 0;
+
+  /* Action purpose: Everything the configuration listed ahead of the
+  application band leads the column and is pinned there by panel.c. config.c
+  guarantees the band is in the list, so this loop terminates on it rather than
+  swallowing the whole order -- and if a caller hands over a config that was
+  never loaded, the band simply starts at index 0, which is still a column. */
+  for (; at < order_len && order[at] != SABER_PORTION_APPS; at++) {
+    add_portion(model, order[at]);
+  }
+
   model->head = model->items->len;
 
   char **favourites = NULL;
@@ -184,15 +216,27 @@ saber_model_create(const struct saber_config *config,
   }
 
   size_t before_tail = model->items->len;
-  add_special(model, config->items.sheets, SABER_ITEM_SHEETS, "sheets");
-  add_special(model, config->items.devices, SABER_ITEM_DEVICES, "devices");
-  add_special(model, config->items.trash, SABER_ITEM_TRASH, "trash");
-  add_special(model, config->items.tray, SABER_ITEM_TRAY, "tray");
-  add_special(model, config->items.session, SABER_ITEM_SESSION, "session");
+
+  for (at = at < order_len ? at + 1 : at; at < order_len; at++) {
+    add_portion(model, order[at]);
+  }
+
   model->tail = model->items->len - before_tail;
 
   model->loading = false;
   return model;
+}
+
+size_t
+saber_model_apps_begin(const struct saber_model *model)
+{
+  return model->head;
+}
+
+size_t
+saber_model_apps_end(const struct saber_model *model)
+{
+  return apps_end(model);
 }
 
 void

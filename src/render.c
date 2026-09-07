@@ -664,7 +664,7 @@ saber_render_init(struct saber_render *render,
   render->scale = 1.0;
   render->edge = config->panel.edge;
   render->icon_size = config->panel.icon_size;
-  render->tile = saber_surface_panel_width(config->panel.icon_size);
+  render->tile = saber_surface_panel_width_for(config);
 }
 
 static void

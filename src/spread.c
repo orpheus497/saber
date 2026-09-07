@@ -34,6 +34,10 @@ carries are stable and are spelled out rather than pulled in through a shim. */
 #define SPREAD_CLOSE 11.0
 #define SPREAD_SCROLLBAR 4.0
 
+/* Padding either side of the painted bar. Four logical pixels is a legible
+width and an unhittable target; this is what makes it a pointer target. */
+#define SPREAD_SCROLLBAR_GRAB 6.0
+
 /* Weight of the second backdrop pass; see spread_render. */
 #define SPREAD_BACKDROP_PASS 0.7
 
@@ -70,6 +74,18 @@ struct saber_spread {
   int pressed;
   bool on_close; /* the pointer is over the hovered cell's close disc */
   int scroll;
+  struct saber_scroll_accum scroll_accum;
+
+  /* Action purpose: The scrollbar track sits in the margin beside the grid, so
+  it falls inside no cell -- spread_cell_at answers -1 there, and until Phase 12
+  that made a press on the bar indistinguishable from a press on the backdrop,
+  which dismisses the spread. These say the press was the bar's, so the
+  dismissal path never sees it. `bar_grab` keeps the same point of the thumb
+  under the pointer for the length of the drag. */
+  double pointer_x, pointer_y;
+  bool bar_pressed;
+  bool bar_dragging;
+  double bar_grab;
 
   int columns, rows, visible_rows;
   double cell_width, cell_height;
@@ -202,6 +218,9 @@ spread_layout(struct saber_spread *spread);
 
 static void
 spread_place(struct saber_spread *spread);
+
+static int
+spread_max_scroll(const struct saber_spread *spread);
 
 static void
 spread_rebuild(struct saber_spread *spread)
@@ -359,6 +378,15 @@ spread_layout(struct saber_spread *spread)
     spread->grid_y += (room - spread->rows * spread->cell_height) / 2.0;
   }
 
+  /* Action purpose: The offset outlives the cell list, so it is clamped
+  wherever the row count is recomputed. Re-filtering an open spread to a shorter
+  application reaches saber_spread_refresh and returns from saber_spread_show
+  BEFORE that function's own `scroll = 0`, so a stale offset would survive and
+  place every remaining cell off the top -- a grid that draws empty with windows
+  in it. spread_reveal_selection clamps too, but only when something is
+  selected, which an empty result set never is. */
+  spread->scroll = CLAMP(spread->scroll, 0, spread_max_scroll(spread));
+
   spread_place(spread);
 }
 
@@ -443,6 +471,50 @@ spread_cell_at(const struct saber_spread *spread,
   }
 
   return -1;
+}
+
+/* Function purpose: Where the scrollbar and its thumb are, in one place, so the
+painter and the hit test cannot disagree about it. False when there is nothing
+to scroll, which is also when no bar is drawn. */
+static bool
+spread_scrollbar_geometry(const struct saber_spread *spread,
+    double *x,
+    double *track_y,
+    double *track_h,
+    double *thumb_y,
+    double *thumb_h)
+{
+  int max = spread_max_scroll(spread);
+
+  if (max <= 0 || spread->rows <= 0) {
+    return false;
+  }
+
+  double track = spread->visible_rows * spread->cell_height;
+  double thumb = track * spread->visible_rows / (double)spread->rows;
+
+  *x = spread->grid_x + spread->columns * spread->cell_width + 10.0;
+  *track_y = spread->grid_y;
+  *track_h = track;
+  *thumb_h = thumb;
+  *thumb_y = spread->grid_y + (track - thumb) * spread->scroll / (double)max;
+
+  return true;
+}
+
+static bool
+spread_on_scrollbar(const struct saber_spread *spread, double x, double y)
+{
+  double bar_x, track_y, track_h, thumb_y, thumb_h;
+
+  if (!spread_scrollbar_geometry(spread, &bar_x, &track_y, &track_h, &thumb_y,
+          &thumb_h)) {
+    return false;
+  }
+
+  return x >= bar_x - SPREAD_SCROLLBAR_GRAB &&
+      x < bar_x + SPREAD_SCROLLBAR + SPREAD_SCROLLBAR_GRAB && y >= track_y &&
+      y < track_y + track_h;
 }
 
 /* ---------------------------------------------------------------- drawing */
@@ -600,21 +672,17 @@ spread_draw_header(struct saber_spread *spread, cairo_t *cr)
 static void
 spread_draw_scrollbar(struct saber_spread *spread, cairo_t *cr)
 {
-  int max = spread_max_scroll(spread);
+  double x, track_y, track_h, thumb_y, thumb_h;
 
-  if (max <= 0) {
+  if (!spread_scrollbar_geometry(spread, &x, &track_y, &track_h, &thumb_y,
+          &thumb_h)) {
     return;
   }
 
   const struct saber_theme *theme = spread->deps.theme;
-  double track_h = spread->visible_rows * spread->cell_height;
-  double x = spread->grid_x + spread->columns * spread->cell_width + 10.0;
-  double thumb_h = track_h * spread->visible_rows / (double)spread->rows;
-  double thumb_y =
-      spread->grid_y + (track_h - thumb_h) * spread->scroll / (double)max;
 
   set_source_alpha(cr, &theme->dim, 0.5);
-  rounded_rect(cr, x, spread->grid_y, SPREAD_SCROLLBAR, track_h,
+  rounded_rect(cr, x, track_y, SPREAD_SCROLLBAR, track_h,
       SPREAD_SCROLLBAR / 2.0);
   cairo_fill(cr);
 
@@ -791,6 +859,88 @@ spread_set_hover(struct saber_spread *spread, int index, bool on_close)
   spread_damage(spread);
 }
 
+/* Function purpose: The one way the grid's offset changes. Clamps, re-places
+the cells, re-resolves the hover -- the cells moved under a pointer that did
+not -- and repaints. */
+static void
+spread_scroll_to(struct saber_spread *spread, int scroll)
+{
+  int next = CLAMP(scroll, 0, spread_max_scroll(spread));
+
+  if (next == spread->scroll) {
+    return;
+  }
+
+  spread->scroll = next;
+  spread_place(spread);
+
+  bool on_close = false;
+  int index =
+      spread_cell_at(spread, spread->pointer_x, spread->pointer_y, &on_close);
+
+  spread_set_hover(spread, index, on_close);
+  spread_damage(spread);
+}
+
+/* Function purpose: Take a press on the scrollbar. Returns true when the press
+belonged to the bar, which is what keeps it out of the backdrop path below --
+the track is outside every cell, so an unclaimed press there dismissed the whole
+spread. */
+static bool
+spread_scrollbar_press(struct saber_spread *spread, double x, double y)
+{
+  double bar_x, track_y, track_h, thumb_y, thumb_h;
+
+  if (!spread_scrollbar_geometry(spread, &bar_x, &track_y, &track_h, &thumb_y,
+          &thumb_h) ||
+      !spread_on_scrollbar(spread, x, y)) {
+    return false;
+  }
+
+  spread->bar_pressed = true;
+
+  if (y >= thumb_y && y < thumb_y + thumb_h) {
+    spread->bar_dragging = true;
+    spread->bar_grab = y - thumb_y;
+
+    return true;
+  }
+
+  /* Bare track: page toward the click, the way every other scrollbar does. No
+  drag is started, because the thumb has just moved out from under the pointer
+  and there is no grab point left that would not make it jump. */
+  spread_scroll_to(spread,
+      spread->scroll +
+          (y < thumb_y ? -spread->visible_rows : spread->visible_rows));
+
+  return true;
+}
+
+static void
+spread_scrollbar_drag(struct saber_spread *spread, double y)
+{
+  double bar_x, track_y, track_h, thumb_y, thumb_h;
+
+  if (!spread_scrollbar_geometry(spread, &bar_x, &track_y, &track_h, &thumb_y,
+          &thumb_h)) {
+    spread->bar_dragging = false;
+
+    return;
+  }
+
+  double span = track_h - thumb_h;
+
+  if (span <= 0.0) {
+    return;
+  }
+
+  /* The point of the thumb the drag started on stays under the pointer, so the
+  thumb does not snap its centre to the cursor on the first motion event. */
+  double top = y - spread->bar_grab - track_y;
+
+  spread_scroll_to(spread, (int)lround(top * spread_max_scroll(spread) / span));
+}
+
 /* The spread draws one surface; ownership is an identity test. */
 static bool
 spread_pointer_owns(void *data, struct wl_surface *surface)
@@ -812,6 +962,9 @@ spread_pointer_enter(void *data, struct wl_surface *surface, double x, double y)
   bool on_close = false;
   int index = spread_cell_at(spread, x, y, &on_close);
 
+  spread->pointer_x = x;
+  spread->pointer_y = y;
+
   saber_display_set_cursor(spread->deps.display, "left_ptr");
   spread_set_hover(spread, index, on_close);
 }
@@ -821,7 +974,12 @@ spread_pointer_leave(void *data, struct wl_surface *surface)
 {
   (void)surface;
 
-  spread_set_hover(data, -1, false);
+  struct saber_spread *spread = data;
+
+  spread->bar_pressed = false;
+  spread->bar_dragging = false;
+  saber_scroll_reset(&spread->scroll_accum);
+  spread_set_hover(spread, -1, false);
 }
 
 static void
@@ -830,6 +988,16 @@ spread_pointer_motion(void *data, uint32_t time, double x, double y)
   (void)time;
 
   struct saber_spread *spread = data;
+
+  spread->pointer_x = x;
+  spread->pointer_y = y;
+
+  if (spread->bar_dragging) {
+    spread_scrollbar_drag(spread, y);
+
+    return;
+  }
+
   bool on_close = false;
   int index = spread_cell_at(spread, x, y, &on_close);
 
@@ -859,6 +1027,11 @@ spread_pointer_button(void *data,
   }
 
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (spread_scrollbar_press(spread, spread->pointer_x,
+            spread->pointer_y)) {
+      return;
+    }
+
     spread->pressed = spread->hovered;
 
     if (spread->hovered >= 0) {
@@ -866,6 +1039,16 @@ spread_pointer_button(void *data,
     }
 
     spread_damage(spread);
+
+    return;
+  }
+
+  /* Action purpose: The release that ends a scrollbar interaction, thumb or
+  track, stops here. Below, a release with no pressed cell IS the dismissal --
+  which is exactly how grabbing the scrollbar used to close the spread. */
+  if (spread->bar_pressed) {
+    spread->bar_pressed = false;
+    spread->bar_dragging = false;
 
     return;
   }
@@ -897,6 +1080,9 @@ spread_pointer_button(void *data,
   }
 }
 
+/* Action purpose: A row per notch of travel, not a row per event. The bare sign
+this replaced meant one two-finger swipe -- dozens of fractional axis events --
+scrolled the grid dozens of rows, straight past every window in it. */
 static void
 spread_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
 {
@@ -904,20 +1090,35 @@ spread_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
 
   struct saber_spread *spread = data;
 
-  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || value == 0.0) {
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
     return;
   }
 
-  int scroll = CLAMP(spread->scroll + (value > 0.0 ? 1 : -1), 0,
-      spread_max_scroll(spread));
+  int steps = saber_scroll_steps(&spread->scroll_accum,
+      saber_scroll_delta(&spread->scroll_accum, axis, value), 120);
 
-  if (scroll == spread->scroll) {
-    return;
+  if (steps != 0) {
+    spread_scroll_to(spread, spread->scroll + steps);
   }
+}
 
-  spread->scroll = scroll;
-  spread_place(spread);
-  spread_damage(spread);
+static void
+spread_pointer_axis_value120(void *data, uint32_t axis, int32_t value120)
+{
+  struct saber_spread *spread = data;
+
+  saber_scroll_detail(&spread->scroll_accum, axis, value120);
+}
+
+static void
+spread_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
+{
+  (void)time;
+  (void)axis;
+
+  struct saber_spread *spread = data;
+
+  saber_scroll_reset(&spread->scroll_accum);
 }
 
 static const struct saber_pointer_listener spread_pointer_listener = {
@@ -927,6 +1128,8 @@ static const struct saber_pointer_listener spread_pointer_listener = {
   .motion = spread_pointer_motion,
   .button = spread_pointer_button,
   .axis = spread_pointer_axis,
+  .axis_value120 = spread_pointer_axis_value120,
+  .axis_stop = spread_pointer_axis_stop,
 };
 
 /* ---------------------------------------------------------------- keyboard */
@@ -1256,6 +1459,9 @@ saber_spread_hide(struct saber_spread *spread)
   spread->pressed = -1;
   spread->on_close = false;
   spread->scroll = 0;
+  spread->bar_pressed = false;
+  spread->bar_dragging = false;
+  saber_scroll_reset(&spread->scroll_accum);
   spread->hiding = false;
 }
 

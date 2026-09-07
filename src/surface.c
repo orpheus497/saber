@@ -24,12 +24,18 @@ saber_surface_panel_width(int icon_size)
   return icon_size + SABER_PANEL_PADDING;
 }
 
+int
+saber_surface_panel_width_for(const struct saber_config *config)
+{
+  return config->panel.icon_size + config->panel.padding;
+}
+
 void
 saber_surface_panel_params(struct saber_surface_params *params,
     const struct saber_config *config,
     struct saber_output *output)
 {
-  int width = saber_surface_panel_width(config->panel.icon_size);
+  int width = saber_surface_panel_width_for(config);
 
   memset(params, 0, sizeof(*params));
 

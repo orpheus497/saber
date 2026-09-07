@@ -18,6 +18,11 @@ configuration, or a broken one, still gets a panel. */
 #define SABER_ICON_SIZE_MIN 24
 #define SABER_ICON_SIZE_MAX 64
 
+/* Zero is a legitimate choice -- an icon-sized column with no gutter at all --
+and the ceiling only stops a typo turning the strip into half the desktop. */
+#define SABER_PANEL_PADDING_MIN 0
+#define SABER_PANEL_PADDING_MAX 64
+
 struct saber_enum_name {
   const char *name;
   int value;
@@ -40,6 +45,29 @@ static const struct saber_enum_name saber_backlight_names[] = {
   { "dominant", SABER_BACKLIGHT_DOMINANT },
   { "off", SABER_BACKLIGHT_OFF },
   { NULL, 0 },
+};
+
+static const struct saber_enum_name saber_portion_names[] = {
+  { "bfb", SABER_PORTION_BFB },
+  { "apps", SABER_PORTION_APPS },
+  { "sheets", SABER_PORTION_SHEETS },
+  { "devices", SABER_PORTION_DEVICES },
+  { "trash", SABER_PORTION_TRASH },
+  { "tray", SABER_PORTION_TRAY },
+  { "session", SABER_PORTION_SESSION },
+  { NULL, 0 },
+};
+
+/* The order the column carried before `items { order }` existed, and what an
+absent key still means. */
+static const enum saber_portion saber_portion_default[] = {
+  SABER_PORTION_BFB,
+  SABER_PORTION_APPS,
+  SABER_PORTION_SHEETS,
+  SABER_PORTION_DEVICES,
+  SABER_PORTION_TRASH,
+  SABER_PORTION_TRAY,
+  SABER_PORTION_SESSION,
 };
 
 /* Action purpose: The documented keys are hyphenated (`icon-size`), but UCL
@@ -164,6 +192,7 @@ config_defaults(struct saber_config *config)
   1:1 rather than resampled to an in-between number. With SABER_PANEL_PADDING
   that gives a 44px column. */
   config->panel.icon_size = 32;
+  config->panel.padding = SABER_PANEL_PADDING;
   config->panel.autohide = SABER_AUTOHIDE_NEVER;
   config->panel.reveal_pressure = 240;
   config->panel.animation_ms = 180;
@@ -179,6 +208,9 @@ config_defaults(struct saber_config *config)
   config->items.trash = true;
   config->items.tray = true;
   config->items.session = true;
+  config->items.order =
+      g_memdup2(saber_portion_default, sizeof(saber_portion_default));
+  config->items.order_len = G_N_ELEMENTS(saber_portion_default);
 
   config->session.suspend = g_strdup("");
   config->session.reboot = g_strdup("");
@@ -298,6 +330,118 @@ config_apply_palette(struct saber_config *config, const ucl_object_t *theme)
   return true;
 }
 
+/* Function purpose: Read `items { order }`, the ordered portion list. An
+unrecognised name is reported rather than silently dropped -- config_enum's
+precedent -- and a repeat is ignored, because a portion is one place in the
+column and cannot be in two. */
+static void
+config_apply_order(struct saber_config *config, const ucl_object_t *list)
+{
+  if (list == NULL) {
+    return;
+  }
+
+  enum saber_portion order[SABER_PORTION_COUNT];
+  bool seen[SABER_PORTION_COUNT] = { false };
+  size_t len = 0;
+  ucl_object_iter_t iterator = NULL;
+  const ucl_object_t *entry;
+
+  /* Same reason as the favourites list: iterating covers a one-element list
+  written without brackets as well as an array. */
+  while ((entry = ucl_object_iterate(list, &iterator, true)) != NULL) {
+    const char *name = ucl_object_tostring(entry);
+    const struct saber_enum_name *match = NULL;
+
+    for (const struct saber_enum_name *n = saber_portion_names;
+        name != NULL && n->name != NULL; n++) {
+      if (g_ascii_strcasecmp(name, n->name) == 0) {
+        match = n;
+
+        break;
+      }
+    }
+
+    if (match == NULL) {
+      fprintf(stderr,
+          "saber: items: order: unknown portion \"%s\"; ignoring it\n",
+          name == NULL ? "" : name);
+
+      continue;
+    }
+
+    if (!seen[match->value]) {
+      seen[match->value] = true;
+      order[len++] = (enum saber_portion)match->value;
+    }
+  }
+
+  /* Action purpose: The application band has no key that turns it off, so an
+  order that forgets to name it still gets it -- in the place the column has
+  always put it, directly after the BFB. Without this a user who listed only
+  the special tiles would lose every application tile with no way to tell why,
+  and len is at most six here, so the insert cannot overrun. */
+  if (!seen[SABER_PORTION_APPS]) {
+    size_t at = 0;
+
+    for (size_t i = 0; i < len; i++) {
+      if (order[i] == SABER_PORTION_BFB) {
+        at = i + 1;
+
+        break;
+      }
+    }
+
+    memmove(&order[at + 1], &order[at], (len - at) * sizeof(order[0]));
+    order[at] = SABER_PORTION_APPS;
+    len++;
+  }
+
+  g_free(config->items.order);
+  config->items.order = g_memdup2(order, len * sizeof(order[0]));
+  config->items.order_len = len;
+}
+
+/* Function purpose: Reconcile the two forms of the items block. The booleans
+filter the order -- `trash = false` still hides the trash, whether the order
+came from the user or from the default -- and the survivors then define the
+booleans, so config->items.bfb and friends describe the column that will
+actually be built rather than what was written. */
+static void
+config_resolve_order(struct saber_config *config)
+{
+  bool enabled[SABER_PORTION_COUNT] = { false };
+  size_t len = 0;
+
+  enabled[SABER_PORTION_BFB] = config->items.bfb;
+  enabled[SABER_PORTION_APPS] = true;
+  enabled[SABER_PORTION_SHEETS] = config->items.sheets;
+  enabled[SABER_PORTION_DEVICES] = config->items.devices;
+  enabled[SABER_PORTION_TRASH] = config->items.trash;
+  enabled[SABER_PORTION_TRAY] = config->items.tray;
+  enabled[SABER_PORTION_SESSION] = config->items.session;
+
+  bool present[SABER_PORTION_COUNT] = { false };
+
+  for (size_t i = 0; i < config->items.order_len; i++) {
+    enum saber_portion portion = config->items.order[i];
+
+    if (enabled[portion]) {
+      present[portion] = true;
+      config->items.order[len++] = portion;
+    }
+  }
+
+  config->items.order_len = len;
+
+  config->items.bfb = present[SABER_PORTION_BFB];
+  config->items.sheets = present[SABER_PORTION_SHEETS];
+  config->items.devices = present[SABER_PORTION_DEVICES];
+  config->items.trash = present[SABER_PORTION_TRASH];
+  config->items.tray = present[SABER_PORTION_TRAY];
+  config->items.session = present[SABER_PORTION_SESSION];
+}
+
 static bool
 config_apply(struct saber_config *config, const ucl_object_t *root)
 {
@@ -312,6 +456,8 @@ config_apply(struct saber_config *config, const ucl_object_t *root)
       panel, "edge", saber_edge_names, config->panel.edge, "panel");
   config_apply_int(panel, "icon-size", &config->panel.icon_size,
       SABER_ICON_SIZE_MIN, SABER_ICON_SIZE_MAX);
+  config_apply_int(panel, "padding", &config->panel.padding,
+      SABER_PANEL_PADDING_MIN, SABER_PANEL_PADDING_MAX);
   config->panel.autohide = config_enum(panel, "autohide", saber_autohide_names,
       config->panel.autohide, "panel");
   config_apply_int(
@@ -331,6 +477,7 @@ config_apply(struct saber_config *config, const ucl_object_t *root)
   config_apply_bool(items, "trash", &config->items.trash);
   config_apply_bool(items, "tray", &config->items.tray);
   config_apply_bool(items, "session", &config->items.session);
+  config_apply_order(config, config_lookup(items, "order"));
 
   config_apply_string(session, "suspend", &config->session.suspend);
   config_apply_string(session, "reboot", &config->session.reboot);
@@ -421,6 +568,8 @@ saber_config_load(struct saber_config *config, const char *path)
     g_free(file);
   }
 
+  config_resolve_order(config);
+
   if (!explicit_palette && config->theme.inherit_hikari) {
     config->theme.palette_valid = config_import_hikari(config);
   }
@@ -436,6 +585,7 @@ saber_config_fini(struct saber_config *config)
   }
 
   g_free(config->panel.output);
+  g_free(config->items.order);
   g_strfreev(config->launcher.favourites);
   g_free(config->session.suspend);
   g_free(config->session.reboot);

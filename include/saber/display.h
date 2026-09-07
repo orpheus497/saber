@@ -51,8 +51,69 @@ struct saber_pointer_listener {
   void (*motion)(void *data, uint32_t time, double x, double y);
   void (*button)(void *data, uint32_t time, uint32_t button, uint32_t state);
   void (*axis)(void *data, uint32_t time, uint32_t axis, double value);
+
+  /* Action purpose: The high-resolution half of a scroll, normalised. The wire
+  carries it two incompatible ways -- wl_pointer.axis_discrete on v5 to v7 and
+  wl_pointer.axis_value120 from v8, and a compositor sends one or the other,
+  never both -- so display.c converts a discrete notch to 120 and this one
+  callback covers every version. It arrives BEFORE the `axis` event it
+  describes, in the same frame; a source with no detail (a touchpad) sends
+  nothing here at all. */
+  void (*axis_value120)(void *data, uint32_t axis, int32_t value120);
+  void (*axis_source)(void *data, uint32_t axis_source);
+  /* The fingers left the touchpad: whatever remainder an accumulator is
+  holding belongs to a gesture that is over and must not be carried into the
+  next one. */
+  void (*axis_stop)(void *data, uint32_t time, uint32_t axis);
   void (*frame)(void *data);
 };
+
+/* Action purpose: wl_pointer reports scroll three ways that cannot be compared
+directly -- a wheel notch as 10.0 continuous units, a touchpad as dozens of
+fractional ones per gesture, and a detented source as a separate discrete or
+v120 event ahead of the axis event. Reduced to a bare sign, as every call site
+here did until Phase 12, one two-finger swipe fires dozens of steps. This holds
+the conversion into one currency, v120 units where 120 is one notch, plus the
+sub-notch remainder that makes a step cost a whole notch of travel.
+
+One accumulator belongs to one scroll TARGET: reset it when the target changes,
+or a half-notch left over from the tile above is spent on the tile below. */
+struct saber_scroll_accum {
+  int32_t detail; /* v120 the current frame announced ahead of its axis event */
+  uint32_t detail_axis;
+  bool has_detail;
+  int32_t pending; /* accumulated v120 not yet worth a whole step */
+};
+
+/* Function purpose: Record the v120 detail for the axis event that is about to
+follow it. Call from a listener's `axis_value120`; it never acts by itself,
+because the axis event is what says the scroll happened. */
+void
+saber_scroll_detail(struct saber_scroll_accum *accum,
+    uint32_t axis,
+    int32_t value120);
+
+/* Function purpose: The event's delta in v120 units -- the detail the frame
+announced when it had one, and otherwise the continuous value converted at the
+10.0-units-per-notch rate every wheel without detail reports. Call once per
+`axis` event; it consumes the detail, so a frame's detail can never be spent
+twice. Returns 0 for an axis the detail did not belong to. */
+int32_t
+saber_scroll_delta(struct saber_scroll_accum *accum,
+    uint32_t axis,
+    double value);
+
+/* Function purpose: Whole steps from a v120 delta, keeping what is left over
+for the next event. `per_step` is 120 for one step per notch; a caller wanting
+a coarser gesture asks for a larger one. A reversal drops the remainder rather
+than making the user unwind it. */
+int
+saber_scroll_steps(struct saber_scroll_accum *accum,
+    int32_t value120,
+    int32_t per_step);
+
+void
+saber_scroll_reset(struct saber_scroll_accum *accum);
 
 /* One registered module. Ownership is resolved by asking each entry's `owns`,
 so registration order carries no meaning and a module removing itself can never

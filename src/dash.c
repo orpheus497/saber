@@ -2,15 +2,24 @@
 Layout, cairo/pango drawing, the substring filter and its ranking, and the
 xkbcommon keyboard handling that makes the search field type.
 
-The surface is an OVERLAY layer surface anchored to all four edges with
-EXCLUSIVE keyboard interactivity, and it is CREATED on show and DESTROYED on
-hide rather than merely being unmapped: a layer surface holding the seat's
-keyboard exclusively goes on holding it for as long as it exists.
+The surface is an OVERLAY layer surface anchored to config->panel.edge plus TOP
+and BOTTOM, with EXCLUSIVE keyboard interactivity, and it is CREATED on show and
+DESTROYED on hide rather than merely being unmapped: a layer surface holding the
+seat's keyboard exclusively goes on holding it for as long as it exists.
 
-Only a third of that surface is PAINTED. Unity's dash is a panel docked to the
-launcher's edge over an undimmed desktop, so everything outside the dash
-rectangle is left fully transparent; the surface stays full-screen because that
-is what carries the exclusive keyboard and the click-away-to-dismiss path. */
+The surface IS the dash. Unity's dash is a panel docked to the launcher's edge
+over an undimmed desktop, and it is drawn here by asking the compositor for a
+surface that size rather than by taking the output and painting a third of it:
+an exclusive_zone of 0 then has the compositor dock it beside the panel's own
+reserved column, so the two sit side by side without either measuring the
+other. Everything below works in surface-local coordinates, and panel_x and
+panel_width -- which dash_layout still sets, because every measurement here is
+written against them -- are now simply 0 and the surface's width.
+
+What that costs is click-away-to-dismiss: a click on the desktop lands on the
+desktop. Escape, a second click on the BFB and `saberctl dash` are the ways
+out, plus dash_keyboard_leave for the case where a compositor moves the
+keyboard on anyway. */
 
 #include <math.h>
 #include <string.h>
@@ -38,13 +47,17 @@ carries are stable and are spelled out rather than pulled in through a shim. */
 #define DASH_RADIUS 8.0
 #define DASH_SCROLLBAR 4.0
 
+/* Padding either side of the painted bar. Four logical pixels is a legible
+width and an unhittable target; this is what makes it a pointer target. */
+#define DASH_SCROLLBAR_GRAB 6.0
+
 /* Action purpose: The scrollbar sits in a gutter of its own rather than over
 the last column, so a full row of cells is never partly hidden by the thumb. */
 #define DASH_GUTTER 14.0
 
-/* The dash rectangle: a third of the output, held between a width that still
-fits three columns on a laptop and one that stops an ultrawide handing the dash
-half the desktop. */
+/* The width the dash asks the compositor for: a third of the output, held
+between a width that still fits three columns on a laptop and one that stops an
+ultrawide handing the dash half the desktop. */
 #define DASH_PANEL_DIVISOR 3.0
 #define DASH_PANEL_MIN_WIDTH 420.0
 #define DASH_PANEL_MAX_WIDTH 700.0
@@ -145,7 +158,14 @@ struct saber_dash {
   struct saber_dash_deps deps;
   struct saber_surface *surface;
 
-  int width, height;
+  int width, height; /* the surface's logical size, which is the dash's */
+
+  /* The output's own logical size, remembered across hides. The surface is no
+  longer the output, so its size can no longer be read back as one -- and the
+  width the dash asks for is a fraction of the OUTPUT, not of itself, which
+  would otherwise shrink a little further every time it opened. */
+  int output_width, output_height;
+
   double scale;
 
   GString *query;
@@ -164,8 +184,9 @@ struct saber_dash {
   int pressed;
   int scroll; /* first visible row */
 
-  /* The painted rectangle inside the full-screen surface: full height, docked
-  against the panel's edge. */
+  /* The dash rectangle, which is the whole surface: panel_x is 0 and
+  panel_width is `width`. Kept as a pair because every measurement, hit test
+  and paint below is written against them. */
   double panel_x, panel_width;
 
   int columns, rows, visible_rows;
@@ -174,10 +195,20 @@ struct saber_dash {
   double search_x, search_y, search_width;
   double strip_y;
 
-  /* Where the pointer last was across the dash rectangle, kept so a release can
-  tell a dismissal from a click that merely missed a cell inside the dash. */
+  /* Where the pointer last was across the dash, kept so the hover can be
+  re-resolved when the grid scrolls under a pointer that did not move. The
+  vertical half is what a scrollbar drag is measured against. */
   double pointer_x;
-  bool pressed_outside;
+  double pointer_y;
+
+  /* The scrollbar was decoration until Phase 12: nothing outside
+  dash_draw_scrollbar knew where it was, so there was no thumb to grab.
+  `bar_grab` is where on the thumb it was picked up, which is what keeps the
+  same point of the thumb under the pointer for the whole drag. */
+  bool bar_dragging;
+  double bar_grab;
+
+  struct saber_scroll_accum scroll_accum;
 
   PangoFontDescription *font;
   PangoFontDescription *search_font;
@@ -563,6 +594,22 @@ dash_filter(struct saber_dash *dash)
 
 /* ----------------------------------------------------------------- layout */
 
+/* Function purpose: The width to ask the compositor for, from the OUTPUT's
+width rather than the dash's own -- the surface is the dash now, so measuring it
+against itself would shrink it a third every time it opened. */
+static int
+dash_panel_width(int output_width)
+{
+  double width = CLAMP((double)output_width / DASH_PANEL_DIVISOR,
+      DASH_PANEL_MIN_WIDTH, DASH_PANEL_MAX_WIDTH);
+
+  if (width > (double)output_width) {
+    width = (double)output_width;
+  }
+
+  return (int)width;
+}
+
 /* Function purpose: Spread the filter strip evenly across the bottom edge of
 the dash rectangle. The strip is a fixed set of small cells rather than measured
 chips: at a third of the output there is no width to wrap into, so every filter
@@ -600,20 +647,17 @@ dash_layout(struct saber_dash *dash)
 {
   int count = (int)dash->results->len;
 
-  /* Action purpose: The dash is docked against whichever edge carries the panel
-  column, so a right-hand panel gets a right-hand dash. The surface itself stays
-  full-screen -- only this rectangle is painted. */
-  dash->panel_width = CLAMP((double)dash->width / DASH_PANEL_DIVISOR,
-      DASH_PANEL_MIN_WIDTH, DASH_PANEL_MAX_WIDTH);
+  /* Action purpose: The rectangle is the surface. The compositor was asked for
+  a surface the dash's size, anchored to whichever edge carries the panel
+  column, so a right-hand panel gets a right-hand dash without this function
+  offsetting anything -- and a compositor that hands back a width other than
+  the one requested is followed rather than argued with. */
+  dash->panel_x = 0.0;
+  dash->panel_width = (double)dash->width;
 
-  if (dash->panel_width > (double)dash->width) {
-    dash->panel_width = (double)dash->width;
+  if (dash->panel_width < 1.0) {
+    dash->panel_width = 1.0;
   }
-
-  bool right = dash->deps.config != NULL &&
-      dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
-
-  dash->panel_x = right ? (double)dash->width - dash->panel_width : 0.0;
 
   double inner = dash->panel_width - 2.0 * DASH_PAD;
 
@@ -653,15 +697,6 @@ dash_layout(struct saber_dash *dash)
   }
 
   dash->rows = count > 0 ? (count + dash->columns - 1) / dash->columns : 0;
-}
-
-/* Function purpose: Whether a point falls on the dash rectangle. The rectangle
-is full height, so only the horizontal span is asked -- and a point off it is a
-dismissal, since the rest of the surface is transparent desktop. */
-static bool
-dash_inside(const struct saber_dash *dash, double x)
-{
-  return x >= dash->panel_x && x < dash->panel_x + dash->panel_width;
 }
 
 static int
@@ -749,6 +784,50 @@ dash_cell_at(const struct saber_dash *dash, double x, double y)
   int index = row * dash->columns + column;
 
   return index < (int)dash->results->len ? index : -1;
+}
+
+/* Function purpose: Where the scrollbar and its thumb are, in one place, so the
+painter and the hit test cannot disagree about it. False when there is nothing
+to scroll, which is also when no bar is drawn. */
+static bool
+dash_scrollbar_geometry(const struct saber_dash *dash,
+    double *x,
+    double *track_y,
+    double *track_h,
+    double *thumb_y,
+    double *thumb_h)
+{
+  int max = dash_max_scroll(dash);
+
+  if (max <= 0 || dash->rows <= 0) {
+    return false;
+  }
+
+  double track = dash->visible_rows * dash->cell_height;
+  double thumb = track * dash->visible_rows / (double)dash->rows;
+
+  *x = dash->panel_x + dash->panel_width - DASH_PAD - DASH_SCROLLBAR;
+  *track_y = dash->grid_y;
+  *track_h = track;
+  *thumb_h = thumb;
+  *thumb_y = dash->grid_y + (track - thumb) * dash->scroll / (double)max;
+
+  return true;
+}
+
+static bool
+dash_on_scrollbar(const struct saber_dash *dash, double x, double y)
+{
+  double bar_x, track_y, track_h, thumb_y, thumb_h;
+
+  if (!dash_scrollbar_geometry(dash, &bar_x, &track_y, &track_h, &thumb_y,
+          &thumb_h)) {
+    return false;
+  }
+
+  return x >= bar_x - DASH_SCROLLBAR_GRAB &&
+      x < bar_x + DASH_SCROLLBAR + DASH_SCROLLBAR_GRAB && y >= track_y &&
+      y < track_y + track_h;
 }
 
 /* ---------------------------------------------------------------- drawing */
@@ -1014,22 +1093,17 @@ dash_draw_cell(struct saber_dash *dash,
 static void
 dash_draw_scrollbar(struct saber_dash *dash, cairo_t *cr)
 {
-  int max = dash_max_scroll(dash);
+  double x, track_y, track_h, thumb_y, thumb_h;
 
-  if (max <= 0) {
+  if (!dash_scrollbar_geometry(dash, &x, &track_y, &track_h, &thumb_y,
+          &thumb_h)) {
     return;
   }
 
   const struct saber_theme *theme = dash->deps.theme;
-  double track_h = dash->visible_rows * dash->cell_height;
-  double x = dash->panel_x + dash->panel_width - DASH_PAD - DASH_SCROLLBAR;
-  double thumb_h = track_h * dash->visible_rows / (double)dash->rows;
-  double thumb_y = dash->grid_y +
-      (track_h - thumb_h) * dash->scroll / (double)max;
 
   set_source_alpha(cr, &theme->dim, 0.5);
-  rounded_rect(cr, x, dash->grid_y, DASH_SCROLLBAR, track_h,
-      DASH_SCROLLBAR / 2.0);
+  rounded_rect(cr, x, track_y, DASH_SCROLLBAR, track_h, DASH_SCROLLBAR / 2.0);
   cairo_fill(cr);
 
   saber_theme_set_source(cr, &theme->accent);
@@ -1058,8 +1132,7 @@ dash_render(void *data,
 
   /* Action purpose: Clear the whole surface to nothing first. SOURCE, not OVER:
   the buffer is recycled, so a translucent paint over a stale frame would
-  accumulate -- and everything outside the dash rectangle must end up fully
-  transparent, because the desktop beside a docked dash is not dimmed. */
+  accumulate into something progressively more opaque. */
   cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
   cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
   cairo_paint(cr);
@@ -1080,14 +1153,20 @@ dash_render(void *data,
   set_source_alpha(cr, &theme->overlay, DASH_BACKDROP_PASS);
   cairo_fill_preserve(cr);
 
-  /* Nothing may spill onto the undimmed desktop beside the dash. */
+  /* The rectangle is the surface now, so this no longer keeps paint off a
+  desktop beside it -- it keeps an over-long label or an over-wide cell inside
+  the dash's own edges. */
   cairo_save(cr);
   cairo_clip(cr);
 
   /* The inner edge, so the dash reads as a panel with a boundary rather than as
-  a darkened region of the wallpaper. */
-  double edge = dash->panel_x > 0.0 ? dash->panel_x + 0.5
-                                    : dash->panel_width - 0.5;
+  a darkened region of the wallpaper. Which side of the surface that is follows
+  the panel's edge, not panel_x: the dash starts at 0 whichever way it is
+  docked, and a right-hand dash meets the desktop on its left. */
+  bool docked_right = dash->deps.config != NULL &&
+      dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
+  double edge = docked_right ? dash->panel_x + 0.5
+                             : dash->panel_x + dash->panel_width - 0.5;
 
   set_source_alpha(cr, &theme->dim, 0.5);
   cairo_set_line_width(cr, 1.0);
@@ -1222,6 +1301,7 @@ static void
 dash_set_hover(struct saber_dash *dash, double x, double y)
 {
   dash->pointer_x = x;
+  dash->pointer_y = y;
 
   int cell = dash_cell_at(dash, x, y);
   int chip = cell >= 0 ? -1 : dash_chip_at(dash, x, y);
@@ -1245,6 +1325,80 @@ dash_clear_hover(struct saber_dash *dash)
   dash->hovered = -1;
   dash->chip_hovered = -1;
   dash_damage(dash);
+}
+
+/* Function purpose: The one way the grid's offset changes. Clamps, re-resolves
+the hover -- the cells moved under a pointer that did not -- and repaints. */
+static void
+dash_scroll_to(struct saber_dash *dash, int scroll)
+{
+  int next = CLAMP(scroll, 0, dash_max_scroll(dash));
+
+  if (next == dash->scroll) {
+    return;
+  }
+
+  dash->scroll = next;
+  dash_set_hover(dash, dash->pointer_x, dash->pointer_y);
+  dash_damage(dash);
+}
+
+/* Function purpose: Take a press on the scrollbar. Returns true when the press
+belonged to the bar, which is what keeps it out of the cell and dismissal paths
+below. */
+static bool
+dash_scrollbar_press(struct saber_dash *dash, double x, double y)
+{
+  double bar_x, track_y, track_h, thumb_y, thumb_h;
+
+  if (!dash_scrollbar_geometry(dash, &bar_x, &track_y, &track_h, &thumb_y,
+          &thumb_h) ||
+      !dash_on_scrollbar(dash, x, y)) {
+    return false;
+  }
+
+  dash->pressed = -1;
+  dash->chip_pressed = -1;
+
+  if (y >= thumb_y && y < thumb_y + thumb_h) {
+    dash->bar_dragging = true;
+    dash->bar_grab = y - thumb_y;
+
+    return true;
+  }
+
+  /* Bare track: page toward the click, the way every other scrollbar does. No
+  drag is started, because the thumb has just moved out from under the pointer
+  and there is no grab point left that would not make it jump. */
+  dash_scroll_to(dash,
+      dash->scroll + (y < thumb_y ? -dash->visible_rows : dash->visible_rows));
+
+  return true;
+}
+
+static void
+dash_scrollbar_drag(struct saber_dash *dash, double y)
+{
+  double bar_x, track_y, track_h, thumb_y, thumb_h;
+
+  if (!dash_scrollbar_geometry(dash, &bar_x, &track_y, &track_h, &thumb_y,
+          &thumb_h)) {
+    dash->bar_dragging = false;
+
+    return;
+  }
+
+  double span = track_h - thumb_h;
+
+  if (span <= 0.0) {
+    return;
+  }
+
+  /* The point of the thumb the drag started on stays under the pointer, so the
+  thumb does not snap its centre to the cursor on the first motion event. */
+  double top = y - dash->bar_grab - track_y;
+
+  dash_scroll_to(dash, (int)lround(top * dash_max_scroll(dash) / span));
 }
 
 /* Function purpose: Switch the filter and re-run both halves of it. The query
@@ -1323,9 +1477,12 @@ dash_pointer_leave(void *data, struct wl_surface *surface)
 
   struct saber_dash *dash = data;
 
-  /* Off the surface entirely is off the dash rectangle, so a press that started
-  outside and left the output still dismisses. */
+  /* Off the surface is off the dash. Parking the position out of range keeps a
+  scroll or a re-layout from resolving a hover against where the pointer was
+  when it left. */
   dash->pointer_x = -1.0;
+  dash->bar_dragging = false;
+  saber_scroll_reset(&dash->scroll_accum);
   dash_clear_hover(dash);
 }
 
@@ -1335,6 +1492,14 @@ dash_pointer_motion(void *data, uint32_t time, double x, double y)
   (void)time;
 
   struct saber_dash *dash = data;
+
+  if (dash->bar_dragging) {
+    dash->pointer_x = x;
+    dash->pointer_y = y;
+    dash_scrollbar_drag(dash, y);
+
+    return;
+  }
 
   dash_set_hover(dash, x, y);
 }
@@ -1354,22 +1519,29 @@ dash_pointer_button(void *data,
   }
 
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (dash_scrollbar_press(dash, dash->pointer_x, dash->pointer_y)) {
+      return;
+    }
+
     dash->pressed = dash->hovered;
     dash->chip_pressed = dash->chip_hovered;
-    dash->pressed_outside = !dash_inside(dash, dash->pointer_x);
     dash->selected = dash->hovered >= 0 ? dash->hovered : dash->selected;
     dash_damage(dash);
 
     return;
   }
 
+  if (dash->bar_dragging) {
+    dash->bar_dragging = false;
+
+    return;
+  }
+
   int index = dash->pressed;
   int chip = dash->chip_pressed;
-  bool outside = dash->pressed_outside;
 
   dash->pressed = -1;
   dash->chip_pressed = -1;
-  dash->pressed_outside = false;
 
   if (chip >= 0) {
     if (chip == dash->chip_hovered) {
@@ -1382,16 +1554,12 @@ dash_pointer_button(void *data,
     return;
   }
 
-  /* Action purpose: A click that both began and ended off the dash rectangle is
-  a dismissal. The surface still covers the whole output -- that is what carries
-  the exclusive keyboard -- so "click away to close" is a test against the
-  painted rectangle, not against the surface. A miss inside the dash, on the
-  search field or the gap between cells, changes nothing. */
+  /* Action purpose: Every click that reaches this listener is a click on the
+  dash, because the surface is now the dash and nothing else. A miss -- the
+  search field, the gap between cells -- changes nothing, and the click that
+  used to dismiss from out here now lands on whatever is really there. Escape,
+  the BFB and `saberctl dash` are the ways out. */
   if (index < 0) {
-    if (outside && !dash_inside(dash, dash->pointer_x)) {
-      saber_dash_hide(dash);
-    }
-
     return;
   }
 
@@ -1402,6 +1570,9 @@ dash_pointer_button(void *data,
   }
 }
 
+/* Action purpose: A row per notch of travel, not a row per event. The bare sign
+this replaced meant one two-finger swipe -- dozens of fractional axis events --
+scrolled the grid dozens of rows, straight to the bottom of the list. */
 static void
 dash_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
 {
@@ -1409,19 +1580,35 @@ dash_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
 
   struct saber_dash *dash = data;
 
-  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || value == 0.0) {
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
     return;
   }
 
-  int scroll = CLAMP(dash->scroll + (value > 0.0 ? 1 : -1), 0,
-      dash_max_scroll(dash));
+  int steps = saber_scroll_steps(&dash->scroll_accum,
+      saber_scroll_delta(&dash->scroll_accum, axis, value), 120);
 
-  if (scroll == dash->scroll) {
-    return;
+  if (steps != 0) {
+    dash_scroll_to(dash, dash->scroll + steps);
   }
+}
 
-  dash->scroll = scroll;
-  dash_damage(dash);
+static void
+dash_pointer_axis_value120(void *data, uint32_t axis, int32_t value120)
+{
+  struct saber_dash *dash = data;
+
+  saber_scroll_detail(&dash->scroll_accum, axis, value120);
+}
+
+static void
+dash_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
+{
+  (void)time;
+  (void)axis;
+
+  struct saber_dash *dash = data;
+
+  saber_scroll_reset(&dash->scroll_accum);
 }
 
 static const struct saber_pointer_listener dash_pointer_listener = {
@@ -1431,6 +1618,8 @@ static const struct saber_pointer_listener dash_pointer_listener = {
   .motion = dash_pointer_motion,
   .button = dash_pointer_button,
   .axis = dash_pointer_axis,
+  .axis_value120 = dash_pointer_axis_value120,
+  .axis_stop = dash_pointer_axis_stop,
 };
 
 /* ---------------------------------------------------------------- keyboard */
@@ -1641,10 +1830,30 @@ dash_key(void *data, uint32_t time, uint32_t key, uint32_t state)
   }
 }
 
+/* Function purpose: Close the dash if the seat's keyboard ever goes elsewhere.
+EXCLUSIVE interactivity is supposed to make that impossible, but the protocol
+only promises exclusivity against the top-most such surface in the layer: a lock
+screen, another exclusive overlay, or a compositor that reads the rule its own
+way can all take the keyboard away. Without this the dash would then be sitting
+on the edge of the screen with no keyboard, no click-away and a search field
+that no longer types -- and now that the surface is not covering the output,
+nothing else would dismiss it either. Only the dash's own surface counts: the
+leave that precedes the dash's own enter names the surface being left. */
+static void
+dash_keyboard_leave(void *data, struct wl_surface *surface)
+{
+  struct saber_dash *dash = data;
+
+  if (dash->surface != NULL && dash->surface->wl_surface == surface) {
+    saber_dash_hide(dash);
+  }
+}
+
 static const struct saber_keyboard_listener dash_keyboard_listener = {
   .keymap = dash_keymap,
   .key = dash_key,
   .modifiers = dash_modifiers,
+  .leave = dash_keyboard_leave,
 };
 
 /* --------------------------------------------------------------- lifecycle */
@@ -1671,6 +1880,7 @@ saber_dash_create(const struct saber_dash_deps *deps)
   dash->hovered = -1;
   dash->pressed = -1;
   dash->pointer_x = -1.0;
+  dash->pointer_y = -1.0;
   dash->scale = 1.0;
   dash->columns = 1;
   dash->visible_rows = 1;
@@ -1747,27 +1957,41 @@ saber_dash_show(struct saber_dash *dash, struct saber_output *output)
   /* The output's own size, so the first frame is laid out correctly rather than
   being relaid on the configure that follows it. */
   if (output != NULL && output->scale > 0) {
-    dash->width = output->width / output->scale;
-    dash->height = output->height / output->scale;
+    dash->output_width = output->width / output->scale;
+    dash->output_height = output->height / output->scale;
   }
 
-  if (dash->width <= 0 || dash->height <= 0) {
-    dash->width = 1280;
-    dash->height = 720;
+  if (dash->output_width <= 0 || dash->output_height <= 0) {
+    dash->output_width = 1280;
+    dash->output_height = 720;
   }
+
+  dash->width = dash_panel_width(dash->output_width);
+  dash->height = dash->output_height;
 
   dash_filter(dash);
 
+  bool right = dash->deps.config != NULL &&
+      dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
+
+  /* Action purpose: The dash asks for its own size instead of taking the output
+  and painting a third of it. TOP|BOTTOM spans the usable height and the third
+  anchor docks it against the edge the panel column is on; the width is the only
+  axis this side decides. exclusive_zone 0 is not "no opinion" -- the protocol
+  reads it as "move me clear of anything that has reserved space", which is what
+  puts the dash beside the panel's reserved column rather than over it. */
   struct saber_surface_params params = {
     .output = output,
     .layer = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
     .anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
         ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-        ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+        (right ? ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT
+               : ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT),
     .keyboard_interactivity =
         ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE,
     .exclusive_zone = 0,
+    .width = dash->width,
+    .height = 0, /* TOP|BOTTOM spans the output */
     .layer_namespace = "saber-dash",
   };
 
@@ -1834,9 +2058,11 @@ saber_dash_hide(struct saber_dash *dash)
   dash->selected = -1;
   dash->hovered = -1;
   dash->pressed = -1;
-  dash->pressed_outside = false;
   dash->pointer_x = -1.0;
+  dash->pointer_y = -1.0;
+  dash->bar_dragging = false;
   dash->scroll = 0;
+  saber_scroll_reset(&dash->scroll_accum);
   dash->hiding = false;
 }
 

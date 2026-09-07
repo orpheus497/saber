@@ -95,14 +95,18 @@ struct saber_surface {
   void *listener_data;
 };
 
-/* Icon plus a symmetric 8px gutter each side; the column's whole width. */
-/* Tile width is icon_size + this. Padding scales with the icon rather than
-being fixed, so a smaller column stays proportioned rather than becoming an
-icon squeezed inside the same border. */
-#define SABER_PANEL_PADDING 12
-
+/* Function purpose: The column's width for an icon size alone, using the
+built-in SABER_PANEL_PADDING (config.h) gutter. Only for a caller with no
+configuration to hand; anything that has one wants the function below, because
+the gutter is a configurable key and this ignores it. */
 int
 saber_surface_panel_width(int icon_size);
+
+/* Function purpose: The column's width under `config`, which is the tile pitch
+as well -- the panel's slots, its hit testing and the layer surface's own width
+are all this one number, so nothing may arrive at it a second way. */
+int
+saber_surface_panel_width_for(const struct saber_config *config);
 
 /* Function purpose: Fill in the panel's own geometry from configuration.
 Anchors LEFT|TOP|BOTTOM (or RIGHT|TOP|BOTTOM), which is what makes the strip

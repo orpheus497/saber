@@ -49,6 +49,8 @@ The "Dependency added/removed/changed" row governs a dependency shift discovered
 
 For new public/exported functions going forward (not retroactive — do not mass-edit existing files solely to add these): write one comment line directly above the function, in the language's native comment syntax, explaining *why* it exists and how it's used. No exact prefix or tag is required — write it as a normal comment. Do not add comments that just restate the function name/signature.
 
+NEVER reference .devdocs on code comments nor use direct quotations from the user unless specified.
+
 Documentation is only necessary where the code is not self-explanatory, all files must meet this standard; DO NOT retroactively add commenting unless explicitly requested by the user. Use the following exact prefixes directly above the relevant code blocks, using the native comment syntax of the language (e.g., `//`, `#`, or `##`), to ensure immediate legibility. For shell scripts, place the comment directly beneath the shebang:
 
 * `Script function and purpose:` [What this script does] - Top of every script/source.

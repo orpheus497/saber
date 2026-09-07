@@ -169,6 +169,42 @@ struct saber_app {
   GMainLoop *loop;
 };
 
+/* Which modal surface is being raised, so app_clear_modals leaves that one
+alone and dismisses the rest. */
+enum saber_modal {
+  MODAL_DASH,
+  MODAL_SPREAD,
+};
+
+/* Function purpose: Leave exactly one modal surface up. The Dash and the
+spread are both full-output OVERLAY surfaces asking for EXCLUSIVE keyboard, and
+before this each could be opened over the other -- two surfaces holding the
+same keyboard, `saberctl status` reporting both open, and a quicklist left
+mapped underneath with no way to reach it. Every entry point that raises one of
+them calls this first. Lives in main.c because D-015 keeps the Dash and spread
+reachable only through hooks, so this is the one place that holds both. */
+static void
+app_clear_modals(struct saber_app *app, enum saber_modal raising)
+{
+  saber_panels_close_menu(app->panels);
+
+#ifdef HAVE_SPREAD
+  if (raising != MODAL_SPREAD && app->spread != NULL &&
+      saber_spread_is_visible(app->spread)) {
+    saber_spread_hide(app->spread);
+  }
+#endif
+
+#ifdef HAVE_DASH
+  if (raising != MODAL_DASH && app->dash != NULL &&
+      saber_dash_is_visible(app->dash)) {
+    saber_dash_hide(app->dash);
+  }
+#endif
+
+  (void)raising;
+}
+
 /* Function purpose: The saberctl verb table. ipc.c holds no panel logic, so
 every verb resolves to one of these; a NULL member is answered "error feature
 not built", which is how a WITH_DASH=NO build needs no conditional there. */
@@ -179,6 +215,10 @@ ipc_dash(void *user)
   struct saber_app *app = user;
 
   if (app->dash != NULL) {
+    if (!saber_dash_is_visible(app->dash)) {
+      app_clear_modals(app, MODAL_DASH);
+    }
+
     saber_dash_toggle(app->dash, NULL);
 
     return SABER_IPC_RESULT_OK;
@@ -197,6 +237,10 @@ ipc_spread(const char *app_id, void *user)
   struct saber_app *app = user;
 
   if (app->spread != NULL) {
+    if (!saber_spread_is_visible(app->spread)) {
+      app_clear_modals(app, MODAL_SPREAD);
+    }
+
     saber_spread_toggle(app->spread, app_id, NULL);
 
     return SABER_IPC_RESULT_OK;
@@ -321,6 +365,10 @@ on_bfb_clicked(struct saber_output *output, void *user)
   struct saber_app *app = user;
 
   if (app->dash != NULL) {
+    if (!saber_dash_is_visible(app->dash)) {
+      app_clear_modals(app, MODAL_DASH);
+    }
+
     saber_dash_toggle(app->dash, output);
   }
 }
@@ -331,6 +379,10 @@ on_spread_requested(const char *app_id, struct saber_output *output, void *user)
   struct saber_app *app = user;
 
   if (app->spread != NULL) {
+    if (!saber_spread_is_visible(app->spread)) {
+      app_clear_modals(app, MODAL_SPREAD);
+    }
+
     saber_spread_toggle(app->spread, app_id, output);
   }
 }

@@ -90,4 +90,12 @@ saber_panels_refresh(struct saber_panels *panels);
 unsigned int
 saber_panels_count(const struct saber_panels *panels);
 
+/* Function purpose: Dismiss any open quicklist or sheet grid. Exists so the
+Dash and the spread can clear the column's popups before they raise their own
+modal surface -- without it a quicklist stays mapped and keyboard-holding
+underneath a full-output overlay, with no way to reach it. Safe to call when
+nothing is open. */
+void
+saber_panels_close_menu(struct saber_panels *panels);
+
 #endif

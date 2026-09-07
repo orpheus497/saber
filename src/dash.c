@@ -187,8 +187,6 @@ struct saber_dash {
   struct xkb_keymap *keymap;
   struct xkb_state *xkb_state;
 
-  const struct saber_pointer_listener *prev_pointer;
-  void *prev_pointer_data;
   const struct saber_keyboard_listener *prev_keyboard;
   void *prev_keyboard_data;
 
@@ -976,8 +974,17 @@ dash_draw_cell(struct saber_dash *dash,
     distinct cell rather than as a gap in the grid. */
     char initial[8] = { 0 };
 
-    g_utf8_strncpy(initial, entry->label, 1);
-    *initial = (char)g_ascii_toupper(*initial);
+    /* Action purpose: g_utf8_strncpy advances with g_utf8_next_char, which
+    trusts the lead byte's declared length -- on a truncated final sequence it
+    reads past the terminator and copies whatever follows. entry->label is
+    app->name or the filename-derived app->id, and only the former is validated
+    by glib on the way in, so the label reaching here is not guaranteed valid.
+    The file's own note at the top of fold() documents this hazard; it was not
+    applied on this path. */
+    if (g_utf8_validate(entry->label, -1, NULL)) {
+      g_utf8_strncpy(initial, entry->label, 1);
+      *initial = (char)g_ascii_toupper(*initial);
+    }
 
     set_source_alpha(cr, &theme->dim, 0.6);
     rounded_rect(cr, x + w / 2.0 - DASH_ICON / 2.0, y + 14.0, DASH_ICON,
@@ -1283,6 +1290,19 @@ dash_cycle_category(struct saber_dash *dash, int delta)
       g_array_index(dash->chips, struct dash_chip, next).category);
 }
 
+/* The dash draws exactly one surface, so ownership is an identity test. Until
+display.c routed by surface this check lived only in dash_pointer_enter, and
+motion and button ran on panel-local coordinates as though they were the
+dash's -- which is how a click on the panel came to be read as a click inside
+the dash rectangle, and why the dash would not close. */
+static bool
+dash_pointer_owns(void *data, struct wl_surface *surface)
+{
+  struct saber_dash *dash = data;
+
+  return dash->surface != NULL && dash->surface->wl_surface == surface;
+}
+
 static void
 dash_pointer_enter(void *data, struct wl_surface *surface, double x, double y)
 {
@@ -1405,6 +1425,7 @@ dash_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
 }
 
 static const struct saber_pointer_listener dash_pointer_listener = {
+  .owns = dash_pointer_owns,
   .enter = dash_pointer_enter,
   .leave = dash_pointer_leave,
   .motion = dash_pointer_motion,
@@ -1759,15 +1780,15 @@ saber_dash_show(struct saber_dash *dash, struct saber_output *output)
     return false;
   }
 
-  /* Action purpose: The dash is modal, and display.c holds one listener of each
-  kind. Taking both over for its lifetime and putting the previous pair back on
-  hide is the only way to share them with the panel. */
-  dash->prev_pointer = dash->deps.display->pointer_listener;
-  dash->prev_pointer_data = dash->deps.display->pointer_data;
+  /* Action purpose: Pointer input is registered, not seized. display.c routes
+  by surface, so the panel keeps receiving its own clicks while the dash is up
+  -- which is what lets a second click on the BFB close it. The keyboard is
+  still a single slot and is genuinely exclusive while the dash is modal, so
+  that one keeps the save-and-restore. */
   dash->prev_keyboard = dash->deps.display->keyboard_listener;
   dash->prev_keyboard_data = dash->deps.display->keyboard_data;
 
-  saber_display_set_pointer_listener(dash->deps.display, &dash_pointer_listener,
+  saber_display_add_pointer_listener(dash->deps.display, &dash_pointer_listener,
       dash);
   saber_display_set_keyboard_listener(dash->deps.display,
       &dash_keyboard_listener, dash);
@@ -1793,8 +1814,8 @@ saber_dash_hide(struct saber_dash *dash)
   dash->surface = NULL;
 
   if (dash->listening) {
-    saber_display_set_pointer_listener(dash->deps.display, dash->prev_pointer,
-        dash->prev_pointer_data);
+    saber_display_remove_pointer_listener(dash->deps.display,
+        &dash_pointer_listener, dash);
     saber_display_set_keyboard_listener(dash->deps.display, dash->prev_keyboard,
         dash->prev_keyboard_data);
     dash->listening = false;

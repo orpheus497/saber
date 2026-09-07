@@ -82,8 +82,6 @@ struct saber_spread {
   struct xkb_keymap *keymap;
   struct xkb_state *xkb_state;
 
-  const struct saber_pointer_listener *prev_pointer;
-  void *prev_pointer_data;
   const struct saber_keyboard_listener *prev_keyboard;
   void *prev_keyboard_data;
 
@@ -793,6 +791,15 @@ spread_set_hover(struct saber_spread *spread, int index, bool on_close)
   spread_damage(spread);
 }
 
+/* The spread draws one surface; ownership is an identity test. */
+static bool
+spread_pointer_owns(void *data, struct wl_surface *surface)
+{
+  struct saber_spread *spread = data;
+
+  return spread->surface != NULL && spread->surface->wl_surface == surface;
+}
+
 static void
 spread_pointer_enter(void *data, struct wl_surface *surface, double x, double y)
 {
@@ -914,6 +921,7 @@ spread_pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
 }
 
 static const struct saber_pointer_listener spread_pointer_listener = {
+  .owns = spread_pointer_owns,
   .enter = spread_pointer_enter,
   .leave = spread_pointer_leave,
   .motion = spread_pointer_motion,
@@ -1199,15 +1207,14 @@ saber_spread_show(struct saber_spread *spread,
     return false;
   }
 
-  /* Action purpose: The spread is modal, and display.c holds one listener of
-  each kind. Taking both over for its lifetime and putting the previous pair
-  back on hide is the only way to share them with the panel. */
-  spread->prev_pointer = spread->deps.display->pointer_listener;
-  spread->prev_pointer_data = spread->deps.display->pointer_data;
+  /* Action purpose: Pointer input is registered, not seized -- display.c routes
+  by surface, so the panel keeps its own clicks while the spread is up. The
+  keyboard is still a single slot and is genuinely exclusive here, so it keeps
+  the save-and-restore. */
   spread->prev_keyboard = spread->deps.display->keyboard_listener;
   spread->prev_keyboard_data = spread->deps.display->keyboard_data;
 
-  saber_display_set_pointer_listener(spread->deps.display,
+  saber_display_add_pointer_listener(spread->deps.display,
       &spread_pointer_listener, spread);
   saber_display_set_keyboard_listener(spread->deps.display,
       &spread_keyboard_listener, spread);
@@ -1233,8 +1240,8 @@ saber_spread_hide(struct saber_spread *spread)
   spread->surface = NULL;
 
   if (spread->listening) {
-    saber_display_set_pointer_listener(spread->deps.display,
-        spread->prev_pointer, spread->prev_pointer_data);
+    saber_display_remove_pointer_listener(spread->deps.display,
+        &spread_pointer_listener, spread);
     saber_display_set_keyboard_listener(spread->deps.display,
         spread->prev_keyboard, spread->prev_keyboard_data);
     spread->listening = false;

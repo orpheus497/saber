@@ -312,6 +312,29 @@ saber_display_set_cursor_scale(struct saber_display *display, int scale)
 
 /* -- seat ---------------------------------------------------------------- */
 
+/* Function purpose: Find the module that drew a surface. Asked once per enter;
+the first registration to claim the surface wins, and surfaces are disjoint
+across modules so the order the array happens to be in carries no meaning. */
+static struct saber_pointer_registration *
+pointer_owner(struct saber_display *display, struct wl_surface *surface)
+{
+  if (display->pointer_listeners == NULL || surface == NULL) {
+    return NULL;
+  }
+
+  for (guint i = 0; i < display->pointer_listeners->len; i++) {
+    struct saber_pointer_registration *reg =
+        g_ptr_array_index(display->pointer_listeners, i);
+
+    if (reg->listener->owns != NULL &&
+        reg->listener->owns(reg->data, surface)) {
+      return reg;
+    }
+  }
+
+  return NULL;
+}
+
 static void
 pointer_handle_enter(void *data,
     struct wl_pointer *wl_pointer,
@@ -329,10 +352,16 @@ pointer_handle_enter(void *data,
 
   saber_display_set_cursor(display, display->cursor_name);
 
-  if (display->pointer_listener != NULL &&
-      display->pointer_listener->enter != NULL) {
-    display->pointer_listener->enter(display->pointer_data, surface,
-        wl_fixed_to_double(x), wl_fixed_to_double(y));
+  /* Action purpose: Resolve the owning module once, here, because this is the
+  only event that carries the surface. Everything until the matching leave is
+  routed to whatever this finds -- which is what stops an open Dash from
+  swallowing clicks on the panel beside it. */
+  display->pointer_target = pointer_owner(display, surface);
+
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->enter != NULL) {
+    display->pointer_target->listener->enter(display->pointer_target->data,
+        surface, wl_fixed_to_double(x), wl_fixed_to_double(y));
   }
 }
 
@@ -349,10 +378,13 @@ pointer_handle_leave(void *data,
 
   display->pointer_focus = NULL;
 
-  if (display->pointer_listener != NULL &&
-      display->pointer_listener->leave != NULL) {
-    display->pointer_listener->leave(display->pointer_data, surface);
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->leave != NULL) {
+    display->pointer_target->listener->leave(display->pointer_target->data,
+        surface);
   }
+
+  display->pointer_target = NULL;
 }
 
 static void
@@ -366,10 +398,10 @@ pointer_handle_motion(void *data,
 
   struct saber_display *display = data;
 
-  if (display->pointer_listener != NULL &&
-      display->pointer_listener->motion != NULL) {
-    display->pointer_listener->motion(display->pointer_data, time,
-        wl_fixed_to_double(x), wl_fixed_to_double(y));
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->motion != NULL) {
+    display->pointer_target->listener->motion(display->pointer_target->data,
+        time, wl_fixed_to_double(x), wl_fixed_to_double(y));
   }
 }
 
@@ -385,15 +417,20 @@ pointer_handle_button(void *data,
 
   struct saber_display *display = data;
 
-  /* Action purpose: The button serial, not the enter serial, is what a
-  compositor accepts for a drag or a popup grab, so it replaces the stored
-  one. */
-  display->pointer_enter_serial = serial;
+  /* Action purpose: A press serial, and only a press. A compositor accepts the
+  serial of a button PRESS for a popup grab or a drag, and menus here open on
+  the matching RELEASE -- so recording the release too, as this did until
+  2026-09-07, meant every grab quoted a serial the compositor was entitled to
+  refuse. Kept apart from pointer_enter_serial, which wl_pointer.set_cursor
+  needs and which this used to overwrite. */
+  if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    display->pointer_press_serial = serial;
+  }
 
-  if (display->pointer_listener != NULL &&
-      display->pointer_listener->button != NULL) {
-    display->pointer_listener->button(display->pointer_data, time, button,
-        state);
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->button != NULL) {
+    display->pointer_target->listener->button(display->pointer_target->data,
+        time, button, state);
   }
 }
 
@@ -408,10 +445,10 @@ pointer_handle_axis(void *data,
 
   struct saber_display *display = data;
 
-  if (display->pointer_listener != NULL &&
-      display->pointer_listener->axis != NULL) {
-    display->pointer_listener->axis(display->pointer_data, time, axis,
-        wl_fixed_to_double(value));
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->axis != NULL) {
+    display->pointer_target->listener->axis(display->pointer_target->data,
+        time, axis, wl_fixed_to_double(value));
   }
 }
 
@@ -422,9 +459,9 @@ pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
 
   struct saber_display *display = data;
 
-  if (display->pointer_listener != NULL &&
-      display->pointer_listener->frame != NULL) {
-    display->pointer_listener->frame(display->pointer_data);
+  if (display->pointer_target != NULL &&
+      display->pointer_target->listener->frame != NULL) {
+    display->pointer_target->listener->frame(display->pointer_target->data);
   }
 }
 
@@ -1063,12 +1100,62 @@ saber_display_set_disconnect_handler(struct saber_display *display,
 }
 
 void
-saber_display_set_pointer_listener(struct saber_display *display,
+saber_display_add_pointer_listener(struct saber_display *display,
     const struct saber_pointer_listener *listener,
     void *data)
 {
-  display->pointer_listener = listener;
-  display->pointer_data = data;
+  if (display == NULL || listener == NULL) {
+    return;
+  }
+
+  /* Action purpose: Registering twice would leave a second entry that the
+  matching remove could not reach, so an already-present pair is a no-op. */
+  for (guint i = 0; i < display->pointer_listeners->len; i++) {
+    struct saber_pointer_registration *existing =
+        g_ptr_array_index(display->pointer_listeners, i);
+
+    if (existing->listener == listener && existing->data == data) {
+      return;
+    }
+  }
+
+  struct saber_pointer_registration *reg =
+      g_new0(struct saber_pointer_registration, 1);
+
+  reg->listener = listener;
+  reg->data = data;
+
+  g_ptr_array_add(display->pointer_listeners, reg);
+}
+
+void
+saber_display_remove_pointer_listener(struct saber_display *display,
+    const struct saber_pointer_listener *listener,
+    void *data)
+{
+  if (display == NULL || display->pointer_listeners == NULL) {
+    return;
+  }
+
+  for (guint i = 0; i < display->pointer_listeners->len; i++) {
+    struct saber_pointer_registration *reg =
+        g_ptr_array_index(display->pointer_listeners, i);
+
+    if (reg->listener != listener || reg->data != data) {
+      continue;
+    }
+
+    /* Action purpose: Drop the target before the entry is freed. A module
+    unregisters while tearing its surfaces down, and the next motion event
+    would otherwise call through a listener whose data has just been freed. */
+    if (display->pointer_target == reg) {
+      display->pointer_target = NULL;
+    }
+
+    g_ptr_array_remove_index(display->pointer_listeners, i);
+
+    return;
+  }
 }
 
 void
@@ -1166,6 +1253,7 @@ saber_display_create(const char *name)
   struct saber_display *display = g_new0(struct saber_display, 1);
 
   wl_list_init(&display->outputs);
+  display->pointer_listeners = g_ptr_array_new_with_free_func(g_free);
 
   display->wl_display = wl_display_connect(name);
 
@@ -1229,6 +1317,13 @@ saber_display_destroy(struct saber_display *display)
     wl_cursor_theme_destroy(display->cursor_theme);
   }
 
+  display->pointer_target = NULL;
+
+  if (display->pointer_listeners != NULL) {
+    g_ptr_array_unref(display->pointer_listeners);
+    display->pointer_listeners = NULL;
+  }
+
   g_free(display->keymap_data);
   g_free(display->cursor_theme_name);
   g_free(display->cursor_name);
@@ -1270,8 +1365,19 @@ saber_display_destroy(struct saber_display *display)
     wp_viewporter_destroy(display->viewporter);
   }
 
+  /* Action purpose: zwlr_layer_shell_v1.destroy is `since="3"`, and the shell is
+  bound with version_min(version, 4) -- so on a v1 or v2 compositor this sends
+  an opcode that does not exist at that version, which libwayland does not check
+  and the compositor answers by killing the client. Below v3 the proxy is simply
+  released locally; the resource goes when the connection does, which is the
+  next statement but one. */
   if (display->layer_shell != NULL) {
-    zwlr_layer_shell_v1_destroy(display->layer_shell);
+    if (zwlr_layer_shell_v1_get_version(display->layer_shell) >=
+        ZWLR_LAYER_SHELL_V1_DESTROY_SINCE_VERSION) {
+      zwlr_layer_shell_v1_destroy(display->layer_shell);
+    } else {
+      wl_proxy_destroy((struct wl_proxy *)display->layer_shell);
+    }
   }
 
   if (display->shm != NULL) {

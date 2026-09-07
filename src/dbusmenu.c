@@ -36,6 +36,14 @@ GPtrArray and two strdups here. This caps the tree as a whole. Still far above
 any real menu: the largest seen in practice is in the low hundreds. */
 #define MENU_MAX_NODES 4096
 
+/* Action purpose: A per-row icon cap. `icon-data` is raw image bytes chosen by
+the peer, and it was copied with no limit at all -- 4096 nodes each carrying a
+large PNG is a legal GetLayout reply that fits inside D-Bus's 128MB message
+limit and costs that much heap here, re-read on every ItemsPropertiesUpdated.
+sni.c already caps its own pixmaps at 512x512; this is the equivalent for menu
+rows. 256KB is far above any real menu icon, which is a handful of KB. */
+#define MENU_MAX_ICON_BYTES (256 * 1024)
+
 /* GetLayout's recursionDepth: -1 is the whole tree. Saber draws the submenus
 itself rather than asking the application to open them, so it wants the tree in
 one round trip; AboutToShow still runs before a submenu opens, for applications
@@ -166,9 +174,13 @@ apply_properties(struct saber_dbusmenu_item *item, GVariant *props)
     gsize length = 0;
     const guchar *bytes = g_variant_get_fixed_array(icon_data, &length, 1);
 
-    if (bytes != NULL && length > 0) {
+    if (bytes != NULL && length > 0 && length <= MENU_MAX_ICON_BYTES) {
       item->icon_data = g_memdup2(bytes, length);
       item->icon_data_len = length;
+    } else if (length > MENU_MAX_ICON_BYTES) {
+      g_debug("saber: menu row carries a %" G_GSIZE_FORMAT
+              " byte icon; ignoring it",
+          length);
     }
 
     g_variant_unref(icon_data);
@@ -384,6 +396,18 @@ saber_dbusmenu_open(GDBusConnection *connection,
 {
   if (bus_name == NULL || bus_name[0] == '\0' || object_path == NULL ||
       object_path[0] == '\0') {
+    return NULL;
+  }
+
+  /* Action purpose: Both of these reach g_dbus_connection_call and
+  g_dbus_connection_signal_subscribe, which raise a g_critical on a malformed
+  name or path -- fatal under G_DEBUG=fatal-criticals. The values originate in
+  a StatusNotifierItem's properties, i.e. from an arbitrary session peer, so
+  they are validated here as well as at the sni.c ingress. Two layers, because
+  this function is public and sni.c is not its only possible caller. */
+  if (!g_dbus_is_name(bus_name) || !g_variant_is_object_path(object_path)) {
+    g_debug("saber: refusing a menu with an invalid bus name or object path");
+
     return NULL;
   }
 

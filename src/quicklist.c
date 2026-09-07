@@ -115,8 +115,6 @@ struct saber_quicklist {
   struct xkb_keymap *keymap;
   struct xkb_state *xkb_state;
 
-  const struct saber_pointer_listener *prev_pointer;
-  void *prev_pointer_data;
   const struct saber_keyboard_listener *prev_keyboard;
   void *prev_keyboard_data;
 
@@ -997,7 +995,18 @@ quicklist_pointer_button(void *data,
   }
 }
 
+/* A menu owns one popup surface per open level, so ownership is the same walk
+the event handlers already use to find which level was hit. */
+static bool
+quicklist_pointer_owns(void *data, struct wl_surface *surface)
+{
+  struct saber_quicklist *ql = data;
+
+  return level_from_surface(ql, surface) != NULL;
+}
+
 static const struct saber_pointer_listener quicklist_pointer_listener = {
+  .owns = quicklist_pointer_owns,
   .enter = quicklist_pointer_enter,
   .leave = quicklist_pointer_leave,
   .motion = quicklist_pointer_motion,
@@ -1301,15 +1310,15 @@ saber_quicklist_open(const struct saber_quicklist_params *params,
     return NULL;
   }
 
-  /* Action purpose: The menu is modal, and display.c holds one listener of
-  each kind. Taking both over for the menu's lifetime and putting the previous
-  pair back on close is the only way to share them. */
-  ql->prev_pointer = ql->display->pointer_listener;
-  ql->prev_pointer_data = ql->display->pointer_data;
+  /* Action purpose: Pointer input is registered, not seized. display.c routes
+  by surface, so a menu no longer blinds the panel underneath it -- which is
+  what used to make scrolling dead everywhere on screen while any menu was
+  open. The keyboard is still one slot and the menu is genuinely modal for it,
+  so that keeps the save-and-restore. */
   ql->prev_keyboard = ql->display->keyboard_listener;
   ql->prev_keyboard_data = ql->display->keyboard_data;
 
-  saber_display_set_pointer_listener(ql->display, &quicklist_pointer_listener,
+  saber_display_add_pointer_listener(ql->display, &quicklist_pointer_listener,
       ql);
   saber_display_set_keyboard_listener(ql->display, &quicklist_keyboard_listener,
       ql);
@@ -1342,8 +1351,8 @@ saber_quicklist_close(struct saber_quicklist *ql)
   }
 
   if (ql->listening) {
-    saber_display_set_pointer_listener(ql->display, ql->prev_pointer,
-        ql->prev_pointer_data);
+    saber_display_remove_pointer_listener(ql->display,
+        &quicklist_pointer_listener, ql);
     saber_display_set_keyboard_listener(ql->display, ql->prev_keyboard,
         ql->prev_keyboard_data);
   }

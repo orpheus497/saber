@@ -206,6 +206,33 @@ set_string(char **dest, GVariant *value)
   *dest = g_variant_dup_string(value, NULL);
 }
 
+/* Action purpose: The same as set_string, for a property that is fed straight
+to GDBus as an object path. Accepting a plain `s` here -- which real tray items
+do send -- and then handing it on unchecked let any session peer publish
+Menu="garbage" and turn one right-click into a g_critical from GDBus's own
+argument precondition, which aborts the shell under G_DEBUG=fatal-criticals.
+The type is tolerated; the VALUE is not. */
+static void
+set_object_path(char **dest, GVariant *value)
+{
+  if (!g_variant_is_of_type(value, G_VARIANT_TYPE_STRING) &&
+      !g_variant_is_of_type(value, G_VARIANT_TYPE_OBJECT_PATH)) {
+    return;
+  }
+
+  const char *path = g_variant_get_string(value, NULL);
+
+  if (!g_variant_is_object_path(path)) {
+    g_debug("saber: tray item published a Menu that is not an object path; "
+            "ignoring it");
+
+    return;
+  }
+
+  g_free(*dest);
+  *dest = g_strdup(path);
+}
+
 static void
 set_pixmap(GVariant **dest, GVariant *value, struct icon_cache *cache)
 {
@@ -253,7 +280,7 @@ apply_property(struct saber_sni_item *item, const char *name, GVariant *value)
   } else if (g_strcmp0(name, "IconThemePath") == 0) {
     set_string(&item->icon_theme_path, value);
   } else if (g_strcmp0(name, "Menu") == 0) {
-    set_string(&item->menu_path, value);
+    set_object_path(&item->menu_path, value);
   } else if (g_strcmp0(name, "IconPixmap") == 0) {
     set_pixmap(&item->icon_pixmap, value, &item->icon);
   } else if (g_strcmp0(name, "AttentionIconPixmap") == 0) {
@@ -287,10 +314,49 @@ apply_property(struct saber_sni_item *item, const char *name, GVariant *value)
 /* fetching                                                          */
 /* ---------------------------------------------------------------- */
 
+/* Action purpose: An async property reply can outlive the item it belongs to,
+because a tray application exiting while a call is in flight frees the item from
+one main-loop source while the reply is already queued on another. Cancelling a
+GCancellable does NOT retract a GTask that has already completed, so testing the
+reply for G_IO_ERROR_CANCELLED proves nothing about whether the item is still
+alive -- that check only fires when GDBus itself noticed the cancellation in
+time. Holding a reference to the cancellable, which item_destroy cancels before
+it frees anything, gives the callback something it can safely ask. */
 struct prop_fetch {
   struct saber_sni_item *item;
-  char *name;
+  GCancellable *cancellable;
+  char *name; /* NULL for a GetAll batch. */
 };
+
+static struct prop_fetch *
+prop_fetch_new(struct saber_sni_item *item, const char *name)
+{
+  struct prop_fetch *ctx = g_new0(struct prop_fetch, 1);
+
+  ctx->item = item;
+  ctx->cancellable = g_object_ref(item->cancellable);
+  ctx->name = g_strdup(name);
+
+  return ctx;
+}
+
+static void
+prop_fetch_free(struct prop_fetch *ctx)
+{
+  g_object_unref(ctx->cancellable);
+  g_free(ctx->name);
+  g_free(ctx);
+}
+
+/* Whether the item this call was issued for has since been destroyed. Sound
+because both item_destroy and this callback run on the same main loop: if the
+cancel got there first the item is gone, and if it did not the item is alive
+for the duration of this callback. */
+static bool
+prop_fetch_orphaned(const struct prop_fetch *ctx)
+{
+  return g_cancellable_is_cancelled(ctx->cancellable);
+}
 
 static void
 on_get_property(GObject *source, GAsyncResult *res, gpointer data)
@@ -300,22 +366,27 @@ on_get_property(GObject *source, GAsyncResult *res, gpointer data)
   GVariant *reply =
       g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
 
-  if (reply == NULL) {
-    /* Action purpose: The cancellation check must come first. A cancelled call
-    means the item has already been freed, so ctx->item is dead memory and even
-    reading its name for a diagnostic is a use-after-free. */
-    bool cancelled = g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+  /* Action purpose: Orphan check first, and on BOTH paths -- a successful reply
+  is just as capable of arriving after the item was freed as a failed one, which
+  is what the old error-only check missed. ctx->item is dead memory here, so
+  nothing below may touch it. */
+  if (prop_fetch_orphaned(ctx)) {
+    g_clear_error(&error);
+    g_clear_pointer(&reply, g_variant_unref);
+    prop_fetch_free(ctx);
 
-    if (!cancelled) {
-      /* Ordinary: the specification marks most of these optional. */
-      g_debug("saber: %s unavailable on a tray item: %s",
-          ctx->name,
-          error != NULL ? error->message : "unknown error");
-    }
+    return;
+  }
+
+  if (reply == NULL) {
+    /* Ordinary: the specification marks most of these optional. */
+    g_debug("saber: %s unavailable on a tray item: %s",
+        ctx->name,
+        error != NULL ? error->message : "unknown error");
 
     g_clear_error(&error);
-    g_free(ctx->name);
-    g_free(ctx);
+    prop_fetch_free(ctx);
+
     return;
   }
 
@@ -328,8 +399,7 @@ on_get_property(GObject *source, GAsyncResult *res, gpointer data)
 
   notify_changed(ctx->item->sni);
 
-  g_free(ctx->name);
-  g_free(ctx);
+  prop_fetch_free(ctx);
 }
 
 /* Function purpose: The fallback for an item whose GetAll fails. One property
@@ -356,10 +426,7 @@ fetch_individually(struct saber_sni_item *item)
   };
 
   for (size_t i = 0; wanted[i] != NULL; i++) {
-    struct prop_fetch *ctx = g_new0(struct prop_fetch, 1);
-
-    ctx->item = item;
-    ctx->name = g_strdup(wanted[i]);
+    struct prop_fetch *ctx = prop_fetch_new(item, wanted[i]);
 
     g_dbus_connection_call(item->sni->connection,
         item->bus_name,
@@ -379,23 +446,30 @@ fetch_individually(struct saber_sni_item *item)
 static void
 on_get_all(GObject *source, GAsyncResult *res, gpointer data)
 {
-  struct saber_sni_item *item = data;
+  struct prop_fetch *ctx = data;
+  struct saber_sni_item *item = ctx->item;
   GError *error = NULL;
   GVariant *reply =
       g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
 
-  if (reply == NULL) {
-    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-      g_clear_error(&error);
-      return;
-    }
+  /* Orphan check before anything reads `item` -- see prop_fetch. */
+  if (prop_fetch_orphaned(ctx)) {
+    g_clear_error(&error);
+    g_clear_pointer(&reply, g_variant_unref);
+    prop_fetch_free(ctx);
 
+    return;
+  }
+
+  if (reply == NULL) {
     g_debug("saber: GetAll failed for tray item %s (%s); reading properties "
             "one at a time",
         item->service,
         error != NULL ? error->message : "unknown error");
     g_clear_error(&error);
+    prop_fetch_free(ctx);
     fetch_individually(item);
+
     return;
   }
 
@@ -414,6 +488,8 @@ on_get_all(GObject *source, GAsyncResult *res, gpointer data)
   g_variant_unref(reply);
 
   notify_changed(item->sni);
+
+  prop_fetch_free(ctx);
 }
 
 static void
@@ -430,7 +506,7 @@ fetch_all(struct saber_sni_item *item)
       ITEM_CALL_TIMEOUT_MS,
       item->cancellable,
       on_get_all,
-      item);
+      prop_fetch_new(item, NULL));
 }
 
 static gboolean

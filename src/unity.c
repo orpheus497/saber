@@ -20,6 +20,17 @@ no launcher-entry code to port from. */
 /* app_uri is "application://<desktop-file-id>". */
 #define APPLICATION_SCHEME "application://"
 
+/* Action purpose: LauncherEntry.Update carries no authentication of any kind --
+the desktop ID is a string in the payload and the protocol offers no way to
+prove the sender owns it. That is a property of the protocol, not something this
+module can repair, and every implementation of it trusts the sender. What can be
+bounded is the damage: an unbounded insert-only table let any session peer grow
+the panel's memory without limit by emitting one Update per made-up ID. These
+two caps plus the name watch below turn that into a fixed ceiling that empties
+itself when publishers exit. Both are far above any real desktop. */
+#define UNITY_MAX_ENTRIES 256
+#define UNITY_MAX_ID_LEN 256
+
 struct saber_unity {
   GDBusConnection *connection;
   guint owner_id;
@@ -27,6 +38,11 @@ struct saber_unity {
   bool owned;
 
   GHashTable *entries; /* desktop-file ID -> struct saber_unity_entry * */
+
+  /* desktop-file ID -> g_bus_watch_name id for the peer that published it.
+  Without this a badge outlived the application that set it for the whole
+  session, because nothing ever noticed the publisher going away. */
+  GHashTable *watches;
 
   saber_unity_changed_func cb;
   void *user;
@@ -64,6 +80,12 @@ desktop_id_of(const char *app_uri)
   one rather than dropped. A path is not: it would key the model on something
   no desktop entry can ever match. */
   if (app_uri[0] == '\0' || strchr(app_uri, '/') != NULL) {
+    return NULL;
+  }
+
+  /* A desktop-file ID is a filename; anything this long is not one, and it is
+  the hash key, so it is the peer choosing how much memory to spend. */
+  if (strlen(app_uri) > UNITY_MAX_ID_LEN) {
     return NULL;
   }
 
@@ -134,6 +156,96 @@ apply_update(struct saber_unity_entry *entry,
   }
 }
 
+/* Records which publisher a badge belongs to, so the badge can be withdrawn
+when that peer leaves the bus. */
+struct unity_watch {
+  struct saber_unity *unity;
+  char *desktop_id;
+};
+
+static void
+unity_watch_free(gpointer data)
+{
+  struct unity_watch *watch = data;
+
+  g_free(watch->desktop_id);
+  g_free(watch);
+}
+
+static void
+watch_id_unwatch(gpointer data)
+{
+  guint id = GPOINTER_TO_UINT(data);
+
+  if (id != 0) {
+    g_bus_unwatch_name(id);
+  }
+}
+
+/* Function purpose: Withdraw an application's badge when its process leaves the
+session bus. Without this a count or progress bar set by an application that has
+since exited stayed on the tile for the rest of the session, because nothing in
+the protocol says "clear". */
+static void
+on_publisher_vanished(GDBusConnection *connection,
+    const char *name,
+    gpointer data)
+{
+  struct unity_watch *watch = data;
+  struct saber_unity *unity = watch->unity;
+
+  (void)connection;
+  (void)name;
+
+  /* Action purpose: Copy the id first. Removing from `watches` unwatches the
+  name, which frees `watch` -- from inside its own callback. Nothing may read
+  `watch` after the first removal below. */
+  char *desktop_id = g_strdup(watch->desktop_id);
+
+  g_hash_table_remove(unity->watches, desktop_id);
+  g_hash_table_remove(unity->entries, desktop_id);
+
+  if (unity->cb != NULL) {
+    /* A zeroed entry is "no badge", which is what the tile must fall back to. */
+    struct saber_unity_entry cleared = { 0 };
+
+    unity->cb(desktop_id, &cleared, unity->user);
+  }
+
+  g_free(desktop_id);
+}
+
+/* Function purpose: Watch the peer that published this badge, replacing any
+previous watch for the same tile -- an application that restarts publishes under
+a new unique name, and the stale watch would otherwise never fire. */
+static void
+unity_watch_publisher(struct saber_unity *unity,
+    const char *desktop_id,
+    const char *sender)
+{
+  if (unity->connection == NULL || sender == NULL || !g_dbus_is_name(sender)) {
+    return;
+  }
+
+  struct unity_watch *watch = g_new0(struct unity_watch, 1);
+
+  watch->unity = unity;
+  watch->desktop_id = g_strdup(desktop_id);
+
+  guint id = g_bus_watch_name_on_connection(unity->connection,
+      sender,
+      G_BUS_NAME_WATCHER_FLAGS_NONE,
+      NULL,
+      on_publisher_vanished,
+      watch,
+      unity_watch_free);
+
+  /* Replaces any existing watch for this tile; the old id is unwatched by the
+  table's value destructor. */
+  g_hash_table_insert(unity->watches, g_strdup(desktop_id),
+      GUINT_TO_POINTER(id));
+}
+
 static void
 on_update(GDBusConnection *connection,
     const char *sender,
@@ -170,6 +282,18 @@ on_update(GDBusConnection *connection,
       g_hash_table_lookup(unity->entries, desktop_id);
 
   if (entry == NULL) {
+    /* Action purpose: Refuse only NEW tiles once the ceiling is reached, so a
+    peer flooding made-up IDs cannot grow the table but also cannot stop the
+    applications already on it from updating their own badges. */
+    if (g_hash_table_size(unity->entries) >= UNITY_MAX_ENTRIES) {
+      g_debug("saber: ignoring a LauncherEntry update for %s; the badge table "
+              "is at its %d-entry ceiling",
+          desktop_id, UNITY_MAX_ENTRIES);
+      g_variant_unref(props);
+
+      return;
+    }
+
     entry = g_new0(struct saber_unity_entry, 1);
     entry->quicklist = g_strdup("");
     entry->bus_name = g_strdup("");
@@ -177,6 +301,7 @@ on_update(GDBusConnection *connection,
   }
 
   apply_update(entry, sender, props);
+  unity_watch_publisher(unity, desktop_id, sender);
   g_variant_unref(props);
 
   if (unity->cb != NULL) {
@@ -236,6 +361,11 @@ saber_unity_create(saber_unity_changed_func cb, void *user)
       g_free,
       entry_destroy);
 
+  unity->watches = g_hash_table_new_full(g_str_hash,
+      g_str_equal,
+      g_free,
+      watch_id_unwatch);
+
   /* Action purpose: Subscribe with a NULL object path. Applications emit
   LauncherEntry.Update on a path of their own choosing -- libunity uses one
   derived from the desktop-file ID -- so matching a path would match almost
@@ -283,6 +413,12 @@ saber_unity_destroy(struct saber_unity *unity)
 
   if (unity->owner_id != 0) {
     g_bus_unown_name(unity->owner_id);
+  }
+
+  /* Before the entries: every watch holds a pointer back into `unity`, and its
+  vanish callback removes from both tables. */
+  if (unity->watches != NULL) {
+    g_hash_table_destroy(unity->watches);
   }
 
   if (unity->entries != NULL) {

@@ -442,6 +442,22 @@ saber_surface_set_keyboard_interactivity(struct saber_surface *surface,
     return;
   }
 
+  /* Action purpose: ON_DEMAND is `since="4"` in the layer-shell protocol, and
+  the shell is bound with version_min(version, 4) -- so on a compositor that
+  advertises 1, 2 or 3 this request carries a value the compositor must reject
+  with `invalid_keyboard_interactivity`, which kills the client. Fall back to
+  EXCLUSIVE there: it is the strongest thing v1 has and it at least delivers
+  the keys the caller asked for, rather than terminating the panel. */
+  if (interactivity == ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND &&
+      zwlr_layer_surface_v1_get_version(surface->layer_surface) <
+          ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND_SINCE_VERSION) {
+    interactivity = ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE;
+
+    if (interactivity == surface->keyboard_interactivity) {
+      return;
+    }
+  }
+
   surface->keyboard_interactivity = interactivity;
   zwlr_layer_surface_v1_set_keyboard_interactivity(surface->layer_surface,
       interactivity);
@@ -914,8 +930,13 @@ popup_grab(struct saber_popup *popup, const struct saber_popup_params *params)
     return;
   }
 
+  /* Action purpose: A popup grab must quote the serial of a button PRESS. The
+  fallback used to be pointer_enter_serial, which the button handler overwrote
+  on press AND release -- so a menu opened from a release quoted a release
+  serial and a compositor that validates it refused the grab, leaving the menu
+  with no click-outside dismissal. */
   uint32_t serial = params->grab_serial != 0 ? params->grab_serial
-                                             : display->pointer_enter_serial;
+                                             : display->pointer_press_serial;
 
   xdg_popup_grab(popup->xdg_popup, display->seat, serial);
 }

@@ -925,7 +925,7 @@ panel_launch(struct saber_panels *set, struct saber_item *item)
 
   if (display->seat != NULL) {
     xdg_activation_token_v1_set_serial(launch->token,
-        display->pointer_enter_serial, display->seat);
+        display->pointer_press_serial, display->seat);
   }
 
   if (set->pointer_panel != NULL && set->pointer_panel->surface != NULL) {
@@ -1544,8 +1544,6 @@ struct saber_sheet_grid {
 
   PangoFontDescription *font, *small_font;
 
-  const struct saber_pointer_listener *prev_pointer;
-  void *prev_pointer_data;
   const struct saber_keyboard_listener *prev_keyboard;
   void *prev_keyboard_data;
 
@@ -1891,7 +1889,18 @@ static const struct saber_popup_listener grid_popup_listener = {
   .done = grid_done,
 };
 
+/* The sheet grid is one popup surface; the same test grid_pointer_enter makes
+to set `inside`. */
+static bool
+grid_pointer_owns(void *data, struct wl_surface *surface)
+{
+  struct saber_sheet_grid *grid = data;
+
+  return grid->popup != NULL && grid->popup->wl_surface == surface;
+}
+
 static const struct saber_pointer_listener grid_pointer_listener = {
+  .owns = grid_pointer_owns,
   .enter = grid_pointer_enter,
   .leave = grid_pointer_leave,
   .motion = grid_pointer_motion,
@@ -1921,8 +1930,8 @@ sheet_grid_close(struct saber_sheet_grid *grid)
   }
 
   if (grid->listening) {
-    saber_display_set_pointer_listener(set->deps.display, grid->prev_pointer,
-        grid->prev_pointer_data);
+    saber_display_remove_pointer_listener(set->deps.display,
+        &grid_pointer_listener, grid);
     saber_display_set_keyboard_listener(set->deps.display, grid->prev_keyboard,
         grid->prev_keyboard_data);
   }
@@ -1997,15 +2006,13 @@ panel_open_sheet_grid(struct saber_panel *panel, const struct saber_slot *slot)
     return;
   }
 
-  /* Action purpose: The grid is modal and display.c holds one listener of each
-  kind. Taking both over for its lifetime and putting the previous pair back on
-  close is the only way to share them. */
-  grid->prev_pointer = set->deps.display->pointer_listener;
-  grid->prev_pointer_data = set->deps.display->pointer_data;
+  /* Action purpose: Pointer input is registered, not seized -- display.c routes
+  by surface, so the column keeps its own clicks while the grid is up. The
+  keyboard stays a single slot and the grid is modal for it. */
   grid->prev_keyboard = set->deps.display->keyboard_listener;
   grid->prev_keyboard_data = set->deps.display->keyboard_data;
 
-  saber_display_set_pointer_listener(set->deps.display, &grid_pointer_listener,
+  saber_display_add_pointer_listener(set->deps.display, &grid_pointer_listener,
       grid);
   saber_display_set_keyboard_listener(set->deps.display,
       &grid_keyboard_listener, grid);
@@ -2388,7 +2395,19 @@ pointer_axis(void *data, uint32_t time, uint32_t axis, double value)
   panel_scroll_slot(panel, panel->hover, value);
 }
 
+/* The set owns one surface per output, and panel_for_surface is already the
+lookup every handler does. Registering it as the ownership test is what keeps
+the column's own clicks reaching it while a Dash, spread or menu is open. */
+static bool
+panel_pointer_owns(void *data, struct wl_surface *surface)
+{
+  struct saber_panels *panels = data;
+
+  return panel_for_surface(panels, surface) != NULL;
+}
+
 static const struct saber_pointer_listener panel_pointer_listener = {
+  .owns = panel_pointer_owns,
   .enter = pointer_enter,
   .leave = pointer_leave,
   .motion = pointer_motion,
@@ -2556,7 +2575,7 @@ saber_panels_create(const struct saber_panel_deps *deps)
 
   saber_render_init(&panels->render, deps->config, deps->theme, deps->icons);
 
-  saber_display_set_pointer_listener(deps->display, &panel_pointer_listener,
+  saber_display_add_pointer_listener(deps->display, &panel_pointer_listener,
       panels);
   /* Fires immediately for every output already known, so no output that
   arrived during startup is missed. */
@@ -2578,7 +2597,8 @@ saber_panels_destroy(struct saber_panels *panels)
   panel_close_menu(panels);
 
   saber_display_set_output_listener(panels->deps.display, NULL, NULL);
-  saber_display_set_pointer_listener(panels->deps.display, NULL, NULL);
+  saber_display_remove_pointer_listener(panels->deps.display,
+      &panel_pointer_listener, panels);
   saber_display_set_keyboard_listener(panels->deps.display, NULL, NULL);
 
   for (guint i = 0; i < panels->list->len; i++) {
@@ -2643,4 +2663,14 @@ unsigned int
 saber_panels_count(const struct saber_panels *panels)
 {
   return panels->list->len;
+}
+
+void
+saber_panels_close_menu(struct saber_panels *panels)
+{
+  if (panels == NULL) {
+    return;
+  }
+
+  panel_close_menu(panels);
 }

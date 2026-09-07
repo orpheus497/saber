@@ -5,6 +5,7 @@ and the painter off the same bytes. */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +94,14 @@ pool_teardown(struct saber_buffer_pool *pool)
     }
 
     if (slot->wl_buffer != NULL) {
+      /* Action purpose: A slot still marked busy is attached to a surface and
+      the compositor has not released it. Destroying it here leaves that
+      surface's last frame reading undefined content -- the acquire path
+      already refuses to reuse a busy slot, and teardown is the one path that
+      does not check. Nothing can be done about it here: the surface is going
+      away and the pool with it. Recorded so the asymmetry with
+      saber_buffer_pool_acquire is deliberate and visible, rather than looking
+      like an oversight to the next reader. */
       wl_buffer_destroy(slot->wl_buffer);
     }
 
@@ -130,6 +139,16 @@ pool_build(struct saber_buffer_pool *pool, int width, int height)
 
   size_t slot_size = (size_t)stride * (size_t)height;
   size_t total = slot_size * SABER_BUFFER_SLOTS;
+
+  /* Action purpose: wl_shm_create_pool and wl_shm_pool_create_buffer both take
+  int32_t, and the pool offset for the last slot is an int32_t too. The
+  multiplications above are done in size_t so they cannot wrap, but the casts
+  below can -- a full-output OVERLAY surface on a very large or heavily scaled
+  output would hand the compositor a negative size, which is a protocol error at
+  best. Refuse the allocation instead of truncating it. */
+  if (total > (size_t)INT32_MAX) {
+    return false;
+  }
 
   int fd = shm_fd_create(total);
 

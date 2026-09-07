@@ -38,12 +38,28 @@ struct saber_output {
 /* Pointer coordinates are surface-local logical pixels; the surface layer, not
 the caller, owns the conversion to buffer pixels. */
 struct saber_pointer_listener {
+  /* Action purpose: wl_pointer carries a surface on enter and leave but NOT on
+  motion, button or axis, so a dispatcher holding one listener has no way to
+  tell whose surface an event belongs to and hands every module's input to
+  whichever registered last. This predicate is how display.c resolves the owner
+  once, on enter, and routes the rest of the stream to that module alone.
+  Every registration must implement it; a listener that claims no surface
+  receives nothing. */
+  bool (*owns)(void *data, struct wl_surface *surface);
   void (*enter)(void *data, struct wl_surface *surface, double x, double y);
   void (*leave)(void *data, struct wl_surface *surface);
   void (*motion)(void *data, uint32_t time, double x, double y);
   void (*button)(void *data, uint32_t time, uint32_t button, uint32_t state);
   void (*axis)(void *data, uint32_t time, uint32_t axis, double value);
   void (*frame)(void *data);
+};
+
+/* One registered module. Ownership is resolved by asking each entry's `owns`,
+so registration order carries no meaning and a module removing itself can never
+displace another's registration. */
+struct saber_pointer_registration {
+  const struct saber_pointer_listener *listener;
+  void *data;
 };
 
 struct saber_keyboard_listener {
@@ -95,7 +111,15 @@ struct saber_display {
 
   struct wl_pointer *pointer;
   struct wl_keyboard *keyboard;
+  /* Action purpose: Two serials, deliberately. wl_pointer.set_cursor is only
+  honoured against the serial of the ENTER that put the pointer on the surface,
+  while xdg_popup.grab and xdg_activation want the serial of the PRESS that
+  asked for them. One field served both until 2026-09-07 and the button handler
+  overwrote it, so the cursor stopped changing after the first click and every
+  popup grab quoted a button-RELEASE serial. `pointer_press_serial` is written
+  on press only, so it survives the release that opens a menu. */
   uint32_t pointer_enter_serial;
+  uint32_t pointer_press_serial;
   struct wl_surface *pointer_focus;
   struct wl_surface *keyboard_focus;
 
@@ -119,8 +143,11 @@ struct saber_display {
   int cursor_base_size;
   int cursor_scale;
 
-  const struct saber_pointer_listener *pointer_listener;
-  void *pointer_data;
+  /* Registered modules, and the one that owns the surface the pointer is on.
+  `pointer_target` is resolved on enter and cleared on leave; it is the only
+  route motion, button and axis events take. */
+  GPtrArray *pointer_listeners;
+  struct saber_pointer_registration *pointer_target;
   const struct saber_keyboard_listener *keyboard_listener;
   void *keyboard_data;
   const struct saber_output_listener *output_listener;
@@ -160,8 +187,23 @@ saber_display_set_disconnect_handler(struct saber_display *display,
     void (*handler)(void *data),
     void *data);
 
+/* Function purpose: Register a module for pointer input. Every registration
+must supply `owns`, because that is what decides which module an event belongs
+to; registrations are unordered and independent, so two modules can be open at
+once without either consuming the other's clicks. Pair with
+saber_display_remove_pointer_listener when the module's surfaces go away. */
 void
-saber_display_set_pointer_listener(struct saber_display *display,
+saber_display_add_pointer_listener(struct saber_display *display,
+    const struct saber_pointer_listener *listener,
+    void *data);
+
+/* Function purpose: Withdraw a registration made by
+saber_display_add_pointer_listener. Matched on the listener/data pair, so a
+module can only ever remove its own, and removing one that is not registered is
+a no-op rather than an error. If the withdrawn module currently owns the
+pointer, the target is dropped so no event reaches freed memory. */
+void
+saber_display_remove_pointer_listener(struct saber_display *display,
     const struct saber_pointer_listener *listener,
     void *data);
 

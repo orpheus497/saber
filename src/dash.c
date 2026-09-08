@@ -31,6 +31,7 @@ keyboard on anyway. */
 #include <pango/pangocairo.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <saber/anim.h>
 #include <saber/dash.h>
 #include <saber/surface.h>
 
@@ -197,6 +198,18 @@ struct saber_dash {
 
   saber_dash_dismissed_cb dismissed;
   void *dismissed_user;
+
+  /* Action purpose: The dash's own clock, driven from the surface layer's frame
+  hook. Both tweens are one-shot -- neither repeats -- so the loop settles by
+  itself and cannot pin a core the way an unbounded repeat did (D-036).
+  `reveal` runs once on show and slides the strip in from the panel's edge;
+  `hover_in`/`hover_out` fade a cell's highlight, with `fading` naming the cell
+  the pointer has just left. */
+  struct saber_clock *clock;
+  bool revealing; /* the open transition has been started for this mapping */
+  struct saber_tween reveal;
+  struct saber_tween hover_in, hover_out;
+  int fading;
 
   int columns, rows, visible_rows;
   double cell_width, cell_height;
@@ -595,6 +608,7 @@ dash_filter(struct saber_dash *dash)
 
   dash->selected = dash->results->len > 0 ? 0 : -1;
   dash->hovered = -1;
+  dash->fading = -1;
   dash->pressed = -1;
   dash->scroll = 0;
 
@@ -1050,14 +1064,33 @@ dash_draw_cell(struct saber_dash *dash,
   double w = dash->cell_width;
   double h = dash->cell_height;
 
-  if (index == dash->selected || index == dash->hovered) {
+  /* Action purpose: The highlight is a fade rather than a switch. `hover` is 1
+  for the cell the pointer is on, whatever the incoming tween has reached, and
+  the outgoing value for the cell it has just left -- so sweeping across the
+  grid leaves a trail that settles instead of a highlight that snaps from cell
+  to cell. The keyboard cursor is deliberately NOT faded: it moves one cell per
+  keypress and a trail behind it would read as lag. */
+  double hover = 0.0;
+
+  if (index == dash->hovered) {
+    hover = saber_tween_value(&dash->hover_in);
+  } else if (index == dash->fading) {
+    hover = saber_tween_value(&dash->hover_out);
+  }
+
+  bool selected = index == dash->selected;
+
+  if (selected || hover > 0.0) {
+    double fill = index == dash->pressed ? 0.55
+        : selected                       ? 0.38
+                                         : 0.18 * hover;
+    double edge = selected ? 1.0 : 0.5 * hover;
+
     rounded_rect(cr, x + 4.0, y + 4.0, w - 8.0, h - 8.0, DASH_RADIUS);
-    set_source_alpha(cr, &theme->accent,
-        index == dash->pressed ? 0.55 : (index == dash->selected ? 0.38
-                                                                 : 0.18));
+    set_source_alpha(cr, &theme->accent, fill);
     cairo_fill_preserve(cr);
 
-    set_source_alpha(cr, &theme->accent, index == dash->selected ? 1.0 : 0.5);
+    set_source_alpha(cr, &theme->accent, edge);
     cairo_set_line_width(cr, 1.5);
     cairo_stroke(cr);
   }
@@ -1167,6 +1200,27 @@ dash_render(void *data,
   cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
   cairo_paint(cr);
 
+  /* Action purpose: The open transition -- the strip slides in from the edge it
+  is docked against and fades up as it arrives. Applied as a translation of
+  everything below rather than as a per-element offset, so nothing else in this
+  function has to know the dash animates at all.
+
+  The clear above happens BEFORE the translation, so the part of the surface the
+  strip has not reached yet stays transparent rather than being dragged along
+  with it. */
+  double reveal = saber_tween_value(&dash->reveal);
+
+  if (reveal < 1.0) {
+    bool docked_right = dash->deps.config != NULL &&
+        dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
+    double slide = (1.0 - reveal) * dash->panel_width;
+
+    /* No save/restore: the context is created fresh for every frame and
+    destroyed at the end of it, and this function has early returns that a save
+    here would leave unbalanced. */
+    cairo_translate(cr, docked_right ? slide : -slide, 0.0);
+  }
+
   /* Action purpose: The dash rectangle itself: a palette fill, never a blur --
   hikari does not advertise ext-background-effect and a client cannot read the
   screen behind itself (BLUEPRINT.md 5.7). The background role is the panel
@@ -1246,6 +1300,12 @@ dash_render(void *data,
   cairo_restore(cr);
 }
 
+static int
+dash_anim_ms(const struct saber_dash *dash);
+
+static void
+dash_damage(struct saber_dash *dash);
+
 static void
 dash_configure(void *data,
     struct saber_surface *surface,
@@ -1260,6 +1320,18 @@ dash_configure(void *data,
   dash->height = height;
   dash_layout(dash);
   dash_reveal_selection(dash);
+
+  /* Action purpose: The open transition begins on the first configure, not at
+  saber_dash_show: the strip has no width to slide in from until the compositor
+  has answered, and starting the tween before that would run most of it against
+  a zero-width rectangle. `revealing` keeps it to the FIRST configure, so a
+  later resize does not replay it. */
+  if (!dash->revealing) {
+    dash->revealing = true;
+    saber_tween_start(&dash->reveal, 0.0, 1.0, dash_anim_ms(dash),
+        SABER_EASE_OUT_CUBIC, saber_clock_now(dash->clock));
+    dash_damage(dash);
+  }
 }
 
 static void
@@ -1270,8 +1342,37 @@ dash_surface_closed(void *data, struct saber_surface *surface)
   saber_dash_hide(data);
 }
 
+/* Function purpose: Advance the dash's clock on the compositor's frame timing.
+
+Same contract as the panel's: damaging from here asks for the next frame,
+returning without damaging lets the loop stop. Every tween on this clock is
+one-shot, so it always stops. */
+/* The configured duration, shared by both of the dash's tweens. 0 disables
+animation, which anim.c handles by landing a zero-length tween on its target
+without ever running it. */
+static int
+dash_anim_ms(const struct saber_dash *dash)
+{
+  return dash->deps.config != NULL ? dash->deps.config->panel.animation_ms : 0;
+}
+
+static void
+dash_frame(void *data, uint32_t time)
+{
+  struct saber_dash *dash = data;
+
+  if (dash->surface == NULL || dash->surface->closed) {
+    return;
+  }
+
+  if (saber_clock_advance(dash->clock, saber_clock_stamp(dash->clock, time))) {
+    saber_surface_damage(dash->surface);
+  }
+}
+
 static const struct saber_surface_listener dash_surface_listener = {
   .configure = dash_configure,
+  .frame = dash_frame,
   .render = dash_render,
   .closed = dash_surface_closed,
 };
@@ -1385,6 +1486,27 @@ dash_set_hover(struct saber_dash *dash, double x, double y)
 
   if (dash->hovered == cell && dash->chip_hovered == chip) {
     return;
+  }
+
+  /* Action purpose: A cross-fade, the panel's shape: the cell being left fades
+  out from wherever the incoming fade had reached, so a pointer swept along the
+  grid leaves a trail that settles rather than a highlight that snaps. */
+  int64_t now = saber_clock_now(dash->clock);
+  int duration = dash_anim_ms(dash);
+
+  dash->fading = dash->hovered;
+
+  if (dash->fading >= 0) {
+    saber_tween_start(&dash->hover_out, saber_tween_value(&dash->hover_in), 0.0,
+        duration, SABER_EASE_OUT_CUBIC, now);
+  }
+
+  if (cell >= 0) {
+    saber_tween_start(&dash->hover_in, 0.0, 1.0, duration, SABER_EASE_OUT_CUBIC,
+        now);
+  } else {
+    saber_tween_stop(&dash->hover_in);
+    dash->hover_in.value = 0.0;
   }
 
   dash->hovered = cell;
@@ -2011,6 +2133,14 @@ saber_dash_create(const struct saber_dash_deps *deps)
   dash->columns = 1;
   dash->visible_rows = 1;
 
+  dash->clock = saber_clock_create();
+  saber_tween_init(&dash->reveal, 1.0);
+  saber_tween_init(&dash->hover_in, 0.0);
+  saber_tween_init(&dash->hover_out, 0.0);
+  saber_clock_add(dash->clock, &dash->reveal);
+  saber_clock_add(dash->clock, &dash->hover_in);
+  saber_clock_add(dash->clock, &dash->hover_out);
+
   dash->font = pango_font_description_from_string(DASH_FONT);
   dash->search_font = pango_font_description_from_string(DASH_SEARCH_FONT);
   dash->chip_font = pango_font_description_from_string(DASH_CHIP_FONT);
@@ -2047,6 +2177,8 @@ saber_dash_destroy(struct saber_dash *dash)
   g_ptr_array_unref(dash->entries);
   g_array_unref(dash->chips);
   g_string_free(dash->query, TRUE);
+
+  saber_clock_destroy(dash->clock);
 
   pango_font_description_free(dash->font);
   pango_font_description_free(dash->search_font);
@@ -2202,6 +2334,14 @@ saber_dash_hide(struct saber_dash *dash)
   dash->pointer_y = -1.0;
   dash->bar_dragging = false;
   dash->pressed_outside = false;
+  dash->revealing = false;
+  dash->fading = -1;
+  saber_tween_stop(&dash->reveal);
+  dash->reveal.value = 1.0;
+  saber_tween_stop(&dash->hover_in);
+  dash->hover_in.value = 0.0;
+  saber_tween_stop(&dash->hover_out);
+  dash->hover_out.value = 0.0;
   dash->scroll = 0;
   saber_scroll_reset(&dash->scroll_accum);
   dash->hiding = false;

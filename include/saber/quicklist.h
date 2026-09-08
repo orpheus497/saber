@@ -51,6 +51,10 @@ struct saber_quicklist_params {
   enum saber_edge edge;
   const struct saber_theme *theme;
 
+  /* The configured animation duration in milliseconds, for the level's fade-in.
+  0 switches it off, which is what `panel { animation-ms = 0 }` means. */
+  int animation_ms;
+
   /* The shared icon resolver. Optional, and when it is NULL a menu row whose
   icon is named by theme rather than by absolute path simply draws no icon --
   which is what every menu did before this was passed in, because the DBusMenu

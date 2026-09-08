@@ -101,7 +101,13 @@ tween_begin(struct saber_tween *tween,
   tween->repeat = repeat;
   tween->running = true;
 
-  if (tween->duration_ms == 0 && !repeat) {
+  /* Action purpose: A zero-length cycle cannot repeat. Without this a repeating
+  tween started with duration 0 -- which is what `animation-ms = 0` produces --
+  stays running for ever, because saber_tween_advance answers `running = repeat`
+  on the zero-duration path. The clock is then permanently busy and its owner
+  repaints for ever: exactly the failure that once held a core for an hour
+  (D-036). A repeat of nothing lands on its target and stops. */
+  if (tween->duration_ms == 0) {
     tween->value = to;
     tween->running = false;
   }
@@ -148,11 +154,13 @@ saber_tween_advance(struct saber_tween *tween, int64_t now_ms)
     return false;
   }
 
+  /* Same reasoning as tween_begin: a cycle of no length is not an animation, so
+  it settles rather than repeating for ever. */
   if (tween->duration_ms <= 0) {
     tween->value = tween->to;
-    tween->running = tween->repeat;
+    tween->running = false;
 
-    return tween->running;
+    return false;
   }
 
   double elapsed = (double)(now_ms - tween->start_ms);

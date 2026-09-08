@@ -155,8 +155,11 @@ struct saber_display {
   struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
   struct xdg_wm_base *wm_base;
   struct xdg_activation_v1 *activation;
-  /* In-flight activation token requests, so a pending one is answered rather
-  than leaked if the display is torn down under it. */
+  /* In-flight activation token requests, so teardown can destroy the token
+  proxy and the timer of one still pending. Teardown does not answer it: the
+  display is destroyed after the model and the appinfo index the callbacks
+  reach, so answering there would launch an application on the way out and read
+  what has already been freed. */
   GPtrArray *activations;
   struct wl_data_device_manager *data_device_manager;
 
@@ -330,9 +333,12 @@ urgent.
 
 Lives here rather than in the panel because the request needs three things only
 this module holds -- the activation global, the seat, and the serial of the
-press being acted on -- and because every launch path needs it. The callback is
-guaranteed to run exactly once: on the compositor's reply, on a one-second
-timeout, or synchronously with NULL when there is no activation global at all.
+press being acted on -- and because every launch path needs it. The callback
+runs exactly once for any request the display outlives: on the compositor's
+reply, on a one-second timeout, or synchronously with NULL when there is no
+activation global at all. Destroying the display is the one path that answers
+nothing -- it runs after the subsystems these callbacks reach, so a request
+still in flight is dropped along with whatever `user` points at.
 
 `surface` and `app_id` may be NULL; both are hints the compositor may use to
 decide whether the request is legitimate. */

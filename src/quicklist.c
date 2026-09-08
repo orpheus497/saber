@@ -22,6 +22,7 @@ paint somebody else's menu in Saber's own theme. */
 #include <pango/pangocairo.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <saber/anim.h>
 #include <saber/dbusmenu.h>
 #include <saber/display.h>
 #include <saber/quicklist.h>
@@ -119,6 +120,14 @@ struct ql_level {
   /* Cancelled by level_destroy before anything is freed, so a reply in flight
   has something safe to ask about a level that may no longer exist. */
   GCancellable *cancellable;
+
+  /* Action purpose: One tween, one-shot: the level's contents fade up as it
+  opens, so a submenu appearing under the pointer reads as arriving rather than
+  as the screen changing between two frames. The ROW highlight deliberately does
+  not fade -- a menu highlight that lags the pointer reads as the menu being
+  slow, and every desktop menu snaps it. */
+  struct saber_clock *clock;
+  struct saber_tween reveal;
 };
 
 struct ql_window {
@@ -158,6 +167,10 @@ struct saber_quicklist {
 
   struct saber_quicklist_handlers handlers;
   void *user;
+
+  /* The configured animation duration, copied because the menu outlives the
+  params it was opened from. 0 means animation is switched off. */
+  int config_anim_ms;
 
   struct ql_level *pointer_level;
   /* The pointer's last row-local position, kept so a scroll can re-resolve the
@@ -668,6 +681,20 @@ level_render(void *data,
   (void)popup;
 
   struct ql_level *level = data;
+
+  /* Action purpose: The whole level is drawn into a group and composited at the
+  reveal tween's alpha, so it fades up as one thing. Compositing once at the end
+  rather than scaling every colour keeps the rows, icons and text in step, and
+  keeps every other draw below ignorant of the fact that the menu animates.
+
+  Balanced by the pop at the end of the function, which is safe because this
+  function has no early return. */
+  double reveal = saber_tween_value(&level->reveal);
+  bool grouped = reveal < 1.0;
+
+  if (grouped) {
+    cairo_push_group(cr);
+  }
   const struct saber_theme *theme = &level->ql->theme;
 
   saber_theme_set_source(cr, &theme->background);
@@ -760,6 +787,10 @@ level_render(void *data,
 
   g_object_unref(layout);
   cairo_restore(cr);
+  if (grouped) {
+    cairo_pop_group_to_source(cr);
+    cairo_paint_with_alpha(cr, reveal);
+  }
 }
 
 /* Levels ----------------------------------------------------------------- */
@@ -851,6 +882,7 @@ level_destroy(struct ql_level *level)
   }
 
   saber_popup_destroy(level->popup);
+  saber_clock_destroy(level->clock);
   g_ptr_array_unref(level->entries);
   g_free(level);
 }
@@ -904,8 +936,33 @@ level_done(void *data, struct saber_popup *popup)
   saber_quicklist_close(ql);
 }
 
+static int
+ql_anim_ms(const struct saber_quicklist *ql)
+{
+  return ql != NULL && ql->config_anim_ms > 0 ? ql->config_anim_ms : 0;
+}
+
+/* Function purpose: Advance a level's clock on the compositor's frame timing.
+Damaging from here asks for the next frame; returning without damaging lets the
+loop stop. The one tween on this clock is one-shot, so it always stops. */
+static void
+level_frame(void *data, uint32_t time)
+{
+  struct ql_level *level = data;
+
+  if (level->popup == NULL) {
+    return;
+  }
+
+  if (saber_clock_advance(level->clock,
+          saber_clock_stamp(level->clock, time))) {
+    saber_popup_damage(level->popup);
+  }
+}
+
 static const struct saber_popup_listener level_popup_listener = {
   .configure = level_configure,
+  .frame = level_frame,
   .render = level_render,
   .done = level_done,
 };
@@ -925,6 +982,11 @@ level_create(struct saber_quicklist *ql,
   level->parent = parent;
   level->entries = entries;
   level->hovered = -1;
+  level->clock = saber_clock_create();
+  saber_tween_init(&level->reveal, 1.0);
+  saber_clock_add(level->clock, &level->reveal);
+  saber_tween_start(&level->reveal, 0.0, 1.0, ql_anim_ms(ql),
+      SABER_EASE_OUT_CUBIC, 0);
   level->selected = -1;
   level->open = -1;
   level->cancellable = g_cancellable_new();
@@ -1692,6 +1754,7 @@ saber_quicklist_open(const struct saber_quicklist_params *params,
 
   ql->display = params->parent->display;
   ql->icons = params->icons;
+  ql->config_anim_ms = params->animation_ms;
   ql->parent = params->parent;
   ql->edge = params->edge;
   ql->user = user;

@@ -143,8 +143,8 @@ panel {
   icon-size       = 32       # 24-64
   padding         = 12       # 0-64; column width is icon-size + padding, so 32+12 = 44px
   autohide        = never    # never | auto  -- see the note below
-  reveal-pressure = 240      # NOT IMPLEMENTED -- see the note below
-  animation-ms    = 180      # see the note below
+  reveal-pressure = 240      # push distance to reveal an autohidden panel
+  animation-ms    = 180      # 0 disables animation; governs all of it
 }
 
 theme {
@@ -265,7 +265,7 @@ bindings {
 ```
 saberctl dash                  toggle the application grid
 saberctl spread [app_id]       toggle the window spread, optionally filtered
-saberctl launch <1-9>          launch or focus favourite N
+saberctl launch <1-10>         launch or focus favourite N
 saberctl overlay <on|off>      the hold-Super number overlay
 saberctl show | hide | toggle  panel visibility
 saberctl sheet <0-9>           switch to sheet N
@@ -446,8 +446,8 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   `saberctl launch N` answers to.
 * **Autohide has `never` and `auto`, not `dodge`.** "Hide when a window would overlap" needs
   window geometry, and no foreign-toplevel protocol publishes any.
-* **`saberctl reload` does not reload everything.** The theme, the column's width and the
-  autohide behaviour change under a running panel. `panel { output }`, which decides how many
+* **`saberctl reload` does not reload everything.** The theme, the column's width, the animation
+  duration and the autohide behaviour change under a running panel. `panel { output }`, which decides how many
   columns exist, and the `items { }` booleans, which decide whether the tray, sheets, devices and
   trash subsystems are constructed at all, are settled at startup and need a restart. `SIGHUP`
   does the same as `reload`.

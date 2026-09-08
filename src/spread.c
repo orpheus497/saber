@@ -17,6 +17,7 @@ this compositor. An icon-and-title grid is the design, not a placeholder for one
 #include <pango/pangocairo.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <saber/anim.h>
 #include <saber/spread.h>
 #include <saber/surface.h>
 
@@ -39,6 +40,9 @@ width and an unhittable target; this is what makes it a pointer target. */
 #define SPREAD_SCROLLBAR_GRAB 6.0
 
 /* Weight of the second backdrop pass; see spread_render. */
+/* How far the grid rises into place on open, in logical pixels. */
+#define SPREAD_REVEAL_RISE 24.0
+
 #define SPREAD_BACKDROP_PASS 0.7
 
 /* Uncapped, a wide output lays a dozen windows out as one unreadable line. */
@@ -76,6 +80,15 @@ struct saber_spread {
 
   int selected;
   int hovered;
+  int fading;
+
+  /* The spread's clock. Both tweens are one-shot -- `reveal` fades the grid up
+  once on open, `hover_in`/`hover_out` cross-fade a cell -- so the loop settles
+  by itself and cannot pin a core the way an unbounded repeat did (D-036). */
+  struct saber_clock *clock;
+  bool revealing;
+  struct saber_tween reveal;
+  struct saber_tween hover_in, hover_out;
   int pressed;
   bool on_close; /* the pointer is over the hovered cell's close disc */
   int scroll;
@@ -570,12 +583,28 @@ spread_draw_cell(struct saber_spread *spread,
   double w = spread->cell_width;
   double h = spread->cell_height;
   bool current = index == spread->selected;
-  bool hot = current || index == spread->hovered;
+
+  /* Action purpose: The pointer highlight is a fade between the resting
+  backlight and the accent; the keyboard cursor stays a switch, because it moves
+  one cell per keypress and a trail behind it would read as lag. */
+  double hover = 0.0;
+
+  if (index == spread->hovered) {
+    hover = saber_tween_value(&spread->hover_in);
+  } else if (index == spread->fading) {
+    hover = saber_tween_value(&spread->hover_out);
+  }
 
   rounded_rect(cr, x + 5.0, y + 5.0, w - 10.0, h - 10.0, SPREAD_RADIUS);
 
-  if (hot) {
-    set_source_alpha(cr, &theme->accent, current ? 0.34 : 0.16);
+  if (current) {
+    set_source_alpha(cr, &theme->accent, 0.34);
+  } else if (hover > 0.0) {
+    /* Both roles are painted, the resting one first, so the accent arrives over
+    a cell that already has a fill rather than over the backdrop. */
+    set_source_alpha(cr, &theme->backlight, 0.28);
+    cairo_fill_preserve(cr);
+    set_source_alpha(cr, &theme->accent, 0.16 * hover);
   } else {
     set_source_alpha(cr, &theme->backlight, 0.28);
   }
@@ -639,7 +668,10 @@ spread_draw_cell(struct saber_spread *spread,
     pango_cairo_show_layout(cr, layout);
   }
 
-  if (hot) {
+  /* The close affordance appears for the keyboard cursor and for the cell the
+  pointer is actually on -- not for the one fading out behind it, which is on
+  its way to having no affordance at all. */
+  if (current || index == spread->hovered) {
     spread_draw_close(spread, cr, cell,
         index == spread->hovered && spread->on_close);
   }
@@ -724,11 +756,17 @@ spread_render(void *data,
 
   spread_place(spread);
 
-  /* A translucent palette fill, never a blur (BLUEPRINT.md 5.7). SOURCE, not
-  OVER: the buffer is recycled, so a translucent paint over a stale frame would
-  accumulate. */
+  /* Action purpose: The open transition. The backdrop fades up and the grid
+  rises slightly into place, so a full-screen surface appearing over the desktop
+  reads as arriving rather than as the screen being replaced between two frames.
+  Both passes of the backdrop are scaled by it, and the grid is translated after
+  them so the fade sits behind the movement. */
+  double reveal = saber_tween_value(&spread->reveal);
+
+  /* A translucent palette fill, never a blur. SOURCE, not OVER: the buffer is
+  recycled, so a translucent paint over a stale frame would accumulate. */
   cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-  saber_theme_set_source(cr, &theme->overlay);
+  set_source_alpha(cr, &theme->overlay, theme->overlay.a * reveal);
   cairo_paint(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
@@ -736,8 +774,14 @@ spread_render(void *data,
   theme's overlay alpha does not carry window titles over a bright desktop, and
   inventing a colour here would break the rule that every colour in the panel
   comes from a theme role. Two passes still leave the desktop showing. */
-  set_source_alpha(cr, &theme->overlay, SPREAD_BACKDROP_PASS);
+  set_source_alpha(cr, &theme->overlay, SPREAD_BACKDROP_PASS * reveal);
   cairo_paint(cr);
+
+  /* No save/restore: the context is created fresh for every frame, and this
+  function has early returns that a save here would leave unbalanced. */
+  if (reveal < 1.0) {
+    cairo_translate(cr, 0.0, (1.0 - reveal) * SPREAD_REVEAL_RISE);
+  }
 
   spread_draw_header(spread, cr);
 
@@ -766,6 +810,12 @@ spread_render(void *data,
   spread_draw_scrollbar(spread, cr);
 }
 
+static int
+spread_anim_ms(const struct saber_spread *spread);
+
+static void
+spread_damage(struct saber_spread *spread);
+
 static void
 spread_configure(void *data,
     struct saber_surface *surface,
@@ -780,6 +830,15 @@ spread_configure(void *data,
   spread->height = height;
   spread_layout(spread);
   spread_reveal_selection(spread);
+
+  /* The open transition starts on the FIRST configure -- there is no geometry
+  to animate against before it, and a later resize must not replay it. */
+  if (!spread->revealing) {
+    spread->revealing = true;
+    saber_tween_start(&spread->reveal, 0.0, 1.0, spread_anim_ms(spread),
+        SABER_EASE_OUT_CUBIC, saber_clock_now(spread->clock));
+    spread_damage(spread);
+  }
 }
 
 static void
@@ -790,8 +849,34 @@ spread_surface_closed(void *data, struct saber_surface *surface)
   saber_spread_hide(data);
 }
 
+static int
+spread_anim_ms(const struct saber_spread *spread)
+{
+  return spread->deps.config != NULL ? spread->deps.config->panel.animation_ms
+                                     : 0;
+}
+
+/* Function purpose: Advance the spread's clock on the compositor's frame
+timing. Damaging from here asks for the next frame; returning without damaging
+lets the loop stop. Every tween on this clock is one-shot. */
+static void
+spread_frame(void *data, uint32_t time)
+{
+  struct saber_spread *spread = data;
+
+  if (spread->surface == NULL || spread->surface->closed) {
+    return;
+  }
+
+  if (saber_clock_advance(spread->clock,
+          saber_clock_stamp(spread->clock, time))) {
+    saber_surface_damage(spread->surface);
+  }
+}
+
 static const struct saber_surface_listener spread_surface_listener = {
   .configure = spread_configure,
+  .frame = spread_frame,
   .render = spread_render,
   .closed = spread_surface_closed,
 };
@@ -863,6 +948,25 @@ spread_set_hover(struct saber_spread *spread, int index, bool on_close)
 {
   if (spread->hovered == index && spread->on_close == on_close) {
     return;
+  }
+
+  int64_t now = saber_clock_now(spread->clock);
+  int duration = spread_anim_ms(spread);
+
+  spread->fading = spread->hovered;
+
+  if (spread->fading >= 0) {
+    saber_tween_start(&spread->hover_out,
+        saber_tween_value(&spread->hover_in), 0.0, duration,
+        SABER_EASE_OUT_CUBIC, now);
+  }
+
+  if (index >= 0) {
+    saber_tween_start(&spread->hover_in, 0.0, 1.0, duration,
+        SABER_EASE_OUT_CUBIC, now);
+  } else {
+    saber_tween_stop(&spread->hover_in);
+    spread->hover_in.value = 0.0;
   }
 
   spread->hovered = index;
@@ -1299,8 +1403,17 @@ saber_spread_create(const struct saber_spread_deps *deps)
   spread->cells = g_ptr_array_new_with_free_func(cell_free);
   spread->selected = -1;
   spread->hovered = -1;
+  spread->fading = -1;
   spread->pressed = -1;
   spread->scale = 1.0;
+
+  spread->clock = saber_clock_create();
+  saber_tween_init(&spread->reveal, 1.0);
+  saber_tween_init(&spread->hover_in, 0.0);
+  saber_tween_init(&spread->hover_out, 0.0);
+  saber_clock_add(spread->clock, &spread->reveal);
+  saber_clock_add(spread->clock, &spread->hover_in);
+  saber_clock_add(spread->clock, &spread->hover_out);
   spread->columns = 1;
   spread->visible_rows = 1;
 
@@ -1336,6 +1449,8 @@ saber_spread_destroy(struct saber_spread *spread)
 
   g_ptr_array_unref(spread->cells);
   g_free(spread->filter);
+
+  saber_clock_destroy(spread->clock);
 
   pango_font_description_free(spread->font);
   pango_font_description_free(spread->header_font);
@@ -1449,6 +1564,14 @@ saber_spread_hide(struct saber_spread *spread)
   }
 
   spread->hiding = true;
+  spread->revealing = false;
+  spread->fading = -1;
+  saber_tween_stop(&spread->reveal);
+  spread->reveal.value = 1.0;
+  saber_tween_stop(&spread->hover_in);
+  spread->hover_in.value = 0.0;
+  saber_tween_stop(&spread->hover_out);
+  spread->hover_out.value = 0.0;
 
   saber_surface_destroy(spread->surface);
   spread->surface = NULL;

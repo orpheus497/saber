@@ -683,12 +683,19 @@ popup_paint(struct saber_popup *popup)
 static void
 popup_frame_done(void *data, struct wl_callback *callback, uint32_t time)
 {
-  (void)time;
-
   struct saber_popup *popup = data;
 
   wl_callback_destroy(callback);
   popup->frame_callback = NULL;
+
+  /* Action purpose: Before the pending repaint, not after -- the owner advances
+  its animation here and marks the popup dirty from inside the call, so the
+  paint below settles the whole frame at once instead of committing the old
+  values and then immediately committing again. The timestamp used to be
+  discarded outright, which is why no popup could animate. */
+  if (popup->listener != NULL && popup->listener->frame != NULL) {
+    popup->listener->frame(popup->listener_data, time);
+  }
 
   if (popup->dirty) {
     popup_paint(popup);

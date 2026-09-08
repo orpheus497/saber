@@ -210,6 +210,14 @@ struct saber_popup_listener {
       int width,
       int height);
 
+  /* Function purpose: The compositor finished a frame and `time` is the
+  timestamp it paced it with. Same contract as the layer surface's hook:
+  animation advances on this and on nothing else, and calling
+  saber_popup_damage from here is what asks for the next frame -- returning
+  without it lets the loop stop. Optional; a popup that does not animate leaves
+  it NULL and repaints only when its contents change. */
+  void (*frame)(void *data, uint32_t time);
+
   /* xdg_popup.popup_done -- the compositor dismissed the popup, typically
   because the user clicked elsewhere. It must be destroyed, not remapped. */
   void (*done)(void *data, struct saber_popup *popup);

@@ -35,6 +35,11 @@ through a compatibility shim. */
 #define SABER_BTN_RIGHT 0x111
 #define SABER_BTN_MIDDLE 0x112
 
+/* Baseline durations for the two phase animations, at the shipped
+`animation-ms` of 180. Both are scaled by whatever the user actually configured,
+so one key governs every animation in the panel and `animation-ms = 0` stops all
+of them rather than only the hover fade. */
+#define SABER_ANIM_BASELINE_MS 180
 #define SABER_THROB_MS 640
 #define SABER_WIGGLE_MS 360
 #define SABER_LAUNCH_TIMEOUT_MS 5000
@@ -90,7 +95,6 @@ struct saber_panel {
   struct saber_panels *set;
   struct saber_output *output;
   struct saber_surface *surface;
-  struct wl_callback *frame;
 
   struct saber_render render; /* per panel: each output has its own scale */
   struct saber_clock *clock;
@@ -218,9 +222,6 @@ struct saber_panels {
 #define SABER_SCROLL_HEAD G_MAXSIZE
 
 static void
-panel_schedule_frame(struct saber_panel *panel);
-
-static void
 panel_layout(struct saber_panel *panel);
 
 static void
@@ -253,6 +254,29 @@ static void
 anim_state_free(gpointer data)
 {
   g_free(data);
+}
+
+/* Function purpose: A phase duration scaled by the user's `animation-ms`.
+
+The throb and the wiggle used to carry fixed durations and ignore the key
+entirely, so `animation-ms = 0` -- documented as disabling animation -- left
+both of them running. Scaling rather than substituting keeps their relative
+speeds: a throb is longer than a wiggle because it reads as a slower gesture,
+and that stays true at every setting. Zero propagates to zero, which anim.c
+turns into a tween that lands on its target and never runs. */
+static int
+panel_phase_ms(const struct saber_panel *panel, int baseline)
+{
+  const struct saber_config *config = panel->set->deps.config;
+  int configured =
+      config != NULL ? config->panel.animation_ms : SABER_ANIM_BASELINE_MS;
+
+  if (configured <= 0) {
+    return 0;
+  }
+
+  return (int)((double)baseline * (double)configured /
+      (double)SABER_ANIM_BASELINE_MS);
 }
 
 static struct saber_anim_state *
@@ -417,12 +441,16 @@ panel_sync_anim(struct saber_panel *panel)
     configure or a model change, neither of which a stalled launch produces.
     The expired latch is what stops the restart below from undoing it, since
     item->launching stays set until a window actually arrives. */
-    if (item->launching) {
+    /* Action purpose: With animation switched off there is no throb to run, so
+    the state is never entered at all. Belt as well as braces -- anim.c now
+    refuses a zero-length repeat too -- because a repeating tween that never
+    settles is the one failure mode in this file that costs a whole core. */
+    if (item->launching && panel_phase_ms(panel, SABER_THROB_MS) > 0) {
       if (!state->throbbing && !state->throb_expired) {
         state->throbbing = true;
         state->launch_started = now;
-        saber_tween_start_repeating(&state->throb, 0.0, 1.0, SABER_THROB_MS,
-            SABER_EASE_LINEAR, now);
+        saber_tween_start_repeating(&state->throb, 0.0, 1.0,
+            panel_phase_ms(panel, SABER_THROB_MS), SABER_EASE_LINEAR, now);
       }
     } else {
       state->throb_expired = false;
@@ -438,12 +466,12 @@ panel_sync_anim(struct saber_panel *panel)
     when the publishing application says so -- pinned the repaint loop for as
     long as it stood. The badge itself is unaffected: it keeps its urgent
     colour once the tile stops moving. */
-    if (item->badge.urgent) {
+    if (item->badge.urgent && panel_phase_ms(panel, SABER_WIGGLE_MS) > 0) {
       if (!state->wiggling && !state->wiggle_expired) {
         state->wiggling = true;
         state->wiggle_started = now;
-        saber_tween_start_repeating(&state->wiggle, 0.0, 1.0, SABER_WIGGLE_MS,
-            SABER_EASE_LINEAR, now);
+        saber_tween_start_repeating(&state->wiggle, 0.0, 1.0,
+            panel_phase_ms(panel, SABER_WIGGLE_MS), SABER_EASE_LINEAR, now);
       }
     } else {
       state->wiggle_expired = false;
@@ -475,20 +503,31 @@ panel_damage(struct saber_panel *panel)
     return;
   }
 
-  if (saber_clock_busy(panel->clock)) {
-    panel_schedule_frame(panel);
-  } else {
-    saber_surface_damage(panel->surface);
-  }
+  /* Action purpose: Just damage. The surface layer installs a frame callback on
+  every paint and hands the timestamp back through the listener's `frame`, so a
+  running animation continues from there -- this used to branch on the clock and
+  request a SECOND frame callback of its own, and the two then raced on the same
+  surface, delivered on the same frame, each able to trigger the other's
+  repaint. */
+  saber_surface_damage(panel->surface);
 }
 
+/* Function purpose: Advance the animation clock on the compositor's own frame
+timing, and keep the loop turning only while something is still moving.
+
+This is the surface layer's `frame` hook, which no module assigned until now.
+The panel used to request a second wl_surface_frame of its own and drive itself
+from that, which meant two callbacks on one surface, delivered on the same
+frame, each able to trigger the other's repaint. One clock, one callback.
+
+Damaging from here is what asks for the next frame; returning without damaging
+is what lets the loop stop. That is the whole of the animation loop's control
+flow, and it is why an animation that never settles costs a core -- see the
+ceilings in panel_expire_anim. */
 static void
-panel_frame_done(void *data, struct wl_callback *callback, uint32_t time)
+panel_frame(void *data, uint32_t time)
 {
   struct saber_panel *panel = data;
-
-  wl_callback_destroy(callback);
-  panel->frame = NULL;
 
   if (panel->surface == NULL || panel->surface->closed) {
     return;
@@ -496,40 +535,14 @@ panel_frame_done(void *data, struct wl_callback *callback, uint32_t time)
 
   int64_t now = saber_clock_stamp(panel->clock, time);
 
-  /* Action purpose: Before the advance, so a tween retired on this frame is
-  already stopped when the clock is asked whether anything is still running.
-  Doing it afterwards would re-arm one more frame per expiry. */
+  /* Before the advance, so a tween retired on this frame is already stopped
+  when the clock is asked whether anything is still running. Doing it afterwards
+  would buy one more frame per expiry. */
   panel_expire_anim(panel, now);
 
   if (saber_clock_advance(panel->clock, now)) {
-    panel_schedule_frame(panel);
-  } else {
-    /* One last paint so the settled values reach the screen. */
     saber_surface_damage(panel->surface);
   }
-}
-
-static const struct wl_callback_listener panel_frame_listener = {
-  .done = panel_frame_done,
-};
-
-/* Action purpose: The surface layer owns its own frame callback and discards
-the timestamp, so the panel asks for one of its own -- Wayland allows any
-number per surface and delivers them all on the same frame. The request is made
-BEFORE the damage that triggers the commit, because a frame callback is only
-registered by the commit that follows it. */
-static void
-panel_schedule_frame(struct saber_panel *panel)
-{
-  if (panel->frame != NULL || panel->surface == NULL ||
-      panel->surface->closed || !panel->surface->configured) {
-    return;
-  }
-
-  panel->frame = wl_surface_frame(panel->surface->wl_surface);
-  wl_callback_add_listener(panel->frame, &panel_frame_listener, panel);
-
-  saber_surface_damage(panel->surface);
 }
 
 /* ----------------------------------------------------------------- layout */
@@ -1096,6 +1109,7 @@ panel_closed(void *data, struct saber_surface *surface)
 
 static const struct saber_surface_listener panel_surface_listener = {
   .configure = panel_configure,
+  .frame = panel_frame,
   .render = panel_render_surface,
   .closed = panel_closed,
 };
@@ -1685,6 +1699,9 @@ panel_menu_params(struct saber_panel *panel,
   params->edge = panel->set->deps.config->panel.edge;
   params->theme = panel->set->deps.theme;
   params->icons = panel->set->deps.icons;
+  params->animation_ms = panel->set->deps.config != NULL
+      ? panel->set->deps.config->panel.animation_ms
+      : 0;
   params->anchor_x = 0;
   params->anchor_y = (int32_t)slot->y;
   params->anchor_width = (int32_t)panel->width;
@@ -3119,10 +3136,6 @@ panel_destroy(struct saber_panel *panel)
     saber_quicklist_close(panel->set->menu);
   }
 
-  if (panel->frame != NULL) {
-    wl_callback_destroy(panel->frame);
-  }
-
   g_clear_pointer(&panel->pressed_id, g_free);
 
   saber_surface_destroy(panel->surface);
@@ -3354,8 +3367,13 @@ saber_panels_reload(struct saber_panels *panels)
     }
 
     /* A column that is autohidden now but was not before -- or the reverse --
-    has to be put into the right state before it is next drawn. */
-    panel->visible = !panel_autohides(panel) || panel->visible;
+    has to be put into the right state before it is next drawn. Keeping the
+    old `visible` here would leave a column that autohide has just been turned
+    on for standing open with no exclusive zone, waiting for a pointer leave
+    that never comes if the pointer is on another output. The pointer being on
+    it is the one reason an autohidden column is up. */
+    panel->visible =
+        !panel_autohides(panel) || panels->pointer_panel == panel;
     panel->reveal_accum = 0.0;
     panel->reveal_tracking = false;
 

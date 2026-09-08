@@ -151,7 +151,8 @@ saber_theme_import_hikari(const char *path,
 void
 saber_theme_init(struct saber_theme *theme,
     const struct saber_color *palette,
-    double opacity)
+    double opacity,
+    double overlay_opacity)
 {
   if (theme == NULL) {
     return;
@@ -177,6 +178,14 @@ saber_theme_init(struct saber_theme *theme,
   }
 
   theme->opacity = opacity;
+
+  if (overlay_opacity < 0.0) {
+    overlay_opacity = 0.0;
+  } else if (overlay_opacity > 1.0) {
+    overlay_opacity = 1.0;
+  }
+
+  theme->overlay_opacity = overlay_opacity;
 
   theme->background = theme->palette[0];
   theme->foreground = theme->palette[15];

@@ -19,6 +19,11 @@ struct saber_model {
   size_t tail; /* trailing special tiles */
 
   bool loading; /* suppress persistence while the list is being built */
+
+  /* One-shot, rearmed by each launch: clears `launching` when the match window
+  that justified it closes. */
+  guint launch_expiry;
+
   saber_model_changed_func changed;
   void *changed_data;
 };
@@ -246,6 +251,10 @@ saber_model_destroy(struct saber_model *model)
     return;
   }
 
+  if (model->launch_expiry != 0) {
+    g_source_remove(model->launch_expiry);
+  }
+
   for (guint i = 0; i < model->items->len; i++) {
     item_free(g_ptr_array_index(model->items, i));
   }
@@ -415,6 +424,24 @@ saber_model_expire_launches(struct saber_model *model)
   return changed;
 }
 
+/* Action purpose: Nothing else clears a `launching` flag once the launch window
+closes. panel.c retires the throb after its own five-second ceiling and calls
+saber_model_expire_launches there, but the match window is four times as long,
+so that call always finds the launch still inside it and the flag stands for the
+rest of the session -- taking the panel's expired latch with it, since the latch
+only resets while the flag is clear, and swallowing the throb of every later
+launch of the same application. */
+static gboolean
+model_launch_expired(gpointer data)
+{
+  struct saber_model *model = data;
+
+  model->launch_expiry = 0;
+  saber_model_expire_launches(model);
+
+  return G_SOURCE_REMOVE;
+}
+
 void
 saber_model_note_launch(struct saber_model *model, const char *desktop_id)
 {
@@ -423,6 +450,19 @@ saber_model_note_launch(struct saber_model *model, const char *desktop_id)
   struct saber_item *item = saber_model_find(model, desktop_id);
   if (item != NULL) {
     item->launching = true;
+
+    /* Action purpose: One timer, rearmed by the newest launch rather than one
+    per tile. It therefore fires past every window still open, and
+    saber_model_expire_launches tests each item against its own. The extra
+    millisecond keeps it off the exact boundary saber_match_is_launching still
+    counts as inside. */
+    if (model->launch_expiry != 0) {
+      g_source_remove(model->launch_expiry);
+    }
+
+    model->launch_expiry = g_timeout_add(SABER_MATCH_LAUNCH_WINDOW_MS + 1,
+        model_launch_expired, model);
+
     notify(model);
   }
 }

@@ -13,6 +13,18 @@ pid-based path to add later. */
 
 #include <saber/appinfo.h>
 
+/* Action purpose: How long after a launch an otherwise-unmatched toplevel may
+still be attributed to it. THIS FIGURE IS A GUESS and wants measuring against a
+cold browser start on the target: too short and Firefox arrives after its own
+launch has expired and opens an untethered tile, too long and an unrelated
+window is claimed by the wrong tile.
+
+Here rather than in match.c because model.c schedules the expiry of its own
+`launching` flags against the same deadline: a tile marked as launching after
+the window that justified it has closed is a tile whose next launch draws
+nothing. */
+#define SABER_MATCH_LAUNCH_WINDOW_MS 20000
+
 struct saber_match;
 
 struct saber_match *

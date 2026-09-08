@@ -148,9 +148,10 @@ panel {
 }
 
 theme {
-  inherit-hikari = true      # import ui { palette } from hikari.conf
-  backlight      = palette   # palette | dominant | off  -- see the note below
-  opacity        = 0.92
+  inherit-hikari  = true     # import ui { palette } from hikari.conf
+  backlight       = palette  # palette | dominant | off  -- see the note below
+  opacity         = 0.92     # the column itself
+  overlay-opacity = 1.00     # dash strip and spread backdrop; 1.0 = opaque
 
   # Optional. Overrides the hikari import; all sixteen must be present or the
   # whole block is ignored and the built-in palette is used.
@@ -450,24 +451,23 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   duration and the autohide behaviour change under a running panel. `panel { output }`, which decides how many
   columns exist, and the `items { }` booleans, which decide whether the tray, sheets, devices and
   trash subsystems are constructed at all, are settled at startup and need a restart. `SIGHUP`
-  does the same as `reload`.
+  does the same as `reload`. A file that will not parse is refused rather than applied: `reload`
+  reports the error and the panel keeps the settings it is already running with.
 * **The Dash holds the keyboard only while the pointer is over it.** The compositor grants a
   layer surface keyboard focus on pointer entry, so opening the Dash from a keybinding while the
   pointer sits on another monitor gives a Dash whose search field will not type until you move
   onto it. The trade is deliberate: it is also why the Dash never monopolises the session, and
   why the other monitor stays fully usable while it is open.
-* **The Dash has no blur, and cannot have one.** `hikari-sakura` advertises no blur protocol of
-  any kind — there is nothing for a client to bind. The backdrop is a translucent palette fill.
-  A client can only blur itself by capturing the screen behind it through `wlr-screencopy`,
-  which is a dependency and a permission question rather than a missing feature.
-* **Nothing animates but the panel column.** The Dash, the spread and the quicklists hold no
-  clock and never tween; the tween engine exists and has one consumer.
-* **Quicklists draw no themed icons.** A menu icon given as a theme name is dropped; only
-  absolute paths are drawn. Tray menus, which name icons by theme, therefore show none.
+* **The Dash has no blur, and will not get one — it has opacity instead.** `hikari-sakura`
+  advertises no blur protocol of any kind, and a Wayland client cannot read the screen behind
+  itself, so there is nothing to bind and nothing to sample. What a client can control exactly
+  is how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
+  strip and the spread backdrop are painted at, written to the surface as given rather than
+  stacked out of translucent passes. At the default `1.0` nothing behind them bleeds through at
+  all. A screencopy self-blur remains possible in principle, but it is a dependency and a
+  permission question rather than a missing feature.
 * **Tray tooltips are not shown**, and `ToolTip` and `Category` are read off the wire and
   discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.
-* **Dynamic (Unity) quicklists are parsed and discarded.** Right-clicking a tile shows only the
-  desktop entry's static `Actions=`.
 * **A rejected sheet switch cannot fail the command.** `saberctl sheet N` and `pin N` answer as
   soon as the request is queued, because the socket is asynchronous and the reply arrives after
   the control connection has been answered. A refusal is reported as a warning naming the reason,
@@ -475,9 +475,9 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
 * **Window matching is by `app_id`.** Neither foreign-toplevel protocol carries a pid, so there
   is no authoritative process-to-window link available to any Wayland client. Saber tries five
   resolution rules and a launch-time window before falling back to a generic tile.
-* **Drag-and-drop onto tiles is written but unreachable.** The module compiles and links into the
-  binary and is constructed by nothing, so dropping a file on a tile does nothing at all. Tile
-  reordering by drag is likewise unimplemented — the model operation exists and has no caller.
+* **Tiles cannot be reordered by dragging them.** Dropping a *file* on a tile works and opens it
+  in that application; dragging a tile along the column to a new position does not. The model
+  operation that would move it exists and still has no caller.
 * **Sheet semantics leak through, deliberately.** On `hikari-sakura` a window's "minimised" bit
   means *"not on the sheet you are looking at"*, and sheet 0's windows are never hidden. Saber
   renders that asymmetry rather than smoothing it away.

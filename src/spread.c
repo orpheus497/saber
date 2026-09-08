@@ -39,11 +39,8 @@ carries are stable and are spelled out rather than pulled in through a shim. */
 width and an unhittable target; this is what makes it a pointer target. */
 #define SPREAD_SCROLLBAR_GRAB 6.0
 
-/* Weight of the second backdrop pass; see spread_render. */
 /* How far the grid rises into place on open, in logical pixels. */
 #define SPREAD_REVEAL_RISE 24.0
-
-#define SPREAD_BACKDROP_PASS 0.7
 
 /* Uncapped, a wide output lays a dozen windows out as one unreadable line. */
 #define SPREAD_MAX_COLUMNS 5
@@ -759,23 +756,25 @@ spread_render(void *data,
   /* Action purpose: The open transition. The backdrop fades up and the grid
   rises slightly into place, so a full-screen surface appearing over the desktop
   reads as arriving rather than as the screen being replaced between two frames.
-  Both passes of the backdrop are scaled by it, and the grid is translated after
-  them so the fade sits behind the movement. */
+  The backdrop is scaled by it, and the grid is translated after it so the fade
+  sits behind the movement. */
   double reveal = saber_tween_value(&spread->reveal);
 
-  /* A translucent palette fill, never a blur. SOURCE, not OVER: the buffer is
-  recycled, so a translucent paint over a stale frame would accumulate. */
+  /* Action purpose: A palette fill, never a blur -- hikari advertises no blur
+  protocol and a client cannot read the screen behind itself. Opacity is the
+  substitute: ONE paint at exactly the configured alpha, scaled by the reveal so
+  the backdrop still fades up on open and lands on the configured value.
+
+  SOURCE, not OVER, for two reasons. The buffer is recycled, so a translucent
+  paint over a stale frame would accumulate; and it is what makes the alpha
+  exact. The two compounded passes this replaces reached 0.82 and left a sixth
+  of the desktop legible through the grid -- and because one of them multiplied
+  the role's alpha by itself, no value in the configuration could correct it. */
   cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-  set_source_alpha(cr, &theme->overlay, theme->overlay.a * reveal);
+  cairo_set_source_rgba(cr, theme->overlay.r, theme->overlay.g,
+      theme->overlay.b, theme->overlay_opacity * reveal);
   cairo_paint(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-
-  /* Action purpose: The same role composited a second time. One pass of the
-  theme's overlay alpha does not carry window titles over a bright desktop, and
-  inventing a colour here would break the rule that every colour in the panel
-  comes from a theme role. Two passes still leave the desktop showing. */
-  set_source_alpha(cr, &theme->overlay, SPREAD_BACKDROP_PASS * reveal);
-  cairo_paint(cr);
 
   /* No save/restore: the context is created fresh for every frame, and this
   function has early returns that a save here would leave unbalanced. */

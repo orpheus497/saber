@@ -416,9 +416,24 @@ static bool
 app_reload_config(struct saber_app *app)
 {
   struct saber_config next;
+  enum saber_config_status status = SABER_CONFIG_ABSENT;
 
   memset(&next, 0, sizeof(next));
-  saber_config_load(&next, NULL);
+  saber_config_load_status(&next, NULL, &status);
+
+  /* Action purpose: A file that would not parse must not reach the running
+  panel. saber_config_load fills in defaults for everything it could not read,
+  which is right at startup -- a broken file costs the user their settings,
+  never their panel -- but here those defaults would land on top of the
+  settings already in force, so one typo would throw away the theme the panel
+  is running and `reload` would answer `ok`. Refused instead; the parse error is
+  already on stderr. An absent file is not refused: the defaults are then the
+  configuration, exactly as they are at startup. */
+  if (status == SABER_CONFIG_UNREADABLE) {
+    saber_config_fini(&next);
+
+    return false;
+  }
 
   app->config.panel.icon_size = next.panel.icon_size;
   app->config.panel.padding = next.panel.padding;
@@ -431,7 +446,7 @@ app_reload_config(struct saber_app *app)
 
   saber_theme_init(&app->theme,
       app->config.theme.palette_valid ? app->config.theme.palette : NULL,
-      app->config.theme.opacity);
+      app->config.theme.opacity, app->config.theme.overlay_opacity);
 
   saber_panels_reload(app->panels);
   app_repaint(app);
@@ -860,7 +875,7 @@ run(void)
   saber_config_load(&app.config, NULL);
   saber_theme_init(&app.theme,
       app.config.theme.palette_valid ? app.config.theme.palette : NULL,
-      app.config.theme.opacity);
+      app.config.theme.opacity, app.config.theme.overlay_opacity);
 
   app.display = saber_display_create(NULL);
 

@@ -67,9 +67,6 @@ ultrawide handing the dash half the desktop. */
 #define DASH_STRIP_ICON 22.0
 #define DASH_STRIP_GAP 10.0 /* grid to the category strip */
 
-/* Weight of the second backdrop pass; see dash_render. */
-#define DASH_BACKDROP_PASS 0.7
-
 /* Action purpose: A grid is only readable while the eye can find the start of
 the next row. Uncapped, a 3440px output lays twenty entries out as one line. */
 #define DASH_MAX_COLUMNS 7
@@ -1221,21 +1218,26 @@ dash_render(void *data,
     cairo_translate(cr, docked_right ? slide : -slide, 0.0);
   }
 
-  /* Action purpose: The dash rectangle itself: a palette fill, never a blur --
-  hikari does not advertise ext-background-effect and a client cannot read the
-  screen behind itself (BLUEPRINT.md 5.7). The background role is the panel
-  column's own and carries the user's opacity, laid down twice for the reason
-  the search field is: one pass of it over a bright desktop leaves the wallpaper
-  legible through the dash, and a backdrop that merely dimmed would do while the
-  dash covered the output but not beside an undimmed one. The overlay role goes
-  over the top for the dash's tint. */
+  /* Action purpose: The dash rectangle itself: a palette fill, never a blur.
+  hikari advertises no blur protocol and a client cannot read the screen behind
+  itself, so opacity is the substitute -- and it is laid down as ONE fill at
+  exactly the configured alpha rather than as several translucent passes.
+
+  Passes compound. Three of them turned a configured 0.92 into 0.997 on the
+  way to the screen, so the number in the file was not the number the compositor
+  blended with, and no setting could reach a true 1.0 however it was written.
+  A single fill under SOURCE writes the alpha as asked: 1.0 means nothing behind
+  the dash bleeds through, and every value below it is exactly the fraction of
+  the desktop the user chose to keep.
+
+  The operator is still SOURCE from the clear above, which is what makes the
+  write exact -- OVER here would blend against the alpha already in the buffer
+  and put the compounding straight back. */
   cairo_rectangle(cr, dash->panel_x, 0.0, dash->panel_width, (double)height);
-  saber_theme_set_source(cr, &theme->background);
+  cairo_set_source_rgba(cr, theme->overlay.r, theme->overlay.g,
+      theme->overlay.b, theme->overlay_opacity);
   cairo_fill_preserve(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-  cairo_fill_preserve(cr);
-  set_source_alpha(cr, &theme->overlay, DASH_BACKDROP_PASS);
-  cairo_fill_preserve(cr);
 
   /* The rectangle is the surface now, so this no longer keeps paint off a
   desktop beside it -- it keeps an over-long label or an over-wide cell inside

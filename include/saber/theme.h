@@ -32,6 +32,13 @@ struct saber_theme {
   struct saber_color overlay;      /* dash/spread backdrop (translucent) */
 
   double opacity;
+
+  /* The alpha the dash strip and the spread backdrop are painted at, written
+  to the surface as given rather than arrived at by compositing several
+  translucent passes. 1.0 is the only value that guarantees nothing behind
+  those two surfaces shows through; every value below it is the fraction of
+  the desktop the user has chosen to keep visible. */
+  double overlay_opacity;
 };
 
 /* Function purpose: Parse "#rgb", "#rrggbb" or "#rrggbbaa". Returns false and
@@ -43,11 +50,14 @@ saber_color_parse(const char *spec, struct saber_color *out);
 /* Function purpose: Build the theme from a palette. `palette` may be NULL, in
 which case the built-in fallback is used -- a panel must come up with no
 hikari.conf present and no configuration of its own. `opacity` applies to the
-background and overlay roles only. */
+background and overlay roles only. `overlay_opacity` is separate and exact: it
+is the alpha the dash strip and the spread backdrop are painted at, so 1.0
+there is a guarantee that nothing behind them bleeds through. */
 void
 saber_theme_init(struct saber_theme *theme,
     const struct saber_color *palette,
-    double opacity);
+    double opacity,
+    double overlay_opacity);
 
 /* Function purpose: Read `ui { palette }` out of a hikari.conf. Returns the
 number of slots read; anything less than SABER_PALETTE_SLOTS means the caller

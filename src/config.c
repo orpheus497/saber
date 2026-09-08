@@ -200,6 +200,7 @@ config_defaults(struct saber_config *config)
   config->theme.inherit_hikari = true;
   config->theme.backlight = SABER_BACKLIGHT_PALETTE;
   config->theme.opacity = 0.92;
+  config->theme.overlay_opacity = 1.0;
   config->theme.palette_valid = false;
 
   config->items.bfb = true;
@@ -468,6 +469,8 @@ config_apply(struct saber_config *config, const ucl_object_t *root)
   config->theme.backlight = config_enum(theme, "backlight",
       saber_backlight_names, config->theme.backlight, "theme");
   config_apply_double(theme, "opacity", &config->theme.opacity, 0.0, 1.0);
+  config_apply_double(
+      theme, "overlay-opacity", &config->theme.overlay_opacity, 0.0, 1.0);
 
   config_apply_favourites(config, config_lookup(launcher, "favourites"));
 
@@ -531,6 +534,20 @@ config_import_hikari(struct saber_config *config)
 bool
 saber_config_load(struct saber_config *config, const char *path)
 {
+  return saber_config_load_status(config, path, NULL);
+}
+
+bool
+saber_config_load_status(struct saber_config *config,
+    const char *path,
+    enum saber_config_status *status)
+{
+  enum saber_config_status outcome = SABER_CONFIG_ABSENT;
+
+  if (status != NULL) {
+    *status = outcome;
+  }
+
   if (config == NULL) {
     return false;
   }
@@ -543,6 +560,8 @@ saber_config_load(struct saber_config *config, const char *path)
   if (file != NULL) {
     struct ucl_parser *parser = ucl_parser_new(UCL_PARSER_NO_IMPLICIT_ARRAYS);
 
+    outcome = SABER_CONFIG_UNREADABLE;
+
     if (parser == NULL) {
       fprintf(stderr, "saber: out of memory reading %s\n", file);
     } else if (!ucl_parser_add_file(parser, file)) {
@@ -553,6 +572,10 @@ saber_config_load(struct saber_config *config, const char *path)
       fprintf(stderr, "saber: %s: %s\n", file,
           error == NULL ? "unreadable" : error);
     } else {
+      /* The parse is what the outcome turns on, not what the file contained:
+      an empty file is a valid configuration that asks for the defaults. */
+      outcome = SABER_CONFIG_LOADED;
+
       ucl_object_t *root = ucl_parser_get_object(parser);
 
       if (root != NULL) {
@@ -572,6 +595,10 @@ saber_config_load(struct saber_config *config, const char *path)
 
   if (!explicit_palette && config->theme.inherit_hikari) {
     config->theme.palette_valid = config_import_hikari(config);
+  }
+
+  if (status != NULL) {
+    *status = outcome;
   }
 
   return true;

@@ -1774,7 +1774,7 @@ saber_quicklist_open(const struct saber_quicklist_params *params,
   if (params->theme != NULL) {
     ql->theme = *params->theme;
   } else {
-    saber_theme_init(&ql->theme, NULL, 1.0);
+    saber_theme_init(&ql->theme, NULL, 1.0, 1.0);
   }
 
   if (params->app != NULL) {

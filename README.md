@@ -140,25 +140,38 @@ A copy with all of this documented in place is installed at
 panel {
   output          = "all"    # all | primary | <output name, e.g. eDP-1>
   edge            = left     # left | right
-  icon-size       = 32       # 24-64; tile width is this + 12, so 32 gives a 44px column
-  autohide        = never    # never | auto
-  reveal-pressure = 240
-  animation-ms    = 180      # 0 disables animation entirely
+  icon-size       = 32       # 24-64
+  padding         = 12       # 0-64; column width is icon-size + padding, so 32+12 = 44px
+  autohide        = never    # never | auto  -- see the note below
+  reveal-pressure = 240      # NOT IMPLEMENTED -- see the note below
+  animation-ms    = 180      # see the note below
 }
 
 theme {
   inherit-hikari = true      # import ui { palette } from hikari.conf
-  backlight      = palette   # palette | dominant | off
+  backlight      = palette   # palette | dominant | off  -- see the note below
   opacity        = 0.92
+
+  # Optional. Overrides the hikari import; all sixteen must be present or the
+  # whole block is ignored and the built-in palette is used.
+  # palette { color0 = "#1c1c1c"; ... color15 = "#f0edf2" }
 }
 
 launcher {
+  # No default. Omit this and the launcher starts with running windows only.
   favourites = [ "firefox.desktop", "thunar.desktop" ]
 }
 
 items {
   bfb = true; sheets = true; devices = true
   trash = true; tray = true; session = true
+
+  # Top-to-bottom order of the column. "apps" is the launcher band and its
+  # position is the split: everything before it is pinned to the top, everything
+  # after it to the bottom. Unknown names warn and are ignored; duplicates count
+  # once; omitting "apps" reinserts it after "bfb". The booleans above act as a
+  # filter over this list.
+  order = [ "bfb", "apps", "sheets", "devices", "trash", "tray", "session" ]
 }
 
 session {
@@ -170,7 +183,22 @@ session {
 ```
 
 `icon-size` 32 and 48 are sizes every icon theme ships natively; values between them make
-raster icons resample, which is visible on a surface that is on screen permanently.
+raster icons resample, which is visible on a surface that is on screen permanently. `padding`
+raises the tile pitch as well as the column width, so a larger value fits fewer tiles.
+
+**Four keys do less than their names suggest, and saying so here is cheaper than letting you
+find out.** All four are honest gaps, not subtleties:
+
+* **`autohide = auto` reserves no space and hides nothing.** Its only effect is to stop the
+  panel reserving its column, so windows open underneath it and it still draws permanently —
+  which is worse than `never`, not better. There is no reveal logic behind it.
+* **`reveal-pressure` is read by nothing at all.** It is parsed, range-checked and stored, and
+  no code reads the value.
+* **`animation-ms` is clamped to 120 ms and cannot disable animation.** The shipped default of
+  180 is therefore unreachable, and `0` gives the same 120 ms fade as any other value. It
+  affects only the hover fade; the launch throb and the urgent wiggle ignore it.
+* **`backlight = dominant` renders identically to `palette`.** Sampling a dominant colour from
+  the icon is not implemented.
 
 ### Favourites are stored twice, on purpose
 
@@ -411,15 +439,42 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   synthesise your configured lock keysym instead, but it breaks silently if you rebind the key,
   which is why it is off by default.
 * **No hold-Super number overlay.** A panel cannot observe modifier state without holding
-  keyboard focus. `saberctl overlay` exists for a held binding instead.
+  keyboard focus. `saberctl overlay` is advertised in `--help` for a held binding, but **has no
+  implementation and answers `error feature not built` in every build.**
+* **Five of the twelve `saberctl` verbs do nothing.** `overlay`, `show`, `hide`, `toggle` and
+  `reload` are advertised and all answer `error feature not built`, which is itself misleading —
+  they are unimplemented rather than compiled out, and no build enables them. `show`/`hide`/
+  `toggle` additionally have no underlying capability: the panel exposes no visibility control,
+  for the same reason `autohide = auto` does nothing.
 * **Autohide has `never` and `auto`, not `dodge`.** "Hide when a window would overlap" needs
-  window geometry, and no foreign-toplevel protocol publishes any. `auto` is not yet
-  implemented either.
+  window geometry, and no foreign-toplevel protocol publishes any. `auto` is **not implemented**
+  either — see the configuration notes above.
+* **The Dash holds the keyboard only while the pointer is over it.** The compositor grants a
+  layer surface keyboard focus on pointer entry, so opening the Dash from a keybinding while the
+  pointer sits on another monitor gives a Dash whose search field will not type until you move
+  onto it. The trade is deliberate: it is also why the Dash never monopolises the session, and
+  why the other monitor stays fully usable while it is open.
+* **The Dash has no blur, and cannot have one.** `hikari-sakura` advertises no blur protocol of
+  any kind — there is nothing for a client to bind. The backdrop is a translucent palette fill.
+  A client can only blur itself by capturing the screen behind it through `wlr-screencopy`,
+  which is a dependency and a permission question rather than a missing feature.
+* **Nothing animates but the panel column.** The Dash, the spread and the quicklists hold no
+  clock and never tween; the tween engine exists and has one consumer.
+* **Quicklists draw no themed icons.** A menu icon given as a theme name is dropped; only
+  absolute paths are drawn. Tray menus, which name icons by theme, therefore show none.
+* **Tray tooltips are not shown**, and `ToolTip` and `Category` are read off the wire and
+  discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.
+* **Dynamic (Unity) quicklists are parsed and discarded.** Right-clicking a tile shows only the
+  desktop entry's static `Actions=`.
+* **A rejected sheet switch is silent.** `saberctl sheet N` and `pin N` report success as soon as
+  the request is queued, before the compositor has answered, so a refusal produces no message,
+  no revert and no log line.
 * **Window matching is by `app_id`.** Neither foreign-toplevel protocol carries a pid, so there
   is no authoritative process-to-window link available to any Wayland client. Saber tries five
   resolution rules and a launch-time window before falling back to a generic tile.
-* **Drag-and-drop onto tiles is written but unproven**, and tile reordering by drag is not
-  implemented.
+* **Drag-and-drop onto tiles is written but unreachable.** The module compiles and links into the
+  binary and is constructed by nothing, so dropping a file on a tile does nothing at all. Tile
+  reordering by drag is likewise unimplemented — the model operation exists and has no caller.
 * **Sheet semantics leak through, deliberately.** On `hikari-sakura` a window's "minimised" bit
   means *"not on the sheet you are looking at"*, and sheet 0's windows are never hidden. Saber
   renders that asymmetry rather than smoothing it away.

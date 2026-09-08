@@ -143,10 +143,6 @@ saber_panels_toggle_visible(struct saber_panels *panels);
 bool
 saber_panels_visible(const struct saber_panels *panels);
 
-/* Function purpose: Act on a click given in OUTPUT-local coordinates rather
-than panel-local ones, for the dash to hand on the press that dismissed it so
-one click both closes the dash and activates the tile under it. Returns whether
-a tile was found and activated. */
 /* Function purpose: Whether a drop at this surface-local point would land on a
 tile that can open files, for the drag-and-drop layer's accept/reject feedback.
 Asked again on every motion event, so it does no more than a hit test. */
@@ -165,6 +161,10 @@ saber_panels_drop_at(struct saber_panels *panels,
     double y,
     const char *const *uris);
 
+/* Function purpose: Act on a click given in OUTPUT-local coordinates rather
+than panel-local ones, for the dash to hand on the press that dismissed it so
+one click both closes the dash and activates the tile under it. Returns whether
+a tile was found and activated. */
 bool
 saber_panels_click_at(struct saber_panels *panels,
     struct saber_output *output,

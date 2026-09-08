@@ -138,6 +138,14 @@ struct saber_panel {
   reachable through the space it would otherwise occupy. */
   bool visible;
 
+  /* Action purpose: `saberctl hide` is a standing request, not a one-off. It is
+  kept apart from `visible` because saber_panels_reload recomputes `visible`
+  from the autohide state alone -- so without this, a `reload` or a SIGHUP put a
+  column the user had explicitly hidden straight back on the screen. Cleared by
+  `saberctl show`, and by an autohide pressure reveal, which is the documented
+  point at which the request is overridden. */
+  bool requested_hidden;
+
   /* Motion accumulated inside the reveal strip, against panel.reveal-pressure.
   Reset when the pointer leaves the strip, so a pointer crossing the edge on its
   way somewhere else does not reveal the column. */
@@ -2962,6 +2970,9 @@ pointer_motion(void *data, uint32_t time, double x, double y)
     if (panel->reveal_accum >= needed) {
       panel->reveal_accum = 0.0;
       panel->visible = true;
+      /* Pressure is the documented override of `saberctl hide`, so the standing
+      request ends here rather than outliving the column it applied to. */
+      panel->requested_hidden = false;
       panel_apply_visibility(panel);
       panel_set_hover(panel, panel_slot_at(panel, x, y));
     }
@@ -3371,9 +3382,13 @@ saber_panels_reload(struct saber_panels *panels)
     old `visible` here would leave a column that autohide has just been turned
     on for standing open with no exclusive zone, waiting for a pointer leave
     that never comes if the pointer is on another output. The pointer being on
-    it is the one reason an autohidden column is up. */
-    panel->visible =
-        !panel_autohides(panel) || panels->pointer_panel == panel;
+    it is the one reason an autohidden column is up.
+
+    `requested_hidden` is consulted rather than recomputed: it is the user's
+    standing `saberctl hide`, and re-deriving visibility from the autohide state
+    alone is what used to make `reload` and SIGHUP undo it. */
+    panel->visible = !panel->requested_hidden &&
+        (!panel_autohides(panel) || panels->pointer_panel == panel);
     panel->reveal_accum = 0.0;
     panel->reveal_tracking = false;
 
@@ -3392,6 +3407,11 @@ saber_panels_set_visible(struct saber_panels *panels, bool visible)
 
   for (guint i = 0; i < panels->list->len; i++) {
     struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    /* Recorded before the no-op check below: a column already hidden by
+    autohide must still take the request, or a later reload would treat it as
+    one nobody had asked to hide. */
+    panel->requested_hidden = !visible;
 
     if (panel->visible == visible) {
       continue;

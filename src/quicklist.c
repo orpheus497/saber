@@ -1015,6 +1015,11 @@ level_create(struct saber_quicklist *ql,
 
   if (level->popup == NULL) {
     g_object_unref(level->cancellable);
+    /* The clock was created and had the reveal tween registered on it before
+    the popup was asked for, so this path owns it exactly as level_destroy
+    does. Without it the clock and its tween array leak on every menu the
+    compositor declines to map. */
+    saber_clock_destroy(level->clock);
     g_ptr_array_unref(entries);
     g_free(level);
     return NULL;

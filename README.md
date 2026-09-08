@@ -196,8 +196,10 @@ Four of these need a word on how they behave:
 * **`reveal-pressure`** is how far the pointer must travel *inside* that strip before the column
   reveals — distance, not dwell, so a pointer parked at the edge by accident never opens it and
   one deliberately rubbed against the edge does. Lower it if revealing feels stiff.
-* **`animation-ms`** is used as written. `0` genuinely disables the hover fade. It governs the
-  hover fade only; the launch throb and the urgent wiggle still carry their own durations.
+* **`animation-ms`** governs every animation, not merely some of them. The Dash's slide-in, the
+  spread's fade-and-rise, menus fading up, the hover cross-fade, and the launch throb and urgent
+  wiggle are all scaled from it against a 180 ms baseline, so `0` genuinely stops all of them
+  rather than leaving two of them running.
 * **`backlight = dominant`** tints the running-application backlight to the icon's own colour
   rather than the palette's, sampled with a bias toward the saturated pixels so a mostly-grey
   icon with one coloured mark does not wash out. An icon carrying no colour at all falls back to

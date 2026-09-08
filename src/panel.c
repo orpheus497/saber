@@ -3087,14 +3087,24 @@ saber_panels_click_at(struct saber_panels *panels,
     double y,
     uint32_t button)
 {
-  if (panels == NULL || output == NULL) {
+  if (panels == NULL) {
+    return false;
+  }
+
+  /* Action purpose: `saberctl dash` maps the dash without naming an output, so
+  its surface has none to report and the click cannot be attributed by identity.
+  Where there is a single panel there is only one answer and it is the right
+  one; where there are several the click is genuinely ambiguous, and is left
+  alone rather than guessed at and delivered to the wrong screen. */
+  if (output == NULL && panels->list->len != 1) {
     return false;
   }
 
   for (guint i = 0; i < panels->list->len; i++) {
     struct saber_panel *panel = g_ptr_array_index(panels->list, i);
 
-    if (panel->output != output || panel->surface == NULL) {
+    if (panel->surface == NULL ||
+        (output != NULL && panel->output != output)) {
       continue;
     }
 
@@ -3108,8 +3118,9 @@ saber_panels_click_at(struct saber_panels *panels,
     if (panels->deps.config != NULL &&
         panels->deps.config->panel.edge == SABER_EDGE_RIGHT) {
       int32_t scale = output->scale > 0 ? output->scale : 1;
+      int32_t logical_width = output->width / scale;
 
-      local_x = x - ((double)(output->width / scale) - (double)panel->width);
+      local_x = x - ((double)logical_width - (double)panel->width);
     }
 
     if (local_x < 0.0 || local_x >= (double)panel->width) {

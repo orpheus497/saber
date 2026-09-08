@@ -1544,17 +1544,22 @@ dash_pointer_button(void *data,
 
   struct saber_dash *dash = data;
 
-  if (button != DASH_BTN_LEFT) {
-    return;
-  }
-
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
     /* Action purpose: Outside the strip is a dismissal, latched here and acted
     on at the release. The surface covers the output, so this test is exact --
-    it is the whole reason the surface is not merely the strip. */
+    it is the whole reason the surface is not merely the strip.
+
+    Every button is tested here, not only the left one, and the test comes
+    before any filtering by button. The surface covers the output, so a press
+    this handler declines is not handed to whatever is underneath -- it is lost.
+    Filtering first swallowed every right and middle click outside the dash. */
     if (!dash_inside_strip(dash, dash->pointer_x, dash->pointer_y)) {
       dash->pressed_outside = true;
 
+      return;
+    }
+
+    if (button != DASH_BTN_LEFT) {
       return;
     }
 
@@ -1596,6 +1601,11 @@ dash_pointer_button(void *data,
       dismissed(user, output, x, y, button);
     }
 
+    return;
+  }
+
+  /* Past the dismissal, only the left button acts on the dash's contents. */
+  if (button != DASH_BTN_LEFT) {
     return;
   }
 
@@ -2064,8 +2074,14 @@ saber_dash_show(struct saber_dash *dash, struct saber_output *output)
         ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+    /* Action purpose: EXCLUSIVE, not ON_DEMAND. The dash is opened from a
+    keybinding as often as from the button -- `saberctl dash` reaches it with no
+    pointer interaction at all -- and ON_DEMAND only promises focus once the
+    user interacts with the surface. A compositor that honours the distinction
+    would hand back a dash whose search field never types and whose Escape does
+    not close it. */
     .keyboard_interactivity =
-        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND,
+        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE,
     .exclusive_zone = 0,
     .width = 0,  /* all four anchors: the compositor sizes it to the output */
     .height = 0,

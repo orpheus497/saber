@@ -1577,6 +1577,7 @@ saber_spread_hide(struct saber_spread *spread)
   spread->hover_in.value = 0.0;
   saber_tween_stop(&spread->hover_out);
   spread->hover_out.value = 0.0;
+  saber_clock_reset(spread->clock);
 
   saber_surface_destroy(spread->surface);
   spread->surface = NULL;

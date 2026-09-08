@@ -112,6 +112,16 @@ which is the panel's signal to ask for another frame callback. */
 bool
 saber_clock_advance(struct saber_clock *clock, int64_t now_ms);
 
+/* Function purpose: Re-anchor the clock on its next frame, for an owner that
+stops the loop by a route the clock cannot see. saber_clock_advance notices the
+loop settling on its own, but a surface torn down mid-animation -- the dash and
+the spread both destroy theirs on hide -- takes its frame callbacks with it
+while tweens are still marked running, so no advance ever records the stop.
+Calling this from the hide path keeps the next open from starting its tween
+against a stale timestamp. */
+void
+saber_clock_reset(struct saber_clock *clock);
+
 int64_t
 saber_clock_now(const struct saber_clock *clock);
 

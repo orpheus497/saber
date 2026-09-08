@@ -2344,6 +2344,7 @@ saber_dash_hide(struct saber_dash *dash)
   dash->hover_in.value = 0.0;
   saber_tween_stop(&dash->hover_out);
   dash->hover_out.value = 0.0;
+  saber_clock_reset(dash->clock);
   dash->scroll = 0;
   saber_scroll_reset(&dash->scroll_accum);
   dash->hiding = false;

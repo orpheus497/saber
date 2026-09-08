@@ -240,12 +240,18 @@ spread_max_scroll(const struct saber_spread *spread);
 static void
 spread_rebuild(struct saber_spread *spread)
 {
-  struct saber_toplevel *was = spread->selected >= 0 &&
+  /* Action purpose: The handle alone cannot carry a selection across a rebuild.
+  A window that closed frees the one the selection named, and a window opened
+  afterwards can be allocated at the same address -- which would silently move
+  the cursor onto a window the user never selected. The identity the cell
+  already carries for exactly this reason is compared with it. */
+  const struct spread_cell *was_cell = spread->selected >= 0 &&
           spread->selected < (int)spread->cells->len
-      ? ((struct spread_cell *)g_ptr_array_index(spread->cells,
-             spread->selected))
-            ->toplevel
+      ? g_ptr_array_index(spread->cells, spread->selected)
       : NULL;
+  const struct saber_toplevel *was =
+      was_cell != NULL ? was_cell->toplevel : NULL;
+  uint64_t was_id = was_cell != NULL ? was_cell->toplevel_id : 0;
 
   g_ptr_array_set_size(spread->cells, 0);
 
@@ -276,7 +282,7 @@ spread_rebuild(struct saber_spread *spread)
       struct spread_cell *cell = g_new0(struct spread_cell, 1);
 
       cell->toplevel = toplevel;
-    cell->toplevel_id = toplevel->id;
+      cell->toplevel_id = toplevel->id;
       cell->minimized =
           saber_toplevel_has_state(toplevel, SABER_TOPLEVEL_MINIMIZED);
       cell->activated =
@@ -309,7 +315,7 @@ spread_rebuild(struct saber_spread *spread)
   for (guint i = 0; was != NULL && i < spread->cells->len; i++) {
     const struct spread_cell *cell = g_ptr_array_index(spread->cells, i);
 
-    if (cell->toplevel == was) {
+    if (cell->toplevel == was && cell->toplevel_id == was_id) {
       spread->selected = (int)i;
       break;
     }

@@ -48,6 +48,12 @@ struct saber_item {
   bool focused;
   bool launching;
 
+  /* When the launch that set `launching` was noted, monotonic microseconds.
+  The flag's own deadline: match.c stops attributing new windows to that launch
+  a fixed window after this, and the flag has to be cleared with it. Distinct
+  from `launched_at` below, which is when the application turned up. */
+  int64_t launch_noted_at;
+
   /* Opaque toplevel handles owned by the Wayland side; the model stores them
   in the order they appeared and never dereferences one. */
   GPtrArray *windows;

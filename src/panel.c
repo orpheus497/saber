@@ -39,6 +39,7 @@ through a compatibility shim. */
 #define SABER_THROB_MS 640
 #define SABER_WIGGLE_MS 360
 #define SABER_LAUNCH_TIMEOUT_MS 5000
+#define SABER_WIGGLE_TIMEOUT_MS 4000
 #define SABER_THROB_DEPTH 0.12
 #define SABER_WIGGLE_PIXELS 3.0
 #define SABER_SEPARATOR_GAP 8.0
@@ -67,7 +68,14 @@ struct saber_anim_state {
   struct saber_tween throb;
   struct saber_tween wiggle;
   int64_t launch_started;
+  int64_t wiggle_started;
   bool throbbing, wiggling, seen;
+
+  /* A repeating tween runs until its owner stops it, so both phase animations
+  need a latch as well as a ceiling: without one, the next sync would see the
+  source condition still true and restart the tween the ceiling just stopped.
+  Cleared when the condition itself clears. */
+  bool throb_expired, wiggle_expired;
 };
 
 struct saber_panel {
@@ -100,6 +108,16 @@ struct saber_panel {
   int hover;  /* slot index, or -1 */
   int fading; /* slot index fading out, or -1 */
   int pressed;
+
+  /* What the press was on, by identity rather than by position. panel_layout
+  rebuilds the slot array whenever the model or the geometry changes, so a slot
+  index does not name the same tile from one moment to the next -- a tray icon
+  appearing between press and release is enough to shift every tile below it,
+  and the release would then act on whichever one had moved into the pressed
+  index. */
+  enum saber_item_type pressed_type;
+  char *pressed_id;
+  int pressed_sub;
   struct saber_tween hover_in, hover_out;
 
   double pointer_x, pointer_y;
@@ -182,6 +200,9 @@ static void
 panel_sync_anim(struct saber_panel *panel);
 
 static void
+panel_expire_anim(struct saber_panel *panel, int64_t now);
+
+static void
 panel_set_hover(struct saber_panel *panel, int slot);
 
 static int
@@ -228,6 +249,42 @@ anim_phase_stop(struct saber_tween *tween)
   tween->value = 0.0;
 }
 
+/* Function purpose: Retire phase animations whose ceiling has passed, from the
+frame callback rather than from a model change.
+
+Both ceilings used to be tested only in panel_sync_anim, which runs on a
+configure or a model change and never on the frame path -- so for the case each
+ceiling exists for, where nothing else changes, neither could ever fire. A
+repeating tween keeps saber_clock_busy true, and panel_frame_done re-arms a
+frame for as long as it is, so a single unmatched launch held the panel in a
+full-rate repaint loop for the rest of the session. */
+static void
+panel_expire_anim(struct saber_panel *panel, int64_t now)
+{
+  GHashTableIter iter;
+  gpointer value;
+
+  g_hash_table_iter_init(&iter, panel->anim);
+
+  while (g_hash_table_iter_next(&iter, NULL, &value)) {
+    struct saber_anim_state *state = value;
+
+    if (state->throbbing &&
+        now - state->launch_started > SABER_LAUNCH_TIMEOUT_MS) {
+      state->throbbing = false;
+      state->throb_expired = true;
+      anim_phase_stop(&state->throb);
+    }
+
+    if (state->wiggling &&
+        now - state->wiggle_started > SABER_WIGGLE_TIMEOUT_MS) {
+      state->wiggling = false;
+      state->wiggle_expired = true;
+      anim_phase_stop(&state->wiggle);
+    }
+  }
+}
+
 static void
 panel_sync_anim(struct saber_panel *panel)
 {
@@ -255,33 +312,48 @@ panel_sync_anim(struct saber_panel *panel)
 
     state->seen = true;
 
-    /* Action purpose: The throb has a five second ceiling (BLUEPRINT.md 5.2).
-    An application that never opens a window -- or one whose app_id never
-    matches -- must not leave a tile pulsing for the rest of the session. */
+    /* Action purpose: The throb has a five second ceiling. An application that
+    never opens a window -- or one whose app_id never matches -- must not leave
+    a tile pulsing for the rest of the session. The ceiling is enforced in
+    panel_expire_anim, on the frame path; this function runs only on a
+    configure or a model change, neither of which a stalled launch produces.
+    The expired latch is what stops the restart below from undoing it, since
+    item->launching stays set until a window actually arrives. */
     if (item->launching) {
-      if (!state->throbbing) {
+      if (!state->throbbing && !state->throb_expired) {
         state->throbbing = true;
         state->launch_started = now;
         saber_tween_start_repeating(&state->throb, 0.0, 1.0, SABER_THROB_MS,
             SABER_EASE_LINEAR, now);
-      } else if (now - state->launch_started > SABER_LAUNCH_TIMEOUT_MS) {
+      }
+    } else {
+      state->throb_expired = false;
+
+      if (state->throbbing) {
         state->throbbing = false;
         anim_phase_stop(&state->throb);
       }
-    } else if (state->throbbing) {
-      state->throbbing = false;
-      anim_phase_stop(&state->throb);
     }
 
+    /* Action purpose: The wiggle is an attention burst, not a permanent state.
+    It had no ceiling of any kind, so a single urgent badge -- withdrawn only
+    when the publishing application says so -- pinned the repaint loop for as
+    long as it stood. The badge itself is unaffected: it keeps its urgent
+    colour once the tile stops moving. */
     if (item->badge.urgent) {
-      if (!state->wiggling) {
+      if (!state->wiggling && !state->wiggle_expired) {
         state->wiggling = true;
+        state->wiggle_started = now;
         saber_tween_start_repeating(&state->wiggle, 0.0, 1.0, SABER_WIGGLE_MS,
             SABER_EASE_LINEAR, now);
       }
-    } else if (state->wiggling) {
-      state->wiggling = false;
-      anim_phase_stop(&state->wiggle);
+    } else {
+      state->wiggle_expired = false;
+
+      if (state->wiggling) {
+        state->wiggling = false;
+        anim_phase_stop(&state->wiggle);
+      }
     }
   }
 
@@ -325,6 +397,11 @@ panel_frame_done(void *data, struct wl_callback *callback, uint32_t time)
   }
 
   int64_t now = saber_clock_stamp(panel->clock, time);
+
+  /* Action purpose: Before the advance, so a tween retired on this frame is
+  already stopped when the clock is asked whether anything is still running.
+  Doing it afterwards would re-arm one more frame per expiry. */
+  panel_expire_anim(panel, now);
 
   if (saber_clock_advance(panel->clock, now)) {
     panel_schedule_frame(panel);
@@ -2305,6 +2382,56 @@ panel_click_tray(struct saber_panel *panel,
   }
 }
 
+/* Function purpose: Remember which tile a press landed on, by identity, so the
+release can tell whether it is still the same one. */
+static void
+panel_latch_pressed(struct saber_panel *panel, int index)
+{
+  g_clear_pointer(&panel->pressed_id, g_free);
+  panel->pressed_type = SABER_ITEM_APP;
+  panel->pressed_sub = -1;
+
+  if (index < 0 || (guint)index >= panel->slots->len) {
+    return;
+  }
+
+  const struct saber_slot *slot =
+      &g_array_index(panel->slots, struct saber_slot, index);
+  const struct saber_item *item =
+      saber_model_nth(panel->set->deps.model, slot->item);
+
+  if (item == NULL) {
+    return;
+  }
+
+  panel->pressed_type = item->type;
+  panel->pressed_id = g_strdup(item->id);
+  panel->pressed_sub = slot->sub;
+}
+
+/* Function purpose: Whether a slot is still the tile that was pressed. Compares
+the id as well as the type because two tiles of the same type -- two application
+tiles, two tray items -- are otherwise indistinguishable. */
+static bool
+panel_pressed_matches(const struct saber_panel *panel, int index)
+{
+  if (index < 0 || (guint)index >= panel->slots->len) {
+    return false;
+  }
+
+  const struct saber_slot *slot =
+      &g_array_index(panel->slots, struct saber_slot, index);
+  const struct saber_item *item =
+      saber_model_nth(panel->set->deps.model, slot->item);
+
+  if (item == NULL) {
+    return false;
+  }
+
+  return item->type == panel->pressed_type && slot->sub == panel->pressed_sub &&
+      g_strcmp0(item->id, panel->pressed_id) == 0;
+}
+
 static void
 panel_activate_slot(struct saber_panel *panel, int index, uint32_t button)
 {
@@ -2620,6 +2747,7 @@ pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
   drag gesture on exactly these tiles. */
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
     panel->pressed = panel->hover;
+    panel_latch_pressed(panel, panel->hover);
     panel_damage(panel);
 
     return;
@@ -2630,9 +2758,15 @@ pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
   panel->pressed = -1;
   panel_damage(panel);
 
-  if (slot >= 0 && slot == panel->hover) {
+  /* Action purpose: The index must still be the hovered one AND still name the
+  tile that was pressed. Without the second test a re-layout between press and
+  release -- a tray icon arriving, a volume mounting -- silently redirects the
+  click to whichever tile has moved into that index. */
+  if (slot >= 0 && slot == panel->hover && panel_pressed_matches(panel, slot)) {
     panel_activate_slot(panel, slot, button);
   }
+
+  g_clear_pointer(&panel->pressed_id, g_free);
 }
 
 static void
@@ -2755,6 +2889,8 @@ panel_destroy(struct saber_panel *panel)
   if (panel->frame != NULL) {
     wl_callback_destroy(panel->frame);
   }
+
+  g_clear_pointer(&panel->pressed_id, g_free);
 
   saber_surface_destroy(panel->surface);
   saber_clock_destroy(panel->clock);
@@ -2942,6 +3078,56 @@ unsigned int
 saber_panels_count(const struct saber_panels *panels)
 {
   return panels->list->len;
+}
+
+bool
+saber_panels_click_at(struct saber_panels *panels,
+    struct saber_output *output,
+    double x,
+    double y,
+    uint32_t button)
+{
+  if (panels == NULL || output == NULL) {
+    return false;
+  }
+
+  for (guint i = 0; i < panels->list->len; i++) {
+    struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    if (panel->output != output || panel->surface == NULL) {
+      continue;
+    }
+
+    /* Action purpose: Translate the output-local x into the column's own space.
+    The column is anchored to one edge and reserves its width there, so on a
+    left-hand panel the two spaces coincide and on a right-hand one they differ
+    by everything the column does not occupy. y needs no translation: the column
+    spans the output's height. */
+    double local_x = x;
+
+    if (panels->deps.config != NULL &&
+        panels->deps.config->panel.edge == SABER_EDGE_RIGHT) {
+      int32_t scale = output->scale > 0 ? output->scale : 1;
+
+      local_x = x - ((double)(output->width / scale) - (double)panel->width);
+    }
+
+    if (local_x < 0.0 || local_x >= (double)panel->width) {
+      return false;
+    }
+
+    int slot = panel_slot_at(panel, local_x, y);
+
+    if (slot < 0) {
+      return false;
+    }
+
+    panel_activate_slot(panel, slot, button);
+
+    return true;
+  }
+
+  return false;
 }
 
 void

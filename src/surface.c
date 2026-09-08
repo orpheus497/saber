@@ -221,6 +221,10 @@ layer_surface_handle_configure(void *data,
 
   zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
 
+  bool first = !surface->configured;
+  int was_width = surface->width;
+  int was_height = surface->height;
+
   /* A zero on an axis means the compositor deferred to the size we asked
   for, which for an anchored panel is the strip's width. */
   if (width > 0) {
@@ -237,15 +241,30 @@ layer_surface_handle_configure(void *data,
 
   surface->configured = true;
 
+  /* Action purpose: Answer a configure that changed nothing with the ack alone.
+
+  The ack above is unconditional because the protocol requires it, but a repaint
+  is not: re-rendering and committing an identical buffer costs a full cairo
+  pass over every tile and, because a compositor may re-arrange its layers in
+  response to any commit, that commit can provoke the next configure. Measured
+  on this stack before the guard existed: 50 configures per second per panel,
+  every one carrying the same width and height, holding the process at 99% of a
+  core for as long as it ran.
+
+  The two cases that must still paint are kept. The first configure has to,
+  because nothing else can: there is no frame callback for a surface that has
+  never committed a buffer, so deferring would deadlock. A genuine resize has
+  to, because the buffer no longer matches the acked size. */
+  if (!first && surface->width == was_width &&
+      surface->height == was_height) {
+    return;
+  }
+
   if (surface->listener != NULL && surface->listener->configure != NULL) {
     surface->listener->configure(surface->listener_data, surface,
         surface->width, surface->height);
   }
 
-  /* Action purpose: A configure must be answered with a commit carrying a
-  buffer of the acked size, so this paints rather than scheduling. Deferring
-  to a frame callback would deadlock: no frame callback arrives for a surface
-  that has never committed a buffer. */
   surface->dirty = true;
   surface_paint(surface);
 }

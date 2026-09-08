@@ -98,4 +98,15 @@ nothing is open. */
 void
 saber_panels_close_menu(struct saber_panels *panels);
 
+/* Function purpose: Act on a click given in OUTPUT-local coordinates rather
+than panel-local ones, for the dash to hand on the press that dismissed it so
+one click both closes the dash and activates the tile under it. Returns whether
+a tile was found and activated. */
+bool
+saber_panels_click_at(struct saber_panels *panels,
+    struct saber_output *output,
+    double x,
+    double y,
+    uint32_t button);
+
 #endif

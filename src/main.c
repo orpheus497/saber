@@ -373,6 +373,27 @@ on_bfb_clicked(struct saber_output *output, void *user)
   }
 }
 
+/* Action purpose: The press that dismissed the dash still belongs to whatever
+it landed on. The dash covers the output while it is up, so without this a
+click on a panel tile would be spent closing the dash and the tile would need a
+second one -- and the button that opens the dash could never be the button that
+closes it. The dash has already hidden itself by the time this runs, so the tile
+acts against a closed dash, and the BFB's own toggle reopens it only on a
+further click. */
+static void
+on_dash_dismissed(void *user,
+    struct saber_output *output,
+    double x,
+    double y,
+    uint32_t button)
+{
+  struct saber_app *app = user;
+
+  if (app->panels != NULL) {
+    saber_panels_click_at(app->panels, output, x, y, button);
+  }
+}
+
 static void
 on_spread_requested(const char *app_id, struct saber_output *output, void *user)
 {
@@ -729,6 +750,7 @@ run(void)
   };
 
   app.dash = saber_dash_create(&dash_deps);
+  saber_dash_set_dismissed(app.dash, on_dash_dismissed, &app);
   saber_panels_set_dash(app.panels, on_bfb_clicked, &app);
 #endif
 

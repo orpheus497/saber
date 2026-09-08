@@ -184,10 +184,19 @@ struct saber_dash {
   int pressed;
   int scroll; /* first visible row */
 
-  /* The dash rectangle, which is the whole surface: panel_x is 0 and
-  panel_width is `width`. Kept as a pair because every measurement, hit test
-  and paint below is written against them. */
+  /* The dash rectangle inside the surface. The surface is the whole output, so
+  this is the painted strip: panel_x is 0 on a left-hand panel and
+  `width - panel_width` on a right-hand one. Kept as a pair because every
+  measurement, hit test and paint below is written against them. */
   double panel_x, panel_width;
+
+  /* A press that landed outside the strip. Held to the release so a drag that
+  starts outside and ends inside does not dismiss, matching how a press on a
+  cell must be released on the same cell to launch it. */
+  bool pressed_outside;
+
+  saber_dash_dismissed_cb dismissed;
+  void *dismissed_user;
 
   int columns, rows, visible_rows;
   double cell_width, cell_height;
@@ -647,16 +656,26 @@ dash_layout(struct saber_dash *dash)
 {
   int count = (int)dash->results->len;
 
-  /* Action purpose: The rectangle is the surface. The compositor was asked for
-  a surface the dash's size, anchored to whichever edge carries the panel
-  column, so a right-hand panel gets a right-hand dash without this function
-  offsetting anything -- and a compositor that hands back a width other than
-  the one requested is followed rather than argued with. */
-  dash->panel_x = 0.0;
-  dash->panel_width = (double)dash->width;
+  /* Action purpose: The surface is the output, so the dash rectangle has to be
+  placed inside it rather than being the whole of it. The width is the same
+  fraction of the output as before; the offset puts it against whichever edge
+  carries the panel column, so a right-hand panel gets a right-hand dash.
+  Everything below -- every measurement, hit test and paint -- is written
+  against this pair, so placing it here is the only change the strip needs. */
+  dash->panel_width = (double)dash_panel_width(dash->width);
 
   if (dash->panel_width < 1.0) {
     dash->panel_width = 1.0;
+  }
+
+  bool docked_right = dash->deps.config != NULL &&
+      dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
+
+  dash->panel_x =
+      docked_right ? (double)dash->width - dash->panel_width : 0.0;
+
+  if (dash->panel_x < 0.0) {
+    dash->panel_x = 0.0;
   }
 
   double inner = dash->panel_width - 2.0 * DASH_PAD;
@@ -745,6 +764,17 @@ dash_cell_rect(const struct saber_dash *dash,
   *y = dash->grid_y + row * dash->cell_height;
 
   return true;
+}
+
+/* Function purpose: Whether a surface-local point is on the dash itself rather
+than on the transparent remainder of the output. The one test that separates a
+click on the dash from a click through it, so dismissal and hit testing cannot
+disagree about where the dash ends. */
+static bool
+dash_inside_strip(const struct saber_dash *dash, double x, double y)
+{
+  return x >= dash->panel_x && x < dash->panel_x + dash->panel_width &&
+      y >= 0.0 && y < (double)dash->height;
 }
 
 static int
@@ -1519,6 +1549,15 @@ dash_pointer_button(void *data,
   }
 
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    /* Action purpose: Outside the strip is a dismissal, latched here and acted
+    on at the release. The surface covers the output, so this test is exact --
+    it is the whole reason the surface is not merely the strip. */
+    if (!dash_inside_strip(dash, dash->pointer_x, dash->pointer_y)) {
+      dash->pressed_outside = true;
+
+      return;
+    }
+
     if (dash_scrollbar_press(dash, dash->pointer_x, dash->pointer_y)) {
       return;
     }
@@ -1527,6 +1566,35 @@ dash_pointer_button(void *data,
     dash->chip_pressed = dash->chip_hovered;
     dash->selected = dash->hovered >= 0 ? dash->hovered : dash->selected;
     dash_damage(dash);
+
+    return;
+  }
+
+  /* Action purpose: Click away to dismiss, and hand the click on rather than
+  spending it. The owner is told where it landed in output-local coordinates, so
+  a click on a panel tile closes the dash AND activates that tile in one press,
+  and a click on the button that opened the dash closes it -- which is what
+  makes that button a toggle. A release that has wandered back inside the strip
+  is not a dismissal. */
+  if (dash->pressed_outside) {
+    dash->pressed_outside = false;
+
+    if (dash_inside_strip(dash, dash->pointer_x, dash->pointer_y)) {
+      return;
+    }
+
+    struct saber_output *output =
+        dash->surface != NULL ? dash->surface->output : NULL;
+    double x = dash->pointer_x;
+    double y = dash->pointer_y;
+    saber_dash_dismissed_cb dismissed = dash->dismissed;
+    void *user = dash->dismissed_user;
+
+    saber_dash_hide(dash);
+
+    if (dismissed != NULL) {
+      dismissed(user, output, x, y, button);
+    }
 
     return;
   }
@@ -1554,11 +1622,9 @@ dash_pointer_button(void *data,
     return;
   }
 
-  /* Action purpose: Every click that reaches this listener is a click on the
-  dash, because the surface is now the dash and nothing else. A miss -- the
-  search field, the gap between cells -- changes nothing, and the click that
-  used to dismiss from out here now lands on whatever is really there. Escape,
-  the BFB and `saberctl dash` are the ways out. */
+  /* A miss inside the strip -- the search field, the gap between cells -- is
+  not a dismissal and changes nothing. Dismissal is handled above, on the press
+  that landed outside. */
   if (index < 0) {
     return;
   }
@@ -1830,23 +1896,26 @@ dash_key(void *data, uint32_t time, uint32_t key, uint32_t state)
   }
 }
 
-/* Function purpose: Close the dash if the seat's keyboard ever goes elsewhere.
-EXCLUSIVE interactivity is supposed to make that impossible, but the protocol
-only promises exclusivity against the top-most such surface in the layer: a lock
-screen, another exclusive overlay, or a compositor that reads the rule its own
-way can all take the keyboard away. Without this the dash would then be sitting
-on the edge of the screen with no keyboard, no click-away and a search field
-that no longer types -- and now that the surface is not covering the output,
-nothing else would dismiss it either. Only the dash's own surface counts: the
-leave that precedes the dash's own enter names the surface being left. */
+/* Function purpose: Note that the keyboard has gone elsewhere, and do nothing
+about it.
+
+This used to dismiss the dash. That is wrong under a focus-follows-mouse
+compositor, where a keyboard leave is routine rather than exceptional: moving
+the pointer to another monitor produces one, and the dash would vanish for no
+reason the user could connect to what they did. Focus comes back when the
+pointer does, because the surface asks for keyboard interactivity and the
+compositor restores it on the way in.
+
+The case the old behaviour guarded -- a dash left on screen with a search field
+that no longer types -- is covered properly now: a press anywhere outside the
+strip dismisses it, and the surface covers the output, so there is always
+somewhere to click. Escape, the button that opened it, and `saberctl dash`
+remain. */
 static void
 dash_keyboard_leave(void *data, struct wl_surface *surface)
 {
-  struct saber_dash *dash = data;
-
-  if (dash->surface != NULL && dash->surface->wl_surface == surface) {
-    saber_dash_hide(dash);
-  }
+  (void)data;
+  (void)surface;
 }
 
 static const struct saber_keyboard_listener dash_keyboard_listener = {
@@ -1966,32 +2035,40 @@ saber_dash_show(struct saber_dash *dash, struct saber_output *output)
     dash->output_height = 720;
   }
 
-  dash->width = dash_panel_width(dash->output_width);
+  dash->width = dash->output_width;
   dash->height = dash->output_height;
 
   dash_filter(dash);
 
-  bool right = dash->deps.config != NULL &&
-      dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
+  /* Action purpose: The surface is the whole output; the dash is the strip
+  painted inside it, and dash_layout places that strip against the panel's edge.
 
-  /* Action purpose: The dash asks for its own size instead of taking the output
-  and painting a third of it. TOP|BOTTOM spans the usable height and the third
-  anchor docks it against the edge the panel column is on; the width is the only
-  axis this side decides. exclusive_zone 0 is not "no opinion" -- the protocol
-  reads it as "move me clear of anything that has reserved space", which is what
-  puts the dash beside the panel's reserved column rather than over it. */
+  The surface has to be the output because of how this compositor routes the
+  pointer. A layer surface that asks for keyboard input is handed every pointer
+  coordinate on its output, but the surface-local coordinates that come with it
+  are only meaningful where the hit test actually succeeded -- outside the
+  surface they are indeterminate. A docked surface therefore cannot tell a click
+  on itself from a click on the panel or on a window, which is what left the
+  dash with no working click-away and no way to be dismissed by the button that
+  opened it. Covering the output makes every coordinate a real hit, so the strip
+  test in dash_pointer_button is exact.
+
+  Everything outside the strip is left fully transparent, so this is invisible:
+  dash_render clears the surface and fills only panel_x..panel_width.
+  exclusive_zone stays 0 -- the dash reserves nothing and overlays the panel's
+  reserved column rather than displacing it. */
   struct saber_surface_params params = {
     .output = output,
     .layer = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
     .anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
         ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-        (right ? ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT
-               : ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT),
+        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+        ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
     .keyboard_interactivity =
-        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE,
+        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND,
     .exclusive_zone = 0,
-    .width = dash->width,
-    .height = 0, /* TOP|BOTTOM spans the output */
+    .width = 0,  /* all four anchors: the compositor sizes it to the output */
+    .height = 0,
     .layer_namespace = "saber-dash",
   };
 
@@ -2061,9 +2138,23 @@ saber_dash_hide(struct saber_dash *dash)
   dash->pointer_x = -1.0;
   dash->pointer_y = -1.0;
   dash->bar_dragging = false;
+  dash->pressed_outside = false;
   dash->scroll = 0;
   saber_scroll_reset(&dash->scroll_accum);
   dash->hiding = false;
+}
+
+void
+saber_dash_set_dismissed(struct saber_dash *dash,
+    saber_dash_dismissed_cb func,
+    void *user)
+{
+  if (dash == NULL) {
+    return;
+  }
+
+  dash->dismissed = func;
+  dash->dismissed_user = user;
 }
 
 bool

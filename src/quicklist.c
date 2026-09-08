@@ -1524,8 +1524,15 @@ quicklist_key(void *data, uint32_t time, uint32_t key, uint32_t state)
   switch (sym) {
   case XKB_KEY_Escape:
     if (level->parent != NULL) {
-      level_close_children(level->parent);
-      saber_popup_damage(level->parent->popup);
+      /* Action purpose: Latch the parent before closing it. level_deepest
+      returned the innermost level, so this level IS parent->child --
+      level_close_children reaches level_destroy on it and ends in g_free, and
+      every later read of `level` would come out of the freed chunk. Same shape
+      as level_done, for the same reason. */
+      struct ql_level *parent = level->parent;
+
+      level_close_children(parent);
+      saber_popup_damage(parent->popup);
     } else {
       saber_quicklist_close(ql);
     }
@@ -1538,8 +1545,12 @@ quicklist_key(void *data, uint32_t time, uint32_t key, uint32_t state)
     break;
   case XKB_KEY_Left:
     if (level->parent != NULL) {
-      level_close_children(level->parent);
-      saber_popup_damage(level->parent->popup);
+      /* The same free-then-read hazard as Escape above, reached the same
+      way. */
+      struct ql_level *parent = level->parent;
+
+      level_close_children(parent);
+      saber_popup_damage(parent->popup);
     }
     break;
   case XKB_KEY_Right:

@@ -76,4 +76,22 @@ saber_dash_toggle(struct saber_dash *dash, struct saber_output *output);
 bool
 saber_dash_is_visible(const struct saber_dash *dash);
 
+/* The click that dismissed the dash, in output-local coordinates. The dash's
+surface covers the whole output, so a press outside the painted strip is a
+dismissal -- and the owner is told where it landed so the click can still reach
+whatever was under it, rather than being spent on closing the dash. */
+typedef void (*saber_dash_dismissed_cb)(void *user,
+    struct saber_output *output,
+    double x,
+    double y,
+    uint32_t button);
+
+/* Function purpose: Register the dismissal hook. Kept out of saber_dash_deps
+because it points back at the owner rather than at a borrowed subsystem, which
+is how the dash and spread are already reached from main.c. */
+void
+saber_dash_set_dismissed(struct saber_dash *dash,
+    saber_dash_dismissed_cb func,
+    void *user);
+
 #endif

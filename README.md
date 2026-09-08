@@ -69,13 +69,13 @@ Top to bottom, each item switchable in `items { }`:
 
 | Item | Left click | Middle click | Right click | Scroll |
 |---|---|---|---|---|
-| **BFB** (the winged orb) | Open the Dash | — | — | — |
+| **BFB** (the winged orb) | Open the Dash | Open the Dash | Open the Dash | — |
 | **Application tile** | Launch · focus · minimise if already focused · spread when 2+ windows | New instance | Quicklist | Cycle that app's windows |
-| **Sheet** | Sheet grid | — | — | Step sheet |
+| **Sheet** | Sheet grid | — | Sheet grid | Step sheet |
 | **Device** | Open the mount point | Unmount | — | — |
 | **Trash** | Open the trash | — | Open / Empty Trash | — |
 | **Tray item** | Activate, or its menu | Secondary activate | Context menu | Forwarded |
-| **Session** | Session menu | — | — | — |
+| **Session** | Session menu | — | Session menu | — |
 
 ### Tile decoration
 
@@ -103,9 +103,10 @@ anything — rendering is the host's job, and that is exactly what lets the pane
 
 ### The Dash
 
-`saberctl dash`, or click the BFB. A panel docked to the same edge as the column, one third of
-the output wide and full height, with the desktop beside it left undimmed. The search field is
-top-left; the category strip runs along the bottom.
+`saberctl dash`, or click the BFB. A panel docked to the same edge as the column, full height and
+one third of the output wide — held between 420 and 700 logical pixels, so a laptop still fits
+three columns and an ultrawide is not handed half the desktop. The desktop beside it is left
+undimmed. The search field is top-left; the category strip runs along the bottom.
 
 Typing filters; categories filter; the two compose. Ranking puts prefix matches above interior
 ones, across name, generic name and `Exec` basename. `Tab` cycles categories, arrows move and
@@ -134,7 +135,7 @@ Unity's mechanics are reproduced; Unity's Ambiance colours are not.
 `~/.config/saber/saber.conf`, in UCL — the same syntax and the same parser as `hikari.conf`.
 **Every key is optional and the whole file may be deleted**; the values below are the defaults.
 A copy with all of this documented in place is installed at
-`${PREFIX}/etc/saber/saber.conf`.
+`${ETC_PREFIX}/etc/saber/saber.conf`, where `ETC_PREFIX` defaults to `PREFIX`.
 
 ```ucl
 panel {
@@ -160,7 +161,7 @@ theme {
 
 launcher {
   # No default. Omit this and the launcher starts with running windows only.
-  favourites = [ "firefox.desktop", "thunar.desktop" ]
+  favourites = [ "sofi.desktop", "firefox.desktop" ]
 }
 
 items {
@@ -283,7 +284,7 @@ It exits 0 when the panel answers `ok` and 1 otherwise, so it composes in script
 to start rather than stealing the socket, and a stale socket left by an unclean exit is removed
 rather than being mistaken for a live panel.
 
-`saberctl` links **only libc** and is 20 KB. That is deliberate: it runs on every bound
+`saberctl` links **only libc** and is 14 KB. That is deliberate: it runs on every bound
 keypress, and linking the desktop's shared libraries to print one line would be paid per
 keystroke.
 
@@ -347,9 +348,11 @@ make
 make install            # PREFIX defaults to /usr/local
 ```
 
-Saber is **not in the ports tree**, and no port skeleton ships here yet. Build it with `make`
-as above; a `ports/` directory with `TRAY`, `DASH` and `SPREAD` options will land alongside an
-actual ports submission.
+Saber is **not in the ports tree** yet, but a complete port skeleton ships under
+[`ports/`](ports/) — `Makefile`, `pkg-descr`, `pkg-message` and `pkg-plist`, with `TRAY`, `DASH`
+and `SPREAD` options, all on by default. It installs the configuration as `saber.conf.sample` so
+a package never overwrites a file the administrator has edited. Until a submission is made, build
+it with `make` as above.
 
 `make install` places `saber` and `saberctl` in `${PREFIX}/bin` (mode 555, neither setuid), the
 default configuration in `${ETC_PREFIX}/etc/saber/saber.conf`, and the BFB emblem in
@@ -449,12 +452,15 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   `saberctl launch N` answers to.
 * **Autohide has `never` and `auto`, not `dodge`.** "Hide when a window would overlap" needs
   window geometry, and no foreign-toplevel protocol publishes any.
-* **`saberctl reload` does not reload everything.** The theme, the column's width, the animation
-  duration and the autohide behaviour change under a running panel. `panel { output }`, which decides how many
-  columns exist, and the `items { }` booleans, which decide whether the tray, sheets, devices and
-  trash subsystems are constructed at all, are settled at startup and need a restart. `SIGHUP`
-  does the same as `reload`. A file that will not parse is refused rather than applied: `reload`
-  reports the error and the panel keeps the settings it is already running with.
+* **`saberctl reload` does not reload everything.** The whole `theme { }` block, the column's
+  width (`icon-size` and `padding`), `autohide`, `reveal-pressure` and `animation-ms` change under
+  a running panel. Everything else is settled at startup and needs a restart: `panel { output }`
+  and `panel { edge }`, which decide how many columns exist and which edge they anchor to; the
+  `items { }` order and booleans, which decide whether the tray, sheets, devices and trash
+  subsystems are constructed at all; `launcher { favourites }`, which seeds the launcher on first
+  run only; and the `session { }` command overrides. `SIGHUP` does the same as `reload`. A file
+  that will not parse is refused rather than applied: `reload` reports the error and the panel
+  keeps the settings it is already running with.
 * **The Dash holds the keyboard only while the pointer is over it.** The compositor grants a
   layer surface keyboard focus on pointer entry, so opening the Dash from a keybinding while the
   pointer sits on another monitor gives a Dash whose search field will not type until you move

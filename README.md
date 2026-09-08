@@ -186,19 +186,21 @@ session {
 raster icons resample, which is visible on a surface that is on screen permanently. `padding`
 raises the tile pitch as well as the column width, so a larger value fits fewer tiles.
 
-**Four keys do less than their names suggest, and saying so here is cheaper than letting you
-find out.** All four are honest gaps, not subtleties:
+Four of these need a word on how they behave:
 
-* **`autohide = auto` reserves no space and hides nothing.** Its only effect is to stop the
-  panel reserving its column, so windows open underneath it and it still draws permanently —
-  which is worse than `never`, not better. There is no reveal logic behind it.
-* **`reveal-pressure` is read by nothing at all.** It is parsed, range-checked and stored, and
-  no code reads the value.
-* **`animation-ms` is clamped to 120 ms and cannot disable animation.** The shipped default of
-  180 is therefore unreachable, and `0` gives the same 120 ms fade as any other value. It
-  affects only the hover fade; the launch throb and the urgent wiggle ignore it.
-* **`backlight = dominant` renders identically to `palette`.** Sampling a dominant colour from
-  the icon is not implemented.
+* **`autohide = auto`** hides the column and reserves nothing. A hidden column draws nothing and
+  accepts pointer input only in a two-pixel strip at the screen edge, so the windows behind it
+  are reachable through the space it would otherwise occupy. Push into that strip and it comes
+  back; move off it and it goes away again.
+* **`reveal-pressure`** is how far the pointer must travel *inside* that strip before the column
+  reveals — distance, not dwell, so a pointer parked at the edge by accident never opens it and
+  one deliberately rubbed against the edge does. Lower it if revealing feels stiff.
+* **`animation-ms`** is used as written. `0` genuinely disables the hover fade. It governs the
+  hover fade only; the launch throb and the urgent wiggle still carry their own durations.
+* **`backlight = dominant`** tints the running-application backlight to the icon's own colour
+  rather than the palette's, sampled with a bias toward the saturated pixels so a mostly-grey
+  icon with one coloured mark does not wash out. An icon carrying no colour at all falls back to
+  `palette`.
 
 ### Favourites are stored twice, on purpose
 
@@ -438,17 +440,17 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   unless you point `session { lock, logout }` at something. A `WITH_VIRTUAL_INPUT` build can
   synthesise your configured lock keysym instead, but it breaks silently if you rebind the key,
   which is why it is off by default.
-* **No hold-Super number overlay.** A panel cannot observe modifier state without holding
-  keyboard focus. `saberctl overlay` is advertised in `--help` for a held binding, but **has no
-  implementation and answers `error feature not built` in every build.**
-* **Five of the twelve `saberctl` verbs do nothing.** `overlay`, `show`, `hide`, `toggle` and
-  `reload` are advertised and all answer `error feature not built`, which is itself misleading —
-  they are unimplemented rather than compiled out, and no build enables them. `show`/`hide`/
-  `toggle` additionally have no underlying capability: the panel exposes no visibility control,
-  for the same reason `autohide = auto` does nothing.
+* **The hold-Super number overlay needs a compositor binding.** A panel cannot observe a modifier
+  it has no keyboard focus for, so the compositor drives it: bind the press and the release of
+  your key to `saberctl overlay on` and `saberctl overlay off`. The numbers drawn are the ones
+  `saberctl launch N` answers to.
 * **Autohide has `never` and `auto`, not `dodge`.** "Hide when a window would overlap" needs
-  window geometry, and no foreign-toplevel protocol publishes any. `auto` is **not implemented**
-  either — see the configuration notes above.
+  window geometry, and no foreign-toplevel protocol publishes any.
+* **`saberctl reload` does not reload everything.** The theme, the column's width and the
+  autohide behaviour change under a running panel. `panel { output }`, which decides how many
+  columns exist, and the `items { }` booleans, which decide whether the tray, sheets, devices and
+  trash subsystems are constructed at all, are settled at startup and need a restart. `SIGHUP`
+  does the same as `reload`.
 * **The Dash holds the keyboard only while the pointer is over it.** The compositor grants a
   layer surface keyboard focus on pointer entry, so opening the Dash from a keybinding while the
   pointer sits on another monitor gives a Dash whose search field will not type until you move
@@ -466,9 +468,10 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.
 * **Dynamic (Unity) quicklists are parsed and discarded.** Right-clicking a tile shows only the
   desktop entry's static `Actions=`.
-* **A rejected sheet switch is silent.** `saberctl sheet N` and `pin N` report success as soon as
-  the request is queued, before the compositor has answered, so a refusal produces no message,
-  no revert and no log line.
+* **A rejected sheet switch cannot fail the command.** `saberctl sheet N` and `pin N` answer as
+  soon as the request is queued, because the socket is asynchronous and the reply arrives after
+  the control connection has been answered. A refusal is reported as a warning naming the reason,
+  not as an exit status.
 * **Window matching is by `app_id`.** Neither foreign-toplevel protocol carries a pid, so there
   is no authoritative process-to-window link available to any Wayland client. Saber tries five
   resolution rules and a launch-time window before falling back to a generic tile.

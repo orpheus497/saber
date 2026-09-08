@@ -35,11 +35,19 @@ through a compatibility shim. */
 #define SABER_BTN_RIGHT 0x111
 #define SABER_BTN_MIDDLE 0x112
 
-#define SABER_HOVER_MS 120
 #define SABER_THROB_MS 640
 #define SABER_WIGGLE_MS 360
 #define SABER_LAUNCH_TIMEOUT_MS 5000
 #define SABER_WIGGLE_TIMEOUT_MS 4000
+
+/* How wide the strip that listens for a reveal is, in logical pixels. Wide
+enough that a pointer thrown at the edge lands in it, narrow enough that it
+does not steal clicks from a maximised window's own edge. */
+#define SABER_REVEAL_STRIP 2
+
+/* How many tiles the hold-Super overlay numbers, matching the ten launch verbs
+`saberctl launch 1..10` resolves. */
+#define SABER_OVERLAY_MAX 10
 #define SABER_THROB_DEPTH 0.12
 #define SABER_WIGGLE_PIXELS 3.0
 #define SABER_SEPARATOR_GAP 8.0
@@ -118,6 +126,20 @@ struct saber_panel {
   enum saber_item_type pressed_type;
   char *pressed_id;
   int pressed_sub;
+
+  /* Whether the column is on screen. Always true under `autohide = never`
+  unless `saberctl hide` says otherwise; under `auto` it is driven by pressure
+  against the screen edge. A hidden column reserves nothing, draws nothing, and
+  accepts pointer input only in the reveal strip -- so the windows behind it are
+  reachable through the space it would otherwise occupy. */
+  bool visible;
+
+  /* Motion accumulated inside the reveal strip, against panel.reveal-pressure.
+  Reset when the pointer leaves the strip, so a pointer crossing the edge on its
+  way somewhere else does not reveal the column. */
+  double reveal_accum;
+  double reveal_x, reveal_y;
+  bool reveal_tracking;
   struct saber_tween hover_in, hover_out;
 
   double pointer_x, pointer_y;
@@ -170,6 +192,11 @@ struct saber_panels {
   struct saber_menu *menu_ctx;
   struct saber_sheet_grid *grid;
 
+  /* The hold-Super launch-number legend. Driven from the compositor through
+  `saberctl overlay on|off`, because a client without keyboard focus cannot see
+  a modifier being held. */
+  bool overlay;
+
   struct saber_filemanager filemanager;
   GPtrArray *launches; /* struct saber_launch * */
 
@@ -201,6 +228,15 @@ panel_sync_anim(struct saber_panel *panel);
 
 static void
 panel_expire_anim(struct saber_panel *panel, int64_t now);
+
+static void
+panel_apply_visibility(struct saber_panel *panel);
+
+static bool
+panel_autohides(const struct saber_panel *panel);
+
+static void
+panel_damage(struct saber_panel *panel);
 
 static void
 panel_set_hover(struct saber_panel *panel, int slot);
@@ -247,6 +283,57 @@ anim_phase_stop(struct saber_tween *tween)
 {
   saber_tween_stop(tween);
   tween->value = 0.0;
+}
+
+static bool
+panel_autohides(const struct saber_panel *panel)
+{
+  const struct saber_config *config = panel->set->deps.config;
+
+  return config != NULL && config->panel.autohide == SABER_AUTOHIDE_AUTO;
+}
+
+/* Function purpose: Make the surface agree with panel->visible.
+
+Three states, not two, because hiding for autohide and hiding on request are
+different things. Shown: the column reserves its width unless autohide is on,
+and takes input across the whole strip. Hidden under autohide: it reserves
+nothing and accepts input only in a two-pixel strip at the screen edge, which is
+what listens for the reveal. Hidden on request: it reserves nothing and takes no
+input at all, so it is entirely out of the way until something asks for it back.
+
+Nothing here moves or resizes the surface. A layer surface that shrinks and
+regrows has to be re-anchored and re-configured, and every one of those round
+trips is a chance for the compositor and the client to disagree about the size;
+leaving the geometry alone and drawing nothing costs one transparent buffer and
+cannot desynchronise. */
+static void
+panel_apply_visibility(struct saber_panel *panel)
+{
+  if (panel->surface == NULL || panel->surface->closed) {
+    return;
+  }
+
+  bool autohide = panel_autohides(panel);
+
+  saber_surface_set_exclusive_zone(panel->surface,
+      panel->visible && !autohide ? panel->width : 0);
+
+  if (panel->visible) {
+    saber_surface_set_input_region(panel->surface, 0, 0, panel->width,
+        panel->height);
+  } else if (autohide) {
+    bool right = panel->set->deps.config != NULL &&
+        panel->set->deps.config->panel.edge == SABER_EDGE_RIGHT;
+    int32_t strip = MIN(SABER_REVEAL_STRIP, panel->width);
+
+    saber_surface_set_input_region(panel->surface,
+        right ? panel->width - strip : 0, 0, strip, panel->height);
+  } else {
+    saber_surface_set_input_region(panel->surface, 0, 0, 0, 0);
+  }
+
+  panel_damage(panel);
 }
 
 /* Function purpose: Retire phase animations whose ceiling has passed, from the
@@ -890,6 +977,15 @@ panel_render_surface(void *data,
     panel_layout(panel);
   }
 
+  /* Action purpose: A hidden column draws nothing at all. The surface layer has
+  already cleared the buffer to transparent, so returning here leaves the
+  windows behind it visible through the space it occupies -- which, together
+  with the input region set in panel_apply_visibility, is what "hidden" means
+  for a surface that is never actually unmapped. */
+  if (!panel->visible) {
+    return;
+  }
+
   saber_render_column(&panel->render, cr, width, height);
 
   if (panel->separator_y >= 0.0) {
@@ -918,6 +1014,15 @@ panel_render_surface(void *data,
       .height = slot->height,
       .throb = 1.0,
     };
+
+    /* Action purpose: The number is the model position, because that is what
+    `saberctl launch N` resolves -- it takes saber_model_nth(model, N - 1) and
+    requires an application there. Numbering the slot instead would drift from
+    the binding the moment a non-application portion sat above the band. */
+    if (panel->set->overlay && item->type == SABER_ITEM_APP &&
+        slot->item < SABER_OVERLAY_MAX) {
+      tile.overlay_number = (int)slot->item + 1;
+    }
 
     if (item->type == SABER_ITEM_APP) {
       panel_fill_app_tile(panel, item, &tile, initial);
@@ -957,6 +1062,11 @@ panel_configure(void *data,
   panel->height = height;
   panel_layout(panel);
   panel_sync_anim(panel);
+
+  /* Action purpose: The input region and the exclusive zone are both expressed
+  in the size the compositor just handed back, so they are re-applied here
+  rather than at creation, where that size is not yet known. */
+  panel_apply_visibility(panel);
 }
 
 static void
@@ -1899,6 +2009,22 @@ grid_hover(struct saber_sheet_grid *grid, double x, double y)
   saber_popup_damage(grid->popup);
 }
 
+/* Function purpose: Say so when the compositor refuses a sheet request.
+
+The grid is torn down before the reply arrives, so there is nothing left on
+screen to revert; without this the click simply appeared to do nothing, which is
+indistinguishable from the tile being dead. */
+static void
+panel_sheet_reply(enum saber_sheets_status status, void *user)
+{
+  (void)user;
+
+  if (status != SABER_SHEETS_OK) {
+    g_warning("saber: the compositor refused the sheet request: %s",
+        saber_sheets_status_string(status));
+  }
+}
+
 /* The grid is torn down before the switch is asked for: closing frees it, and
 the socket answers on its own schedule. */
 static void
@@ -1911,7 +2037,7 @@ grid_activate(struct saber_sheet_grid *grid, int sheet)
   }
 
   sheet_grid_close(grid);
-  saber_sheets_switch(sheets, sheet, NULL, NULL);
+  saber_sheets_switch(sheets, sheet, panel_sheet_reply, NULL);
 }
 
 static void
@@ -2608,7 +2734,7 @@ panel_scroll_slot(struct saber_panel *panel, int index, int32_t value120)
     int next = ((current + steps) % SABER_SHEET_COUNT + SABER_SHEET_COUNT) %
         SABER_SHEET_COUNT;
 
-    saber_sheets_switch(set->deps.sheets, next, NULL, NULL);
+    saber_sheets_switch(set->deps.sheets, next, panel_sheet_reply, NULL);
 
     return;
   }
@@ -2639,8 +2765,14 @@ panel_set_hover(struct saber_panel *panel, int slot)
 
   int64_t now = saber_clock_now(panel->clock);
   int animation_ms = panel->set->deps.config->panel.animation_ms;
-  int duration = animation_ms > 0 ? MIN(animation_ms, SABER_HOVER_MS)
-                                  : SABER_HOVER_MS;
+  /* Action purpose: The configured duration, used as configured. This was
+  MIN(animation_ms, SABER_HOVER_MS) with 0 mapped to SABER_HOVER_MS, which
+  silently truncated every value above 120 -- including the shipped default of
+  180, so that default was unreachable -- and made 0 mean "the same as every
+  other value" rather than the "disables animation entirely" it is documented
+  as. A zero duration needs no special case here: anim.c lands a zero-length
+  tween on its target and never runs it. */
+  int duration = animation_ms;
 
   panel->fading = panel->hover;
 
@@ -2692,6 +2824,20 @@ pointer_enter(void *data, struct wl_surface *surface, double x, double y)
   panel->pointer_y = y;
 
   saber_display_set_cursor(panels->deps.display, "left_ptr");
+
+  /* Action purpose: Entering the reveal strip starts the measurement, it does
+  not complete it. The first position is only a reference point -- pressure is
+  the motion that follows it, so a pointer that merely arrives at the edge and
+  stops does not open the column. */
+  if (!panel->visible) {
+    panel->reveal_accum = 0.0;
+    panel->reveal_x = x;
+    panel->reveal_y = y;
+    panel->reveal_tracking = true;
+
+    return;
+  }
+
   panel_set_hover(panel, panel_slot_at(panel, x, y));
 }
 
@@ -2709,6 +2855,17 @@ pointer_leave(void *data, struct wl_surface *surface)
     panels->pointer_panel = NULL;
   }
 
+  panel->reveal_accum = 0.0;
+  panel->reveal_tracking = false;
+
+  /* Action purpose: The pointer leaving is what closes an autohidden column
+  again. Requested hiding is deliberately not undone here -- `saberctl show`
+  keeps the column up until something asks for it back. */
+  if (panel_autohides(panel) && panel->visible) {
+    panel->visible = false;
+    panel_apply_visibility(panel);
+  }
+
   panel_set_hover(panel, -1);
 }
 
@@ -2721,6 +2878,44 @@ pointer_motion(void *data, uint32_t time, double x, double y)
   struct saber_panel *panel = panels->pointer_panel;
 
   if (panel == NULL) {
+    return;
+  }
+
+  /* Action purpose: While the column is hidden the only input it receives is
+  inside the reveal strip, so every motion event here is the pointer pushing at
+  the screen edge. Accumulate how far it travels and open the column once that
+  passes panel.reveal-pressure.
+
+  Distance rather than dwell, because a pointer parked at the edge by accident
+  should not eventually open the panel, while one deliberately rubbed against
+  the edge should -- and distance is the only measure of intent available to a
+  client. A compositor-side pointer barrier would report the pressure directly;
+  no Wayland protocol offers one. */
+  if (!panel->visible) {
+    if (panel->reveal_tracking) {
+      double dx = x - panel->reveal_x;
+      double dy = y - panel->reveal_y;
+
+      panel->reveal_accum += sqrt(dx * dx + dy * dy);
+    }
+
+    panel->reveal_x = x;
+    panel->reveal_y = y;
+    panel->reveal_tracking = true;
+    panel->pointer_x = x;
+    panel->pointer_y = y;
+
+    const struct saber_config *config = panels->deps.config;
+    double needed =
+        config != NULL ? (double)config->panel.reveal_pressure : 0.0;
+
+    if (panel->reveal_accum >= needed) {
+      panel->reveal_accum = 0.0;
+      panel->visible = true;
+      panel_apply_visibility(panel);
+      panel_set_hover(panel, panel_slot_at(panel, x, y));
+    }
+
     return;
   }
 
@@ -2844,6 +3039,11 @@ panel_create(struct saber_panels *panels, struct saber_output *output)
   panel->hover = -1;
   panel->fading = -1;
   panel->pressed = -1;
+
+  /* Action purpose: An autohidden column starts hidden. Starting shown and
+  hiding on the first pointer-leave would flash the panel across every screen at
+  login, which is exactly what the setting exists to avoid. */
+  panel->visible = !panel_autohides(panel);
 
   saber_tween_init(&panel->hover_in, 0.0);
   saber_tween_init(&panel->hover_out, 0.0);
@@ -3078,6 +3278,116 @@ unsigned int
 saber_panels_count(const struct saber_panels *panels)
 {
   return panels->list->len;
+}
+
+void
+saber_panels_set_overlay(struct saber_panels *panels, bool on)
+{
+  if (panels == NULL || panels->overlay == on) {
+    return;
+  }
+
+  panels->overlay = on;
+
+  for (guint i = 0; i < panels->list->len; i++) {
+    panel_damage(g_ptr_array_index(panels->list, i));
+  }
+}
+
+void
+saber_panels_reload(struct saber_panels *panels)
+{
+  if (panels == NULL) {
+    return;
+  }
+
+  saber_render_init(&panels->render, panels->deps.config, panels->deps.theme,
+      panels->deps.icons);
+
+  int width = saber_surface_panel_width_for(panels->deps.config);
+
+  for (guint i = 0; i < panels->list->len; i++) {
+    struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    /* Action purpose: The scale rides along in this copy and is wrong for every
+    output but one -- panel_render_surface re-reads it from the surface on each
+    paint, which is what makes copying the shared parameters safe here. */
+    panel->render = panels->render;
+
+    if (panel->surface != NULL && !panel->surface->closed) {
+      /* Height stays 0: the column is anchored top and bottom, so its height is
+      the compositor's to decide and asking for one would fight it. */
+      saber_surface_set_size(panel->surface, width, 0);
+    }
+
+    /* A column that is autohidden now but was not before -- or the reverse --
+    has to be put into the right state before it is next drawn. */
+    panel->visible = !panel_autohides(panel) || panel->visible;
+    panel->reveal_accum = 0.0;
+    panel->reveal_tracking = false;
+
+    panel_layout(panel);
+    panel_sync_anim(panel);
+    panel_apply_visibility(panel);
+  }
+}
+
+void
+saber_panels_set_visible(struct saber_panels *panels, bool visible)
+{
+  if (panels == NULL) {
+    return;
+  }
+
+  for (guint i = 0; i < panels->list->len; i++) {
+    struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    if (panel->visible == visible) {
+      continue;
+    }
+
+    panel->visible = visible;
+    panel->reveal_accum = 0.0;
+    panel->reveal_tracking = false;
+
+    /* A column being taken off the screen cannot keep a hover or a half-pressed
+    tile, or the press would fire against the wrong thing when it returns. */
+    if (!visible) {
+      panel_set_hover(panel, -1);
+      panel->pressed = -1;
+      g_clear_pointer(&panel->pressed_id, g_free);
+    }
+
+    panel_apply_visibility(panel);
+  }
+}
+
+bool
+saber_panels_visible(const struct saber_panels *panels)
+{
+  if (panels == NULL) {
+    return false;
+  }
+
+  for (guint i = 0; i < panels->list->len; i++) {
+    const struct saber_panel *panel = g_ptr_array_index(panels->list, i);
+
+    if (panel->visible) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool
+saber_panels_toggle_visible(struct saber_panels *panels)
+{
+  bool visible = !saber_panels_visible(panels);
+
+  saber_panels_set_visible(panels, visible);
+
+  return visible;
 }
 
 bool

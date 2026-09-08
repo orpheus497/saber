@@ -98,6 +98,46 @@ nothing is open. */
 void
 saber_panels_close_menu(struct saber_panels *panels);
 
+/* Function purpose: Show or hide the launch-number legend, for
+`saberctl overlay on|off`.
+
+Unity drew these while Super was held. A Wayland client cannot watch a modifier
+it has no keyboard focus for, so the compositor drives it: bind the press and
+the release of the key to `overlay on` and `overlay off`. The numbers are the
+ones `saberctl launch N` already answers to. */
+void
+saber_panels_set_overlay(struct saber_panels *panels, bool on);
+
+/* Function purpose: Re-derive what the columns take from the configuration
+after it has been re-read, for `saberctl reload` and SIGHUP.
+
+Covers the render parameters, the column's width, the layout and the autohide
+state. It deliberately does NOT recreate surfaces: `panel { output }` decides
+which outputs carry a column and the `items { }` booleans decide which
+subsystems are constructed at all, and both are settled at startup. Those still
+need a restart, and `saberctl reload` says so rather than pretend otherwise. */
+void
+saber_panels_reload(struct saber_panels *panels);
+
+/* Function purpose: Show or hide every column, for `saberctl show` and `hide`.
+
+Works whatever `panel { autohide }` says: under `never` this is the only way to
+get the strip off the screen, and under `auto` it overrides the pressure state
+until the pointer next leaves the column. A hidden column reserves no space,
+draws nothing and takes no pointer input, so the windows behind it are reachable
+through it -- it is not unmapped, because a layer surface that unmaps and remaps
+has to be re-anchored and re-configured for nothing. */
+void
+saber_panels_set_visible(struct saber_panels *panels, bool visible);
+
+/* Returns the visibility afterwards -- what `saberctl toggle` reports. */
+bool
+saber_panels_toggle_visible(struct saber_panels *panels);
+
+/* True when any column is currently on screen. */
+bool
+saber_panels_visible(const struct saber_panels *panels);
+
 /* Function purpose: Act on a click given in OUTPUT-local coordinates rather
 than panel-local ones, for the dash to hand on the press that dismissed it so
 one click both closes the dash and activates the tile under it. Returns whether

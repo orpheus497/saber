@@ -89,6 +89,12 @@ struct saber_tile {
   double hover;  /* 0..1 */
   double throb;  /* scale multiplier; 1.0 for none */
   double wiggle; /* horizontal offset in logical pixels */
+
+  /* The number this tile answers to from `saberctl launch N`, drawn over the
+  icon while the overlay is up and 0 the rest of the time. Deliberately not the
+  badge: a tile can carry a count and a number at once, and they mean different
+  things. */
+  int overlay_number;
 };
 
 void

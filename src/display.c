@@ -1054,6 +1054,15 @@ struct saber_wayland_source {
   GSource base;
   struct saber_display *display;
   gpointer fd_tag;
+
+  /* What fd_tag is currently polling for. g_source_modify_unix_fd wakes the
+  main context so the new condition is picked up, and a wake-up makes the next
+  poll return at once -- so calling it on every prepare, as this did, is a loop
+  that never sleeps: prepare writes the wake-up byte, the poll returns
+  immediately, prepare runs again. Kept so the call is made only when the
+  condition genuinely changes, which is almost never. */
+  GIOCondition fd_events;
+
   bool reading;
   bool queued;
   bool failed;
@@ -1100,7 +1109,10 @@ wayland_source_prepare(GSource *source, gint *timeout)
     }
   }
 
-  g_source_modify_unix_fd(source, self->fd_tag, events);
+  if (events != self->fd_events) {
+    g_source_modify_unix_fd(source, self->fd_tag, events);
+    self->fd_events = events;
+  }
 
   return FALSE;
 }
@@ -1208,9 +1220,9 @@ saber_display_attach(struct saber_display *display, GMainContext *context)
   g_source_set_priority(source, G_PRIORITY_DEFAULT);
   g_source_set_can_recurse(source, FALSE);
 
+  self->fd_events = G_IO_IN | G_IO_ERR | G_IO_HUP;
   self->fd_tag = g_source_add_unix_fd(source,
-      wl_display_get_fd(display->wl_display),
-      G_IO_IN | G_IO_ERR | G_IO_HUP);
+      wl_display_get_fd(display->wl_display), self->fd_events);
 
   g_source_attach(source, context);
   display->source = source;

@@ -8,13 +8,6 @@ launch window for the applications Saber started itself. */
 
 #include <saber/match.h>
 
-/* Action purpose: How long after a launch an otherwise-unmatched toplevel may
-still be attributed to it. THIS FIGURE IS A GUESS and wants measuring against a
-cold browser start on the target: too short and Firefox arrives after its own
-launch has expired and opens an untethered tile, too long and an unrelated
-window is claimed by the wrong tile. */
-#define SABER_MATCH_LAUNCH_WINDOW_MS 20000
-
 struct saber_match_launch {
   char *desktop_id;
   gint64 at;

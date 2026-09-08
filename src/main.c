@@ -31,6 +31,7 @@ linked and not merely that their headers were on the include path. */
 #include <saber/dash.h>
 #include <saber/devices.h>
 #include <saber/display.h>
+#include <saber/dnd.h>
 #include <saber/ipc.h>
 #include <saber/match.h>
 #include <saber/model.h>
@@ -162,6 +163,7 @@ struct saber_app {
   struct saber_unity *unity;
   struct saber_icons *icons;
   struct saber_panels *panels;
+  struct saber_dnd *dnd;
   struct saber_dash *dash;
   struct saber_spread *spread;
   struct saber_ipc *ipc;
@@ -259,6 +261,27 @@ ipc_spread(const char *app_id, void *user)
   return SABER_IPC_RESULT_NOT_BUILT;
 }
 
+#ifdef HAVE_SHEETS
+/* Function purpose: Report a sheet request the compositor refused.
+
+Every caller used to pass no reply callback, so `saberctl sheet 3` answered `ok`
+the moment the request was queued -- before the socket had been written to, let
+alone answered -- and a refusal produced no message, no revert and no log line.
+The request is asynchronous and the control socket has already been answered by
+the time the reply lands, so the exit status cannot carry it; a warning naming
+the reason is what is left, and it is a great deal better than silence. */
+static void
+on_sheet_reply(enum saber_sheets_status status, void *user)
+{
+  (void)user;
+
+  if (status != SABER_SHEETS_OK) {
+    g_warning("saber: the compositor refused the sheet request: %s",
+        saber_sheets_status_string(status));
+  }
+}
+#endif
+
 static enum saber_ipc_result
 ipc_sheet(int sheet, void *user)
 {
@@ -266,7 +289,7 @@ ipc_sheet(int sheet, void *user)
   struct saber_app *app = user;
 
   if (app->sheets != NULL) {
-    saber_sheets_switch(app->sheets, sheet, NULL, NULL);
+    saber_sheets_switch(app->sheets, sheet, on_sheet_reply, app);
 
     return SABER_IPC_RESULT_OK;
   }
@@ -285,7 +308,7 @@ ipc_pin(int sheet, void *user)
   struct saber_app *app = user;
 
   if (app->sheets != NULL) {
-    saber_sheets_pin(app->sheets, sheet, NULL, NULL);
+    saber_sheets_pin(app->sheets, sheet, on_sheet_reply, app);
 
     return SABER_IPC_RESULT_OK;
   }
@@ -295,6 +318,32 @@ ipc_pin(int sheet, void *user)
 #endif
 
   return SABER_IPC_RESULT_NOT_BUILT;
+}
+
+/* A keybinding launch waiting on its activation token. Holds the model rather
+than the application struct, because the reply is asynchronous and only these
+two are needed once it lands. */
+struct ipc_launch {
+  struct saber_model *model;
+  struct saber_appinfo *app; /* owned: one reference, released here */
+};
+
+static void
+ipc_launch_with_token(const char *token, void *user)
+{
+  struct ipc_launch *pending = user;
+  struct saber_model *model = pending->model;
+  struct saber_appinfo *app = pending->app;
+
+  g_free(pending);
+
+  if (saber_appinfo_launch(app, NULL, NULL, token)) {
+    saber_model_note_launch(model, app->id);
+  } else {
+    g_warning("saber: failed to launch '%s'", app->id);
+  }
+
+  saber_appinfo_unref(app);
 }
 
 static enum saber_ipc_result
@@ -324,11 +373,150 @@ ipc_launch(int favourite, void *user)
     return SABER_IPC_RESULT_FAILED;
   }
 
-  if (!saber_appinfo_launch(item->app, NULL, NULL, NULL)) {
+  /* Action purpose: Ask for an activation token, exactly as a click on the tile
+  does. This path is what `Logo+1..4` runs, and without a token the window it
+  starts arrives unfocused -- so the keybinding started the application and then
+  left the user to click it, which is not what the binding is for.
+
+  The reply is asynchronous and the control connection has already been answered
+  by the time it lands, so the verb reports that the launch was accepted rather
+  than that it succeeded; a failure after this point is warned about by
+  ipc_launch_with_token. */
+  struct ipc_launch *pending = g_new0(struct ipc_launch, 1);
+
+  pending->model = app->model;
+  pending->app = saber_appinfo_ref(item->app);
+
+  saber_display_request_activation(app->display, NULL, item->id,
+      ipc_launch_with_token, pending);
+
+  return SABER_IPC_RESULT_OK;
+}
+
+static void
+app_repaint(struct saber_app *app);
+
+/* Function purpose: Re-read the configuration and apply what can be applied
+without restarting. Shared by `saberctl reload` and SIGHUP.
+
+The new file is parsed into a scratch structure and only the fields that are
+safe to change under a running panel are copied across, because `app.config` is
+handed to every subsystem by pointer and its strings are read live -- freeing
+and reallocating them underneath a running model would be a use-after-free
+looking for somewhere to happen. What is copied is scalar or a fixed array:
+the panel's geometry and behaviour, and the whole theme block, which contains
+no pointers.
+
+What deliberately does not reload: `panel { output }`, which decides how many
+columns exist, and the `items { }` booleans, which decide whether the tray,
+sheets, devices and trash subsystems are constructed at all. Both are settled at
+startup and changing them means recreating surfaces and subsystems, which is a
+restart in everything but name. */
+static bool
+app_reload_config(struct saber_app *app)
+{
+  struct saber_config next;
+  enum saber_config_status status = SABER_CONFIG_ABSENT;
+
+  memset(&next, 0, sizeof(next));
+  saber_config_load_status(&next, NULL, &status);
+
+  /* Action purpose: A file that would not parse must not reach the running
+  panel. saber_config_load fills in defaults for everything it could not read,
+  which is right at startup -- a broken file costs the user their settings,
+  never their panel -- but here those defaults would land on top of the
+  settings already in force, so one typo would throw away the theme the panel
+  is running and `reload` would answer `ok`. Refused instead; the parse error is
+  already on stderr. An absent file is not refused: the defaults are then the
+  configuration, exactly as they are at startup. */
+  if (status == SABER_CONFIG_UNREADABLE) {
+    saber_config_fini(&next);
+
+    return false;
+  }
+
+  app->config.panel.icon_size = next.panel.icon_size;
+  app->config.panel.padding = next.panel.padding;
+  app->config.panel.autohide = next.panel.autohide;
+  app->config.panel.reveal_pressure = next.panel.reveal_pressure;
+  app->config.panel.animation_ms = next.panel.animation_ms;
+  app->config.theme = next.theme;
+
+  saber_config_fini(&next);
+
+  saber_theme_init(&app->theme,
+      app->config.theme.palette_valid ? app->config.theme.palette : NULL,
+      app->config.theme.opacity, app->config.theme.overlay_opacity);
+
+  saber_panels_reload(app->panels);
+  app_repaint(app);
+
+  return true;
+}
+
+static enum saber_ipc_result
+ipc_reload(void *user)
+{
+  return app_reload_config(user) ? SABER_IPC_RESULT_OK
+                                 : SABER_IPC_RESULT_FAILED;
+}
+
+/* Action purpose: SIGHUP is the conventional "re-read your configuration" for a
+resident process, and a panel started from a compositor autostart has no other
+channel a shell script can reach it on. Runs on the main loop rather than in the
+handler, so it may allocate and touch the panel like any other event. */
+static gboolean
+on_sighup(gpointer user)
+{
+  app_reload_config(user);
+
+  return G_SOURCE_CONTINUE;
+}
+
+/* Function purpose: `saberctl overlay on|off` -- the hold-Super launch-number
+legend, driven from the compositor because a panel cannot observe a modifier it
+has no keyboard focus for. Bind the key's press and release to the two forms. */
+static enum saber_ipc_result
+ipc_overlay(bool on, void *user)
+{
+  struct saber_app *app = user;
+
+  if (app->panels == NULL) {
     return SABER_IPC_RESULT_FAILED;
   }
 
-  saber_model_note_launch(app->model, item->id);
+  saber_panels_set_overlay(app->panels, on);
+
+  return SABER_IPC_RESULT_OK;
+}
+
+/* Function purpose: `saberctl show`, `hide` and `toggle`.
+
+These were advertised in `--help` from the beginning and answered `error feature
+not built` in every build, because the handler was never installed and there was
+no visibility control behind it to install one for. Both halves exist now. */
+static enum saber_ipc_result
+ipc_visibility(enum saber_ipc_visibility action, void *user)
+{
+  struct saber_app *app = user;
+
+  if (app->panels == NULL) {
+    return SABER_IPC_RESULT_FAILED;
+  }
+
+  switch (action) {
+  case SABER_IPC_VISIBILITY_SHOW:
+    saber_panels_set_visible(app->panels, true);
+    break;
+
+  case SABER_IPC_VISIBILITY_HIDE:
+    saber_panels_set_visible(app->panels, false);
+    break;
+
+  case SABER_IPC_VISIBILITY_TOGGLE:
+    saber_panels_toggle_visible(app->panels);
+    break;
+  }
 
   return SABER_IPC_RESULT_OK;
 }
@@ -413,6 +601,39 @@ on_dash_dismissed(void *user,
   app->dash_dismissing = false;
 }
 
+/* Function purpose: Drag-and-drop onto a tile, which until now was 609 lines
+that nothing constructed.
+
+A file dragged from a file manager onto an application's tile opens it with that
+application. The three callbacks are deliberately thin: dnd.c owns the protocol
+and the accept/reject handshake, panel.c owns the hit test, and this is the
+seam. */
+static bool
+on_dnd_accepts(void *user, struct wl_surface *surface, double x, double y)
+{
+  struct saber_app *app = user;
+
+  return saber_panels_accepts_drop(app->panels, surface, x, y);
+}
+
+static void
+on_dnd_drop(void *user,
+    struct wl_surface *surface,
+    double x,
+    double y,
+    char **uris)
+{
+  struct saber_app *app = user;
+
+  saber_panels_drop_at(app->panels, surface, x, y, (const char *const *)uris);
+}
+
+static const struct saber_dnd_listener app_dnd_listener = {
+  .accepts = on_dnd_accepts,
+  .motion = NULL,
+  .drop = on_dnd_drop,
+};
+
 static void
 on_spread_requested(const char *app_id, struct saber_output *output, void *user)
 {
@@ -480,6 +701,13 @@ on_toplevel_added(void *user, struct saber_toplevel *toplevel)
   app_sync_focus(app);
   app_invalidate_sheets(app);
   app_repaint(app);
+
+  /* A window opening while the spread is up belongs in it. */
+#ifdef HAVE_SPREAD
+  if (app->spread != NULL && saber_spread_is_visible(app->spread)) {
+    saber_spread_refresh(app->spread);
+  }
+#endif
 }
 
 static void
@@ -513,6 +741,16 @@ on_toplevel_closed(void *user, struct saber_toplevel *toplevel)
   app_sync_focus(app);
   app_invalidate_sheets(app);
   app_repaint(app);
+
+  /* Action purpose: An open spread holds one cell per window and had no way to
+  learn that one had gone -- saber_spread_refresh existed with no external
+  caller, so every closed window left a cell behind that still offered to raise
+  or close it. */
+#ifdef HAVE_SPREAD
+  if (app->spread != NULL && saber_spread_is_visible(app->spread)) {
+    saber_spread_refresh(app->spread);
+  }
+#endif
 }
 
 static const struct saber_toplevel_listener app_toplevel_listener = {
@@ -605,6 +843,7 @@ app_shutdown(struct saber_app *app)
   /* Before the panels: both hold a surface that owns the seat's keyboard while
   mapped, and tearing the display down under them leaves the session deaf. */
   saber_ipc_destroy(app->ipc);
+  saber_dnd_destroy(app->dnd);
   saber_dash_destroy(app->dash);
   saber_spread_destroy(app->spread);
   saber_panels_destroy(app->panels);
@@ -636,7 +875,7 @@ run(void)
   saber_config_load(&app.config, NULL);
   saber_theme_init(&app.theme,
       app.config.theme.palette_valid ? app.config.theme.palette : NULL,
-      app.config.theme.opacity);
+      app.config.theme.opacity, app.config.theme.overlay_opacity);
 
   app.display = saber_display_create(NULL);
 
@@ -713,22 +952,20 @@ run(void)
 
 #ifdef HAVE_TRAY
   if (app.config.items.tray) {
+    /* Action purpose: No conflict check here. Bus name ownership is resolved
+    asynchronously, so a test taken between the create call and the main loop
+    always reads the pre-acquisition value and always warns -- on a healthy
+    session as loudly as on a contested one, which is worse than saying nothing.
+    sni.c reports the real answer from its own name-lost callback, at the moment
+    it is known and with the offending name in the message. */
     app.sni = saber_sni_create(on_sni_changed, &app);
-
-    if (app.sni != NULL && !saber_sni_is_watcher(app.sni)) {
-      g_warning("saber: another tray host owns "
-                "org.kde.StatusNotifierWatcher; the tray zone will be empty");
-    }
   }
 #endif
 
 #ifdef HAVE_LAUNCHER_ENTRY
+  /* Same asynchronous-ownership reasoning as the tray above: unity.c warns from
+  its own name-lost callback, once the answer exists. */
   app.unity = saber_unity_create(on_unity_changed, &app);
-
-  if (app.unity != NULL && !saber_unity_is_owner(app.unity)) {
-    g_warning("saber: another launcher owns com.canonical.Unity; count "
-              "badges and progress bars will stay dead");
-  }
 #endif
 
   struct saber_panel_deps deps = {
@@ -742,6 +979,7 @@ run(void)
     .trash = app.trash,
     .devices = app.devices,
     .sni = app.sni,
+    .unity = app.unity,
     .index = app.index,
   };
 
@@ -789,6 +1027,12 @@ run(void)
   saber_panels_set_spread(app.panels, on_spread_requested, &app);
 #endif
 
+  /* Action purpose: After the panels, because a drop is resolved against a
+  column's layout and the listener is handed the application. Returns NULL when
+  the compositor advertises no wl_data_device_manager, which costs
+  drag-and-drop and nothing else. */
+  app.dnd = saber_dnd_create(app.display, &app_dnd_listener, &app);
+
   /* Action purpose: The socket is also the single-instance lock. ipc.c connects
   before it unlinks, so a live panel is detected rather than having its socket
   stolen; a stale file from an unclean exit is removed instead. */
@@ -796,8 +1040,11 @@ run(void)
     .dash = ipc_dash,
     .spread = ipc_spread,
     .launch = ipc_launch,
+    .overlay = ipc_overlay,
+    .visibility = ipc_visibility,
     .sheet = ipc_sheet,
     .pin = ipc_pin,
+    .reload = ipc_reload,
     .status = ipc_status,
     .quit = ipc_quit,
     .user = &app,
@@ -824,12 +1071,14 @@ run(void)
 
   guint sigint = g_unix_signal_add(SIGINT, on_signal, &app);
   guint sigterm = g_unix_signal_add(SIGTERM, on_signal, &app);
+  guint sighup = g_unix_signal_add(SIGHUP, on_sighup, &app);
 
   saber_display_flush(app.display);
   g_main_loop_run(app.loop);
 
   g_source_remove(sigint);
   g_source_remove(sigterm);
+  g_source_remove(sighup);
   app_shutdown(&app);
 
   return EXIT_SUCCESS;

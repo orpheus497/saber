@@ -69,6 +69,7 @@ struct saber_config {
     bool inherit_hikari;
     enum saber_backlight backlight;
     double opacity;
+    double overlay_opacity; /* dash and spread backdrop; applied exactly */
     /* Populated either from hikari.conf or from an explicit theme { palette }
     block; falls back to the built-in palette when neither is readable. */
     struct saber_color palette[SABER_PALETTE_SLOTS];
@@ -105,12 +106,33 @@ struct saber_config {
   } session;
 };
 
+/* Function purpose: Which of the three outcomes produced the configuration a
+load returns. `reload` is the one caller that has to tell them apart: applying
+the defaults of a file it could not parse would overwrite the settings the panel
+is already running with, so a typo would silently cost the user their theme. An
+absent file is not that -- the defaults are then the configuration, exactly as
+they are at startup. A `path` given explicitly is UNREADABLE rather than ABSENT
+when it does not exist, because naming a file that is not there is a mistake
+worth reporting, not a request for the defaults. */
+enum saber_config_status {
+  SABER_CONFIG_LOADED, /* a file was found and parsed */
+  SABER_CONFIG_ABSENT, /* nothing in the search order; the defaults stand */
+  SABER_CONFIG_UNREADABLE, /* a named or found file would not read or parse */
+};
+
 /* Function purpose: Load configuration, applying defaults for everything
 absent. Never fails in a way that costs the user their panel: a malformed file
 is reported and skipped, not fatal. `path` may be NULL to use the standard
 search order (XDG_CONFIG_HOME, then the system default). */
 bool
 saber_config_load(struct saber_config *config, const char *path);
+
+/* Function purpose: saber_config_load, reporting which outcome it took. NULL
+`status` makes it exactly saber_config_load. */
+bool
+saber_config_load_status(struct saber_config *config,
+    const char *path,
+    enum saber_config_status *status);
 
 void
 saber_config_fini(struct saber_config *config);

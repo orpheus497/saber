@@ -316,8 +316,8 @@ dispatch(struct ipc_client *client, char *line)
   } else if (strcmp(line, "launch") == 0) {
     int favourite = 0;
 
-    if (!parse_number(arg, 1, 9, &favourite)) {
-      respond(client, "error favourite number must be 1-9\n");
+    if (!parse_number(arg, 1, 10, &favourite)) {
+      respond(client, "error favourite number must be 1-10\n");
     } else if (handlers->launch == NULL) {
       respond(client, "error feature not built\n");
     } else {

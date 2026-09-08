@@ -17,6 +17,10 @@ its owner. The protocol half only -- nothing here launches anything. */
 /* A source that never closes its end would otherwise pin the fd and the offer
 for the life of the session. */
 #define SABER_DND_READ_TIMEOUT_MS 5000
+/* The most a single drop may deliver. Generous for a URI list -- a thousand
+paths of 256 bytes -- and finite, which is the point. */
+#define SABER_DND_READ_MAX (256 * 1024)
+
 #define SABER_DND_READ_CHUNK 4096
 
 struct saber_dnd_offer {
@@ -262,13 +266,25 @@ read_deliver(struct saber_dnd_read *transfer)
   char **uris = uri_list_parse(transfer->buffer->str, transfer->buffer->len);
   bool delivered = uris[0] != NULL;
 
-  if (delivered && dnd->listener != NULL && dnd->listener->drop != NULL) {
-    dnd->listener->drop(dnd->data, transfer->surface, transfer->x, transfer->y,
-        uris);
+  /* Action purpose: Everything the handler needs is latched, and the transfer
+  is disposed of, BEFORE the handler runs. A drop handler is entitled to do
+  anything -- including tearing the drag-and-drop layer down, which is what
+  quitting from a dropped file would do -- and read_dispose dereferences both
+  the transfer and its dnd. Calling out first and cleaning up afterwards was a
+  use-after-free waiting for the first handler that did. */
+  struct wl_surface *surface = transfer->surface;
+  double x = transfer->x;
+  double y = transfer->y;
+  const struct saber_dnd_listener *listener = dnd->listener;
+  void *data = dnd->data;
+
+  read_dispose(transfer, delivered);
+
+  if (delivered && listener != NULL && listener->drop != NULL) {
+    listener->drop(data, surface, x, y, uris);
   }
 
   g_strfreev(uris);
-  read_dispose(transfer, delivered);
 }
 
 static gboolean
@@ -281,6 +297,19 @@ read_ready(gint fd, GIOCondition condition, gpointer user)
     ssize_t got = read(fd, chunk, sizeof(chunk));
 
     if (got > 0) {
+      /* Action purpose: A cap, because the peer chooses how much it writes and
+      a pipe that is never closed would otherwise hold this loop -- and with it
+      the whole main loop -- for as long as the other side kept writing, growing
+      the buffer without limit the entire time. A URI list long enough to hit
+      this is not a drop anybody meant to make. */
+      if (transfer->buffer->len + (gsize)got > SABER_DND_READ_MAX) {
+        g_warning("saber: drag-and-drop payload exceeded %d bytes; dropped",
+            SABER_DND_READ_MAX);
+        read_dispose(transfer, false);
+
+        return G_SOURCE_REMOVE;
+      }
+
       g_string_append_len(transfer->buffer, chunk, got);
       continue;
     }

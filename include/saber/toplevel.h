@@ -61,6 +61,13 @@ struct saber_toplevel {
 
   bool announced;   /* the first `done` has been delivered */
   uint32_t pending; /* enum saber_toplevel_change, since the last `done` */
+
+  /* Action purpose: A value never reused for the life of the process, so a
+  holder can tell "still the window I was given" from "a different window that
+  happens to have been allocated at the same address". Comparing the pointer
+  alone is not enough: these are g_new0/g_free, and a closed window's block is
+  routinely handed straight back for the next one. */
+  uint64_t id;
 };
 
 /* Function purpose: The owner's view of the window set. `changed` carries the

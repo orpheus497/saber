@@ -19,6 +19,11 @@ struct saber_model {
   size_t tail; /* trailing special tiles */
 
   bool loading; /* suppress persistence while the list is being built */
+
+  /* One-shot, rearmed by each launch: clears `launching` when the match window
+  that justified it closes. */
+  guint launch_expiry;
+
   saber_model_changed_func changed;
   void *changed_data;
 };
@@ -246,6 +251,10 @@ saber_model_destroy(struct saber_model *model)
     return;
   }
 
+  if (model->launch_expiry != 0) {
+    g_source_remove(model->launch_expiry);
+  }
+
   for (guint i = 0; i < model->items->len; i++) {
     item_free(g_ptr_array_index(model->items, i));
   }
@@ -375,6 +384,118 @@ saber_model_set_focus(struct saber_model *model, void *handle)
   notify(model);
 }
 
+/* Function purpose: Clear the launching flag on any tile whose launch window
+has closed, and say whether anything changed.
+
+`launching` was set from four places and cleared in exactly one -- when a window
+turned up carrying a matching app_id. An application that fails to start, or one
+whose window never resolves to the tile that launched it, therefore stayed
+marked as launching for the rest of the session. match.c already knows when a
+launch has expired, because the same window bounds the app_id matching it does;
+this is the reader that function never had.
+
+Returns whether anything changed so the caller can avoid a repaint that would
+draw exactly what is already on screen. */
+bool
+saber_model_expire_launches(struct saber_model *model)
+{
+  if (model == NULL) {
+    return false;
+  }
+
+  bool changed = false;
+
+  for (guint i = 0; i < model->items->len; i++) {
+    struct saber_item *item = g_ptr_array_index(model->items, i);
+
+    if (!item->launching ||
+        saber_match_is_launching(model->match, item->id)) {
+      continue;
+    }
+
+    item->launching = false;
+    changed = true;
+  }
+
+  if (changed) {
+    notify(model);
+  }
+
+  return changed;
+}
+
+static gboolean
+model_launch_expired(gpointer data);
+
+/* Function purpose: How long until the earliest launch window still open closes,
+in milliseconds, or 0 when nothing is launching. The extra millisecond keeps the
+answer off the exact boundary saber_match_is_launching still counts as inside. */
+static guint
+model_launch_delay_ms(const struct saber_model *model)
+{
+  int64_t earliest = 0;
+
+  for (guint i = 0; i < model->items->len; i++) {
+    const struct saber_item *item = g_ptr_array_index(model->items, i);
+
+    if (item->launching &&
+        (earliest == 0 || item->launch_noted_at < earliest)) {
+      earliest = item->launch_noted_at;
+    }
+  }
+
+  if (earliest == 0) {
+    return 0;
+  }
+
+  int64_t elapsed = (g_get_monotonic_time() - earliest) / 1000;
+  int64_t remaining = (int64_t)SABER_MATCH_LAUNCH_WINDOW_MS - elapsed;
+
+  return remaining > 0 ? (guint)remaining + 1 : 1;
+}
+
+/* Action purpose: One timer for the whole model, always aimed at the launch that
+expires first. A later launch never moves it: that launch's own window closes
+after the armed one, so the deadline already set is still the one that matters,
+and the handler rearms for whatever is left. Arming on the newest launch instead
+would hold an earlier tile `launching` until the newest one expired -- two
+launches nineteen seconds apart would leave the first marked for nearly twice
+its window, which is the stale state this whole mechanism exists to clear. */
+static void
+model_arm_launch_expiry(struct saber_model *model)
+{
+  if (model->launch_expiry != 0) {
+    return;
+  }
+
+  guint delay = model_launch_delay_ms(model);
+
+  if (delay == 0) {
+    return;
+  }
+
+  model->launch_expiry = g_timeout_add(delay, model_launch_expired, model);
+}
+
+/* Action purpose: Nothing else clears a `launching` flag once the launch window
+closes. panel.c retires the throb after its own five-second ceiling and calls
+saber_model_expire_launches there, but the match window is four times as long,
+so that call always finds the launch still inside it and the flag stands for the
+rest of the session -- taking the panel's expired latch with it, since the latch
+only resets while the flag is clear, and swallowing the throb of every later
+launch of the same application. */
+static gboolean
+model_launch_expired(gpointer data)
+{
+  struct saber_model *model = data;
+
+  model->launch_expiry = 0;
+  saber_model_expire_launches(model);
+  model_arm_launch_expiry(model);
+
+  return G_SOURCE_REMOVE;
+}
+
 void
 saber_model_note_launch(struct saber_model *model, const char *desktop_id)
 {
@@ -383,6 +504,9 @@ saber_model_note_launch(struct saber_model *model, const char *desktop_id)
   struct saber_item *item = saber_model_find(model, desktop_id);
   if (item != NULL) {
     item->launching = true;
+    item->launch_noted_at = g_get_monotonic_time();
+
+    model_arm_launch_expiry(model);
     notify(model);
   }
 }

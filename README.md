@@ -69,13 +69,13 @@ Top to bottom, each item switchable in `items { }`:
 
 | Item | Left click | Middle click | Right click | Scroll |
 |---|---|---|---|---|
-| **BFB** (the winged orb) | Open the Dash | — | — | — |
+| **BFB** (the winged orb) | Open the Dash | Open the Dash | Open the Dash | — |
 | **Application tile** | Launch · focus · minimise if already focused · spread when 2+ windows | New instance | Quicklist | Cycle that app's windows |
-| **Sheet** | Sheet grid | — | — | Step sheet |
+| **Sheet** | Sheet grid | — | Sheet grid | Step sheet |
 | **Device** | Open the mount point | Unmount | — | — |
 | **Trash** | Open the trash | — | Open / Empty Trash | — |
 | **Tray item** | Activate, or its menu | Secondary activate | Context menu | Forwarded |
-| **Session** | Session menu | — | — | — |
+| **Session** | Session menu | — | Session menu | — |
 
 ### Tile decoration
 
@@ -103,9 +103,10 @@ anything — rendering is the host's job, and that is exactly what lets the pane
 
 ### The Dash
 
-`saberctl dash`, or click the BFB. A panel docked to the same edge as the column, one third of
-the output wide and full height, with the desktop beside it left undimmed. The search field is
-top-left; the category strip runs along the bottom.
+`saberctl dash`, or click the BFB. A panel docked to the same edge as the column, full height and
+one third of the output wide — held between 420 and 700 logical pixels, so a laptop still fits
+three columns and an ultrawide is not handed half the desktop. The desktop beside it is left
+undimmed. The search field is top-left; the category strip runs along the bottom.
 
 Typing filters; categories filter; the two compose. Ranking puts prefix matches above interior
 ones, across name, generic name and `Exec` basename. `Tab` cycles categories, arrows move and
@@ -134,7 +135,7 @@ Unity's mechanics are reproduced; Unity's Ambiance colours are not.
 `~/.config/saber/saber.conf`, in UCL — the same syntax and the same parser as `hikari.conf`.
 **Every key is optional and the whole file may be deleted**; the values below are the defaults.
 A copy with all of this documented in place is installed at
-`${PREFIX}/etc/saber/saber.conf`.
+`${ETC_PREFIX}/etc/saber/saber.conf`, where `ETC_PREFIX` defaults to `PREFIX`.
 
 ```ucl
 panel {
@@ -143,14 +144,15 @@ panel {
   icon-size       = 32       # 24-64
   padding         = 12       # 0-64; column width is icon-size + padding, so 32+12 = 44px
   autohide        = never    # never | auto  -- see the note below
-  reveal-pressure = 240      # NOT IMPLEMENTED -- see the note below
-  animation-ms    = 180      # see the note below
+  reveal-pressure = 240      # push distance to reveal an autohidden panel
+  animation-ms    = 180      # 0 disables animation; governs all of it
 }
 
 theme {
-  inherit-hikari = true      # import ui { palette } from hikari.conf
-  backlight      = palette   # palette | dominant | off  -- see the note below
-  opacity        = 0.92
+  inherit-hikari  = true     # import ui { palette } from hikari.conf
+  backlight       = palette  # palette | dominant | off  -- see the note below
+  opacity         = 0.92     # the column itself
+  overlay-opacity = 1.00     # dash strip and spread backdrop; 1.0 = opaque
 
   # Optional. Overrides the hikari import; all sixteen must be present or the
   # whole block is ignored and the built-in palette is used.
@@ -159,7 +161,7 @@ theme {
 
 launcher {
   # No default. Omit this and the launcher starts with running windows only.
-  favourites = [ "firefox.desktop", "thunar.desktop" ]
+  favourites = [ "sofi.desktop", "firefox.desktop" ]
 }
 
 items {
@@ -186,19 +188,23 @@ session {
 raster icons resample, which is visible on a surface that is on screen permanently. `padding`
 raises the tile pitch as well as the column width, so a larger value fits fewer tiles.
 
-**Four keys do less than their names suggest, and saying so here is cheaper than letting you
-find out.** All four are honest gaps, not subtleties:
+Four of these need a word on how they behave:
 
-* **`autohide = auto` reserves no space and hides nothing.** Its only effect is to stop the
-  panel reserving its column, so windows open underneath it and it still draws permanently —
-  which is worse than `never`, not better. There is no reveal logic behind it.
-* **`reveal-pressure` is read by nothing at all.** It is parsed, range-checked and stored, and
-  no code reads the value.
-* **`animation-ms` is clamped to 120 ms and cannot disable animation.** The shipped default of
-  180 is therefore unreachable, and `0` gives the same 120 ms fade as any other value. It
-  affects only the hover fade; the launch throb and the urgent wiggle ignore it.
-* **`backlight = dominant` renders identically to `palette`.** Sampling a dominant colour from
-  the icon is not implemented.
+* **`autohide = auto`** hides the column and reserves nothing. A hidden column draws nothing and
+  accepts pointer input only in a two-pixel strip at the screen edge, so the windows behind it
+  are reachable through the space it would otherwise occupy. Push into that strip and it comes
+  back; move off it and it goes away again.
+* **`reveal-pressure`** is how far the pointer must travel *inside* that strip before the column
+  reveals — distance, not dwell, so a pointer parked at the edge by accident never opens it and
+  one deliberately rubbed against the edge does. Lower it if revealing feels stiff.
+* **`animation-ms`** governs every animation, not merely some of them. The Dash's slide-in, the
+  spread's fade-and-rise, menus fading up, the hover cross-fade, and the launch throb and urgent
+  wiggle are all scaled from it against a 180 ms baseline, so `0` genuinely stops all of them
+  rather than leaving two of them running.
+* **`backlight = dominant`** tints the running-application backlight to the icon's own colour
+  rather than the palette's, sampled with a bias toward the saturated pixels so a mostly-grey
+  icon with one coloured mark does not wash out. An icon carrying no colour at all falls back to
+  `palette`.
 
 ### Favourites are stored twice, on purpose
 
@@ -263,7 +269,7 @@ bindings {
 ```
 saberctl dash                  toggle the application grid
 saberctl spread [app_id]       toggle the window spread, optionally filtered
-saberctl launch <1-9>          launch or focus favourite N
+saberctl launch <1-10>         launch or focus favourite N
 saberctl overlay <on|off>      the hold-Super number overlay
 saberctl show | hide | toggle  panel visibility
 saberctl sheet <0-9>           switch to sheet N
@@ -278,7 +284,7 @@ It exits 0 when the panel answers `ok` and 1 otherwise, so it composes in script
 to start rather than stealing the socket, and a stale socket left by an unclean exit is removed
 rather than being mistaken for a live panel.
 
-`saberctl` links **only libc** and is 20 KB. That is deliberate: it runs on every bound
+`saberctl` links **only libc** and is 14 KB. That is deliberate: it runs on every bound
 keypress, and linking the desktop's shared libraries to print one line would be paid per
 keystroke.
 
@@ -342,9 +348,11 @@ make
 make install            # PREFIX defaults to /usr/local
 ```
 
-Saber is **not in the ports tree**, and no port skeleton ships here yet. Build it with `make`
-as above; a `ports/` directory with `TRAY`, `DASH` and `SPREAD` options will land alongside an
-actual ports submission.
+Saber is **not in the ports tree** yet, but a complete port skeleton ships under
+[`ports/`](ports/) — `Makefile`, `pkg-descr`, `pkg-message` and `pkg-plist`, with `TRAY`, `DASH`
+and `SPREAD` options, all on by default. It installs the configuration as `saber.conf.sample` so
+a package never overwrites a file the administrator has edited. Until a submission is made, build
+it with `make` as above.
 
 `make install` places `saber` and `saberctl` in `${PREFIX}/bin` (mode 555, neither setuid), the
 default configuration in `${ETC_PREFIX}/etc/saber/saber.conf`, and the BFB emblem in
@@ -438,43 +446,46 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   unless you point `session { lock, logout }` at something. A `WITH_VIRTUAL_INPUT` build can
   synthesise your configured lock keysym instead, but it breaks silently if you rebind the key,
   which is why it is off by default.
-* **No hold-Super number overlay.** A panel cannot observe modifier state without holding
-  keyboard focus. `saberctl overlay` is advertised in `--help` for a held binding, but **has no
-  implementation and answers `error feature not built` in every build.**
-* **Five of the twelve `saberctl` verbs do nothing.** `overlay`, `show`, `hide`, `toggle` and
-  `reload` are advertised and all answer `error feature not built`, which is itself misleading —
-  they are unimplemented rather than compiled out, and no build enables them. `show`/`hide`/
-  `toggle` additionally have no underlying capability: the panel exposes no visibility control,
-  for the same reason `autohide = auto` does nothing.
+* **The hold-Super number overlay needs a compositor binding.** A panel cannot observe a modifier
+  it has no keyboard focus for, so the compositor drives it: bind the press and the release of
+  your key to `saberctl overlay on` and `saberctl overlay off`. The numbers drawn are the ones
+  `saberctl launch N` answers to.
 * **Autohide has `never` and `auto`, not `dodge`.** "Hide when a window would overlap" needs
-  window geometry, and no foreign-toplevel protocol publishes any. `auto` is **not implemented**
-  either — see the configuration notes above.
+  window geometry, and no foreign-toplevel protocol publishes any.
+* **`saberctl reload` does not reload everything.** The whole `theme { }` block, the column's
+  width (`icon-size` and `padding`), `autohide`, `reveal-pressure` and `animation-ms` change under
+  a running panel. Everything else is settled at startup and needs a restart: `panel { output }`
+  and `panel { edge }`, which decide how many columns exist and which edge they anchor to; the
+  `items { }` order and booleans, which decide whether the tray, sheets, devices and trash
+  subsystems are constructed at all; `launcher { favourites }`, which seeds the launcher on first
+  run only; and the `session { }` command overrides. `SIGHUP` does the same as `reload`. A file
+  that will not parse is refused rather than applied: `reload` reports the error and the panel
+  keeps the settings it is already running with.
 * **The Dash holds the keyboard only while the pointer is over it.** The compositor grants a
   layer surface keyboard focus on pointer entry, so opening the Dash from a keybinding while the
   pointer sits on another monitor gives a Dash whose search field will not type until you move
   onto it. The trade is deliberate: it is also why the Dash never monopolises the session, and
   why the other monitor stays fully usable while it is open.
-* **The Dash has no blur, and cannot have one.** `hikari-sakura` advertises no blur protocol of
-  any kind — there is nothing for a client to bind. The backdrop is a translucent palette fill.
-  A client can only blur itself by capturing the screen behind it through `wlr-screencopy`,
-  which is a dependency and a permission question rather than a missing feature.
-* **Nothing animates but the panel column.** The Dash, the spread and the quicklists hold no
-  clock and never tween; the tween engine exists and has one consumer.
-* **Quicklists draw no themed icons.** A menu icon given as a theme name is dropped; only
-  absolute paths are drawn. Tray menus, which name icons by theme, therefore show none.
+* **The Dash has no blur, and will not get one — it has opacity instead.** `hikari-sakura`
+  advertises no blur protocol of any kind, and a Wayland client cannot read the screen behind
+  itself, so there is nothing to bind and nothing to sample. What a client can control exactly
+  is how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
+  strip and the spread backdrop are painted at, written to the surface as given rather than
+  stacked out of translucent passes. At the default `1.0` nothing behind them bleeds through at
+  all. A screencopy self-blur remains possible in principle, but it is a dependency and a
+  permission question rather than a missing feature.
 * **Tray tooltips are not shown**, and `ToolTip` and `Category` are read off the wire and
   discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.
-* **Dynamic (Unity) quicklists are parsed and discarded.** Right-clicking a tile shows only the
-  desktop entry's static `Actions=`.
-* **A rejected sheet switch is silent.** `saberctl sheet N` and `pin N` report success as soon as
-  the request is queued, before the compositor has answered, so a refusal produces no message,
-  no revert and no log line.
+* **A rejected sheet switch cannot fail the command.** `saberctl sheet N` and `pin N` answer as
+  soon as the request is queued, because the socket is asynchronous and the reply arrives after
+  the control connection has been answered. A refusal is reported as a warning naming the reason,
+  not as an exit status.
 * **Window matching is by `app_id`.** Neither foreign-toplevel protocol carries a pid, so there
   is no authoritative process-to-window link available to any Wayland client. Saber tries five
   resolution rules and a launch-time window before falling back to a generic tile.
-* **Drag-and-drop onto tiles is written but unreachable.** The module compiles and links into the
-  binary and is constructed by nothing, so dropping a file on a tile does nothing at all. Tile
-  reordering by drag is likewise unimplemented — the model operation exists and has no caller.
+* **Tiles cannot be reordered by dragging them.** Dropping a *file* on a tile works and opens it
+  in that application; dragging a tile along the column to a new position does not. The model
+  operation that would move it exists and still has no caller.
 * **Sheet semantics leak through, deliberately.** On `hikari-sakura` a window's "minimised" bit
   means *"not on the sheet you are looking at"*, and sheet 0's windows are never hidden. Saber
   renders that asymmetry rather than smoothing it away.

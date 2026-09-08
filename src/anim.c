@@ -16,6 +16,7 @@ struct saber_clock {
   uint32_t last_raw;
   bool stamped;
   bool busy;
+  bool dormant; /* nothing was running at the last advance */
 };
 
 double
@@ -101,7 +102,13 @@ tween_begin(struct saber_tween *tween,
   tween->repeat = repeat;
   tween->running = true;
 
-  if (tween->duration_ms == 0 && !repeat) {
+  /* Action purpose: A zero-length cycle cannot repeat. Without this a repeating
+  tween started with duration 0 -- which is what `animation-ms = 0` produces --
+  stays running for ever, because saber_tween_advance answers `running = repeat`
+  on the zero-duration path. The clock is then permanently busy and its owner
+  repaints for ever: exactly the failure that once held a core for an hour
+  (D-036). A repeat of nothing lands on its target and stops. */
+  if (tween->duration_ms == 0) {
     tween->value = to;
     tween->running = false;
   }
@@ -148,11 +155,13 @@ saber_tween_advance(struct saber_tween *tween, int64_t now_ms)
     return false;
   }
 
+  /* Same reasoning as tween_begin: a cycle of no length is not an animation, so
+  it settles rather than repeating for ever. */
   if (tween->duration_ms <= 0) {
     tween->value = tween->to;
-    tween->running = tween->repeat;
+    tween->running = false;
 
-    return tween->running;
+    return false;
   }
 
   double elapsed = (double)(now_ms - tween->start_ms);
@@ -225,9 +234,21 @@ saber_clock_stamp(struct saber_clock *clock, uint32_t frame_ms)
   /* Action purpose: The first frame stamp is rebased onto wherever the clock
   already stood, so tweens started before any frame arrived -- a hover during
   the very first paint -- do not see the compositor's arbitrary epoch land on
-  them as one enormous elapsed time and finish instantly. */
-  if (!clock->stamped) {
+  them as one enormous elapsed time and finish instantly.
+
+  A clock whose loop has stopped is re-anchored the same way, and for the same
+  reason. While nothing runs no frames arrive, so now_ms stands still, but
+  base_ms goes on mapping the compositor's stamp onto the epoch of the first
+  frame ever seen -- the time this returns keeps pace with the wall clock. A
+  tween started during that gap is anchored to the frozen now_ms by
+  saber_clock_now, so it would see the whole gap as elapsed on its very first
+  frame: finished before it drew once, and finished without ever returning
+  true, so its owner never damages and the settled value is never painted.
+  Discarding the gap is what makes saber_clock_now a valid anchor again, and
+  costs nothing: no tween can observe time in which none of them ran. */
+  if (!clock->stamped || clock->dormant) {
     clock->stamped = true;
+    clock->dormant = false;
     clock->base_ms = clock->now_ms - (int64_t)frame_ms;
   } else if (frame_ms < clock->last_raw) {
     clock->base_ms += (int64_t)UINT32_MAX + 1;
@@ -250,7 +271,17 @@ saber_clock_advance(struct saber_clock *clock, int64_t now_ms)
     }
   }
 
+  /* Nothing is running, so this is the last frame the owner asks for: the next
+  stamp, whenever it comes, re-anchors rather than counting the gap. */
+  clock->dormant = !clock->busy;
+
   return clock->busy;
+}
+
+void
+saber_clock_reset(struct saber_clock *clock)
+{
+  clock->dormant = true;
 }
 
 int64_t

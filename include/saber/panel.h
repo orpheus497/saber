@@ -22,6 +22,7 @@ event to the right column is this module's job, not the caller's. */
 #include <saber/theme.h>
 #include <saber/toplevel.h>
 #include <saber/trash.h>
+#include <saber/unity.h>
 
 /* Everything a column draws from. All borrowed and all must outlive the panel
 set; any of the optional modules may be NULL, in which case its tile simply is
@@ -37,6 +38,10 @@ struct saber_panel_deps {
   struct saber_trash *trash;
   struct saber_devices *devices;
   struct saber_sni *sni;
+  /* The LauncherEntry state. Optional; when it is NULL an application's
+  right-click menu carries its static Actions= only, which is what every menu
+  carried before this was passed in. */
+  struct saber_unity *unity;
   /* Also how a folder-opening tile finds a real file manager: the entry
   carrying the FileManager category, else the one registered against
   inode/directory, both filtered so a terminal can never answer. NULL leaves
@@ -97,6 +102,64 @@ underneath a full-output overlay, with no way to reach it. Safe to call when
 nothing is open. */
 void
 saber_panels_close_menu(struct saber_panels *panels);
+
+/* Function purpose: Show or hide the launch-number legend, for
+`saberctl overlay on|off`.
+
+Unity drew these while Super was held. A Wayland client cannot watch a modifier
+it has no keyboard focus for, so the compositor drives it: bind the press and
+the release of the key to `overlay on` and `overlay off`. The numbers are the
+ones `saberctl launch N` already answers to. */
+void
+saber_panels_set_overlay(struct saber_panels *panels, bool on);
+
+/* Function purpose: Re-derive what the columns take from the configuration
+after it has been re-read, for `saberctl reload` and SIGHUP.
+
+Covers the render parameters, the column's width, the layout and the autohide
+state. It deliberately does NOT recreate surfaces: `panel { output }` decides
+which outputs carry a column and the `items { }` booleans decide which
+subsystems are constructed at all, and both are settled at startup. Those still
+need a restart, and `saberctl reload` says so rather than pretend otherwise. */
+void
+saber_panels_reload(struct saber_panels *panels);
+
+/* Function purpose: Show or hide every column, for `saberctl show` and `hide`.
+
+Works whatever `panel { autohide }` says: under `never` this is the only way to
+get the strip off the screen, and under `auto` it overrides the pressure state
+until the pointer next leaves the column. A hidden column reserves no space,
+draws nothing and takes no pointer input, so the windows behind it are reachable
+through it -- it is not unmapped, because a layer surface that unmaps and remaps
+has to be re-anchored and re-configured for nothing. */
+void
+saber_panels_set_visible(struct saber_panels *panels, bool visible);
+
+/* Returns the visibility afterwards -- what `saberctl toggle` reports. */
+bool
+saber_panels_toggle_visible(struct saber_panels *panels);
+
+/* True when any column is currently on screen. */
+bool
+saber_panels_visible(const struct saber_panels *panels);
+
+/* Function purpose: Whether a drop at this surface-local point would land on a
+tile that can open files, for the drag-and-drop layer's accept/reject feedback.
+Asked again on every motion event, so it does no more than a hit test. */
+bool
+saber_panels_accepts_drop(struct saber_panels *panels,
+    struct wl_surface *surface,
+    double x,
+    double y);
+
+/* Function purpose: Open the dropped URIs with the application whose tile they
+landed on. Returns whether a tile took them. */
+bool
+saber_panels_drop_at(struct saber_panels *panels,
+    struct wl_surface *surface,
+    double x,
+    double y,
+    const char *const *uris);
 
 /* Function purpose: Act on a click given in OUTPUT-local coordinates rather
 than panel-local ones, for the dash to hand on the press that dismissed it so

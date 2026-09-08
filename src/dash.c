@@ -31,6 +31,7 @@ keyboard on anyway. */
 #include <pango/pangocairo.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <saber/anim.h>
 #include <saber/dash.h>
 #include <saber/surface.h>
 
@@ -65,9 +66,6 @@ ultrawide handing the dash half the desktop. */
 #define DASH_STRIP_HEIGHT 46.0
 #define DASH_STRIP_ICON 22.0
 #define DASH_STRIP_GAP 10.0 /* grid to the category strip */
-
-/* Weight of the second backdrop pass; see dash_render. */
-#define DASH_BACKDROP_PASS 0.7
 
 /* Action purpose: A grid is only readable while the eye can find the start of
 the next row. Uncapped, a 3440px output lays twenty entries out as one line. */
@@ -197,6 +195,18 @@ struct saber_dash {
 
   saber_dash_dismissed_cb dismissed;
   void *dismissed_user;
+
+  /* Action purpose: The dash's own clock, driven from the surface layer's frame
+  hook. Both tweens are one-shot -- neither repeats -- so the loop settles by
+  itself and cannot pin a core the way an unbounded repeat did (D-036).
+  `reveal` runs once on show and slides the strip in from the panel's edge;
+  `hover_in`/`hover_out` fade a cell's highlight, with `fading` naming the cell
+  the pointer has just left. */
+  struct saber_clock *clock;
+  bool revealing; /* the open transition has been started for this mapping */
+  struct saber_tween reveal;
+  struct saber_tween hover_in, hover_out;
+  int fading;
 
   int columns, rows, visible_rows;
   double cell_width, cell_height;
@@ -595,6 +605,7 @@ dash_filter(struct saber_dash *dash)
 
   dash->selected = dash->results->len > 0 ? 0 : -1;
   dash->hovered = -1;
+  dash->fading = -1;
   dash->pressed = -1;
   dash->scroll = 0;
 
@@ -1050,14 +1061,33 @@ dash_draw_cell(struct saber_dash *dash,
   double w = dash->cell_width;
   double h = dash->cell_height;
 
-  if (index == dash->selected || index == dash->hovered) {
+  /* Action purpose: The highlight is a fade rather than a switch. `hover` is 1
+  for the cell the pointer is on, whatever the incoming tween has reached, and
+  the outgoing value for the cell it has just left -- so sweeping across the
+  grid leaves a trail that settles instead of a highlight that snaps from cell
+  to cell. The keyboard cursor is deliberately NOT faded: it moves one cell per
+  keypress and a trail behind it would read as lag. */
+  double hover = 0.0;
+
+  if (index == dash->hovered) {
+    hover = saber_tween_value(&dash->hover_in);
+  } else if (index == dash->fading) {
+    hover = saber_tween_value(&dash->hover_out);
+  }
+
+  bool selected = index == dash->selected;
+
+  if (selected || hover > 0.0) {
+    double fill = index == dash->pressed ? 0.55
+        : selected                       ? 0.38
+                                         : 0.18 * hover;
+    double edge = selected ? 1.0 : 0.5 * hover;
+
     rounded_rect(cr, x + 4.0, y + 4.0, w - 8.0, h - 8.0, DASH_RADIUS);
-    set_source_alpha(cr, &theme->accent,
-        index == dash->pressed ? 0.55 : (index == dash->selected ? 0.38
-                                                                 : 0.18));
+    set_source_alpha(cr, &theme->accent, fill);
     cairo_fill_preserve(cr);
 
-    set_source_alpha(cr, &theme->accent, index == dash->selected ? 1.0 : 0.5);
+    set_source_alpha(cr, &theme->accent, edge);
     cairo_set_line_width(cr, 1.5);
     cairo_stroke(cr);
   }
@@ -1167,21 +1197,47 @@ dash_render(void *data,
   cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
   cairo_paint(cr);
 
-  /* Action purpose: The dash rectangle itself: a palette fill, never a blur --
-  hikari does not advertise ext-background-effect and a client cannot read the
-  screen behind itself (BLUEPRINT.md 5.7). The background role is the panel
-  column's own and carries the user's opacity, laid down twice for the reason
-  the search field is: one pass of it over a bright desktop leaves the wallpaper
-  legible through the dash, and a backdrop that merely dimmed would do while the
-  dash covered the output but not beside an undimmed one. The overlay role goes
-  over the top for the dash's tint. */
+  /* Action purpose: The open transition -- the strip slides in from the edge it
+  is docked against and fades up as it arrives. Applied as a translation of
+  everything below rather than as a per-element offset, so nothing else in this
+  function has to know the dash animates at all.
+
+  The clear above happens BEFORE the translation, so the part of the surface the
+  strip has not reached yet stays transparent rather than being dragged along
+  with it. */
+  double reveal = saber_tween_value(&dash->reveal);
+
+  if (reveal < 1.0) {
+    bool docked_right = dash->deps.config != NULL &&
+        dash->deps.config->panel.edge == SABER_EDGE_RIGHT;
+    double slide = (1.0 - reveal) * dash->panel_width;
+
+    /* No save/restore: the context is created fresh for every frame and
+    destroyed at the end of it, and this function has early returns that a save
+    here would leave unbalanced. */
+    cairo_translate(cr, docked_right ? slide : -slide, 0.0);
+  }
+
+  /* Action purpose: The dash rectangle itself: a palette fill, never a blur.
+  hikari advertises no blur protocol and a client cannot read the screen behind
+  itself, so opacity is the substitute -- and it is laid down as ONE fill at
+  exactly the configured alpha rather than as several translucent passes.
+
+  Passes compound. Three of them turned a configured 0.92 into 0.997 on the
+  way to the screen, so the number in the file was not the number the compositor
+  blended with, and no setting could reach a true 1.0 however it was written.
+  A single fill under SOURCE writes the alpha as asked: 1.0 means nothing behind
+  the dash bleeds through, and every value below it is exactly the fraction of
+  the desktop the user chose to keep.
+
+  The operator is still SOURCE from the clear above, which is what makes the
+  write exact -- OVER here would blend against the alpha already in the buffer
+  and put the compounding straight back. */
   cairo_rectangle(cr, dash->panel_x, 0.0, dash->panel_width, (double)height);
-  saber_theme_set_source(cr, &theme->background);
+  cairo_set_source_rgba(cr, theme->overlay.r, theme->overlay.g,
+      theme->overlay.b, theme->overlay_opacity);
   cairo_fill_preserve(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-  cairo_fill_preserve(cr);
-  set_source_alpha(cr, &theme->overlay, DASH_BACKDROP_PASS);
-  cairo_fill_preserve(cr);
 
   /* The rectangle is the surface now, so this no longer keeps paint off a
   desktop beside it -- it keeps an over-long label or an over-wide cell inside
@@ -1246,6 +1302,12 @@ dash_render(void *data,
   cairo_restore(cr);
 }
 
+static int
+dash_anim_ms(const struct saber_dash *dash);
+
+static void
+dash_damage(struct saber_dash *dash);
+
 static void
 dash_configure(void *data,
     struct saber_surface *surface,
@@ -1260,6 +1322,18 @@ dash_configure(void *data,
   dash->height = height;
   dash_layout(dash);
   dash_reveal_selection(dash);
+
+  /* Action purpose: The open transition begins on the first configure, not at
+  saber_dash_show: the strip has no width to slide in from until the compositor
+  has answered, and starting the tween before that would run most of it against
+  a zero-width rectangle. `revealing` keeps it to the FIRST configure, so a
+  later resize does not replay it. */
+  if (!dash->revealing) {
+    dash->revealing = true;
+    saber_tween_start(&dash->reveal, 0.0, 1.0, dash_anim_ms(dash),
+        SABER_EASE_OUT_CUBIC, saber_clock_now(dash->clock));
+    dash_damage(dash);
+  }
 }
 
 static void
@@ -1270,8 +1344,37 @@ dash_surface_closed(void *data, struct saber_surface *surface)
   saber_dash_hide(data);
 }
 
+/* Function purpose: Advance the dash's clock on the compositor's frame timing.
+
+Same contract as the panel's: damaging from here asks for the next frame,
+returning without damaging lets the loop stop. Every tween on this clock is
+one-shot, so it always stops. */
+/* The configured duration, shared by both of the dash's tweens. 0 disables
+animation, which anim.c handles by landing a zero-length tween on its target
+without ever running it. */
+static int
+dash_anim_ms(const struct saber_dash *dash)
+{
+  return dash->deps.config != NULL ? dash->deps.config->panel.animation_ms : 0;
+}
+
+static void
+dash_frame(void *data, uint32_t time)
+{
+  struct saber_dash *dash = data;
+
+  if (dash->surface == NULL || dash->surface->closed) {
+    return;
+  }
+
+  if (saber_clock_advance(dash->clock, saber_clock_stamp(dash->clock, time))) {
+    saber_surface_damage(dash->surface);
+  }
+}
+
 static const struct saber_surface_listener dash_surface_listener = {
   .configure = dash_configure,
+  .frame = dash_frame,
   .render = dash_render,
   .closed = dash_surface_closed,
 };
@@ -1286,6 +1389,20 @@ dash_damage(struct saber_dash *dash)
 
 /* -------------------------------------------------------------- activation */
 
+/* A launch waiting on its activation token. The model and match are held
+directly rather than the dash, because the reply is asynchronous and the dash it
+came from may have been hidden -- and could in principle be destroyed -- before
+it arrives; these two outlive the dash by construction, being borrowed
+dependencies of the whole application. */
+struct dash_launch {
+  struct saber_model *model;
+  struct saber_match *match;
+  struct saber_appinfo *app; /* owned: one reference, released here */
+};
+
+static void
+dash_launch_with_token(const char *token, void *user);
+
 static void
 dash_launch(struct saber_dash *dash, int index)
 {
@@ -1296,27 +1413,60 @@ dash_launch(struct saber_dash *dash, int index)
   const struct dash_entry *entry = g_ptr_array_index(dash->results, index);
   struct saber_appinfo *app = saber_appinfo_ref(entry->app);
 
-  /* Action purpose: The dash is dismissed BEFORE the launch is recorded and
-  after the fork, so the desktop is uncovered the moment the click lands rather
-  than when the child finishes starting. */
-  if (!saber_appinfo_launch(app, NULL, NULL, NULL)) {
+  /* Action purpose: Ask for an activation token first, and start the
+  application from the answer. The dash is the primary launcher and used to pass
+  no token at all, so everything opened from it arrived unfocused and had to be
+  clicked -- which is the opposite of what a launcher is for. The request is
+  answered on the compositor's reply or on a one-second timeout, and a NULL
+  token still launches. */
+  struct dash_launch *pending = g_new0(struct dash_launch, 1);
+
+  pending->model = dash->deps.model;
+  pending->match = dash->deps.match;
+  pending->app = app;
+
+  /* Dismissed before the token arrives, not after: the desktop is uncovered the
+  moment the click lands rather than a round trip later. */
+  struct wl_surface *surface =
+      dash->surface != NULL ? dash->surface->wl_surface : NULL;
+
+  saber_display_request_activation(dash->deps.display, surface, app->id,
+      dash_launch_with_token, pending);
+
+  saber_dash_hide(dash);
+
+  return;
+}
+
+/* Function purpose: Finish a dash launch once the activation token is in hand.
+Takes ownership of the reference held for it, so it runs exactly once whichever
+way the request was answered. */
+static void
+dash_launch_with_token(const char *token, void *user)
+{
+  struct dash_launch *pending = user;
+  struct saber_model *model = pending->model;
+  struct saber_match *match = pending->match;
+  struct saber_appinfo *app = pending->app;
+
+  g_free(pending);
+
+  if (!saber_appinfo_launch(app, NULL, NULL, token)) {
     g_warning("saber: failed to launch '%s'", app->id);
     saber_appinfo_unref(app);
 
     return;
   }
 
-  saber_dash_hide(dash);
-
   /* Action purpose: The launch window is what binds the new window to its tile
   -- neither foreign-toplevel protocol carries a pid, so a launch this process
   did not record is a window with no application. The model's form notes it
   through match.c and throbs the tile; match.c alone is the fallback when the
   dash was built without one. */
-  if (dash->deps.model != NULL) {
-    saber_model_note_launch(dash->deps.model, app->id);
-  } else if (dash->deps.match != NULL) {
-    saber_match_note_launch(dash->deps.match, app->id);
+  if (model != NULL) {
+    saber_model_note_launch(model, app->id);
+  } else if (match != NULL) {
+    saber_match_note_launch(match, app->id);
   }
 
   saber_appinfo_unref(app);
@@ -1338,6 +1488,27 @@ dash_set_hover(struct saber_dash *dash, double x, double y)
 
   if (dash->hovered == cell && dash->chip_hovered == chip) {
     return;
+  }
+
+  /* Action purpose: A cross-fade, the panel's shape: the cell being left fades
+  out from wherever the incoming fade had reached, so a pointer swept along the
+  grid leaves a trail that settles rather than a highlight that snaps. */
+  int64_t now = saber_clock_now(dash->clock);
+  int duration = dash_anim_ms(dash);
+
+  dash->fading = dash->hovered;
+
+  if (dash->fading >= 0) {
+    saber_tween_start(&dash->hover_out, saber_tween_value(&dash->hover_in), 0.0,
+        duration, SABER_EASE_OUT_CUBIC, now);
+  }
+
+  if (cell >= 0) {
+    saber_tween_start(&dash->hover_in, 0.0, 1.0, duration, SABER_EASE_OUT_CUBIC,
+        now);
+  } else {
+    saber_tween_stop(&dash->hover_in);
+    dash->hover_in.value = 0.0;
   }
 
   dash->hovered = cell;
@@ -1964,6 +2135,14 @@ saber_dash_create(const struct saber_dash_deps *deps)
   dash->columns = 1;
   dash->visible_rows = 1;
 
+  dash->clock = saber_clock_create();
+  saber_tween_init(&dash->reveal, 1.0);
+  saber_tween_init(&dash->hover_in, 0.0);
+  saber_tween_init(&dash->hover_out, 0.0);
+  saber_clock_add(dash->clock, &dash->reveal);
+  saber_clock_add(dash->clock, &dash->hover_in);
+  saber_clock_add(dash->clock, &dash->hover_out);
+
   dash->font = pango_font_description_from_string(DASH_FONT);
   dash->search_font = pango_font_description_from_string(DASH_SEARCH_FONT);
   dash->chip_font = pango_font_description_from_string(DASH_CHIP_FONT);
@@ -2000,6 +2179,8 @@ saber_dash_destroy(struct saber_dash *dash)
   g_ptr_array_unref(dash->entries);
   g_array_unref(dash->chips);
   g_string_free(dash->query, TRUE);
+
+  saber_clock_destroy(dash->clock);
 
   pango_font_description_free(dash->font);
   pango_font_description_free(dash->search_font);
@@ -2155,6 +2336,15 @@ saber_dash_hide(struct saber_dash *dash)
   dash->pointer_y = -1.0;
   dash->bar_dragging = false;
   dash->pressed_outside = false;
+  dash->revealing = false;
+  dash->fading = -1;
+  saber_tween_stop(&dash->reveal);
+  dash->reveal.value = 1.0;
+  saber_tween_stop(&dash->hover_in);
+  dash->hover_in.value = 0.0;
+  saber_tween_stop(&dash->hover_out);
+  dash->hover_out.value = 0.0;
+  saber_clock_reset(dash->clock);
   dash->scroll = 0;
   saber_scroll_reset(&dash->scroll_accum);
   dash->hiding = false;

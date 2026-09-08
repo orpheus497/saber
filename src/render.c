@@ -44,6 +44,13 @@ struct icon_dir {
   char *path; /* absolute: <base>/<theme>/<subdir> */
   int size, min, max, threshold;
   int type; /* 0 fixed, 1 scalable, 2 threshold */
+
+  /* Which theme this directory belongs to, counted in search order: the user's
+  theme is 0, its parents follow, then Adwaita, then hicolor. Directories are
+  appended before inheritance recurses, so this is monotonic. It exists because
+  the size match is only meaningful WITHIN a theme -- see
+  icon_candidate_compare. */
+  int theme_order;
 };
 
 struct icon_candidate {
@@ -56,6 +63,7 @@ struct saber_icons {
   GPtrArray *dirs;      /* struct icon_dir *, in theme search order */
   GPtrArray *fallbacks; /* char * flat directories: pixmaps */
   GHashTable *cache;    /* "name@size" -> cairo_surface_t *, NULL for a miss */
+  int theme_seq;        /* next value for icon_dir.theme_order */
   bool scanned;
 };
 
@@ -227,6 +235,11 @@ icon_collect_theme(struct saber_icons *icons,
   char **subdirs =
       g_key_file_get_string_list(keys, "Icon Theme", "Directories", &count, NULL);
 
+  /* Taken once for the whole theme, before its parents are walked, so every
+  directory this theme contributes shares one rank and sorts ahead of every
+  directory its parents contribute. */
+  int theme_order = icons->theme_seq++;
+
   for (gsize i = 0; subdirs != NULL && i < count; i++) {
     const char *sub = g_strstrip(subdirs[i]);
     int size = g_key_file_get_integer(keys, sub, "Size", NULL);
@@ -259,6 +272,7 @@ icon_collect_theme(struct saber_icons *icons,
       dir->type = g_strcmp0(type, "Scalable") == 0 ? 1
           : g_strcmp0(type, "Fixed") == 0          ? 0
                                                    : 2;
+      dir->theme_order = theme_order;
 
       g_ptr_array_add(icons->dirs, dir);
     }
@@ -376,11 +390,25 @@ icon_dir_distance(const struct icon_dir *dir, int want)
   }
 }
 
+/* Function purpose: Order the directories an icon name might be found in.
+
+Theme position first, size second -- which is the way round the icon theme
+specification requires and the reverse of what this did. Sorting on size first
+let any theme in the search path win a name outright whenever it happened to
+ship an exactly-matching fixed size, so a user's chosen theme lost icons to
+Adwaita or hicolor one at a time and the column came out visibly mixed. The
+specification is explicit that the current theme and its parents are exhausted
+before a fallback is considered; size is how you choose between directories
+*within* a theme, not between themes. */
 static int
 icon_candidate_compare(gconstpointer a, gconstpointer b)
 {
   const struct icon_candidate *left = a;
   const struct icon_candidate *right = b;
+
+  if (left->dir->theme_order != right->dir->theme_order) {
+    return left->dir->theme_order - right->dir->theme_order;
+  }
 
   if (left->distance != right->distance) {
     return left->distance - right->distance;
@@ -764,6 +792,107 @@ edge_is_left(const struct saber_render *render)
   return render->edge == SABER_EDGE_LEFT;
 }
 
+/* Function purpose: The colour an icon reads as, for `theme { backlight =
+dominant }`.
+
+An average weighted by saturation rather than a true dominant-cluster search: a
+histogram over a 48-pixel icon has too few samples per bucket to be stable, and
+the answer wanted here is "what colour is this icon", which the saturated pixels
+carry and the greys dilute. Weighting by saturation stops a mostly-grey icon
+with one coloured mark washing out to grey, which is the case a plain mean gets
+wrong.
+
+Returns false when there is nothing to sample or the result carries no colour at
+all, so the caller falls back to the palette rather than tinting with a grey
+that looks like a mistake. */
+static bool
+icon_dominant_color(cairo_surface_t *icon, struct saber_color *out)
+{
+  if (icon == NULL ||
+      cairo_surface_get_type(icon) != CAIRO_SURFACE_TYPE_IMAGE) {
+    return false;
+  }
+
+  cairo_format_t format = cairo_image_surface_get_format(icon);
+
+  if (format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) {
+    return false;
+  }
+
+  cairo_surface_flush(icon);
+
+  const unsigned char *data = cairo_image_surface_get_data(icon);
+
+  if (data == NULL) {
+    return false;
+  }
+
+  int width = cairo_image_surface_get_width(icon);
+  int height = cairo_image_surface_get_height(icon);
+  int stride = cairo_image_surface_get_stride(icon);
+
+  if (width <= 0 || height <= 0) {
+    return false;
+  }
+
+  double sum_r = 0.0;
+  double sum_g = 0.0;
+  double sum_b = 0.0;
+  double weight_total = 0.0;
+
+  /* Action purpose: At most 32 rows and 32 columns are sampled. An icon is
+  drawn at device scale and can be 192px square on a HiDPI output; walking every
+  pixel of every tile on every repaint is a cost the panel pays permanently, and
+  a grid this size answers the same question. */
+  int step_x = width > 32 ? width / 32 : 1;
+  int step_y = height > 32 ? height / 32 : 1;
+
+  for (int y = 0; y < height; y += step_y) {
+    const uint32_t *row = (const uint32_t *)(const void *)(data + y * stride);
+
+    for (int x = 0; x < width; x += step_x) {
+      uint32_t pixel = row[x];
+      double a = (double)((pixel >> 24) & 0xFFu) / 255.0;
+
+      if (format == CAIRO_FORMAT_RGB24) {
+        a = 1.0;
+      } else if (a <= 0.0) {
+        continue;
+      }
+
+      /* Cairo's ARGB32 is premultiplied, so undo it before comparing channels;
+      a premultiplied pixel's saturation is a function of its alpha. */
+      double r = (double)((pixel >> 16) & 0xFFu) / 255.0 / a;
+      double g = (double)((pixel >> 8) & 0xFFu) / 255.0 / a;
+      double b = (double)(pixel & 0xFFu) / 255.0 / a;
+
+      r = MIN(r, 1.0);
+      g = MIN(g, 1.0);
+      b = MIN(b, 1.0);
+
+      double hi = MAX(r, MAX(g, b));
+      double lo = MIN(r, MIN(g, b));
+      double weight = a * (hi - lo);
+
+      sum_r += r * weight;
+      sum_g += g * weight;
+      sum_b += b * weight;
+      weight_total += weight;
+    }
+  }
+
+  if (weight_total <= 0.0001) {
+    return false;
+  }
+
+  out->r = sum_r / weight_total;
+  out->g = sum_g / weight_total;
+  out->b = sum_b / weight_total;
+  out->a = 1.0;
+
+  return true;
+}
+
 static void
 draw_backlight(const struct saber_render *render,
     cairo_t *cr,
@@ -777,13 +906,24 @@ draw_backlight(const struct saber_render *render,
   double inset = tile->width * SABER_BACKLIGHT_INSET;
   double radius = tile->width * SABER_BACKLIGHT_RADIUS;
 
-  /* Action purpose: `dominant` would tint the fill to the icon's own dominant
-  colour. Until that analysis exists it renders as `palette`, which is a
-  correct-looking panel rather than a missing signifier. */
   const struct saber_color *color =
       render->config->theme.backlight == SABER_BACKLIGHT_OFF
       ? &render->theme->dim
       : &render->theme->backlight;
+
+  /* Action purpose: `dominant` tints the fill to the icon's own colour, as
+  Unity did, which makes the backlight read as belonging to the application
+  rather than to the panel. Falls back to the palette colour
+  whenever the icon cannot be sampled -- there is no surface, it is not an image
+  surface, or it is monochrome -- so a failed sample looks like the other mode
+  rather than like a bug. */
+  struct saber_color sampled;
+
+  if (render->config->theme.backlight == SABER_BACKLIGHT_DOMINANT &&
+      icon_dominant_color(tile->icon, &sampled)) {
+    sampled.a = color->a;
+    color = &sampled;
+  }
 
   rounded_rect(cr, tile->x + inset, tile->y + inset, tile->width - inset * 2.0,
       tile->height - inset * 2.0, radius);
@@ -873,6 +1013,39 @@ draw_badge(const struct saber_render *render,
   }
 
   draw_text(cr, cx, cy, radius * 1.15, text, &render->theme->badge_fg, true);
+}
+
+/* Function purpose: Draw the launch number over a tile while the overlay is up.
+
+Unity showed these while Super was held. A Wayland client cannot watch a
+modifier it does not have keyboard focus for, so the compositor drives it
+instead through `saberctl overlay on|off` bound to the press and release of the
+key -- and this is what that switch turns on. The number is the one
+`saberctl launch N` answers to, so the overlay is a legend for a binding the
+user already has rather than a second, parallel numbering. */
+static void
+draw_overlay_number(const struct saber_render *render,
+    cairo_t *cr,
+    const struct saber_tile *tile)
+{
+  if (tile->overlay_number <= 0) {
+    return;
+  }
+
+  /* Action purpose: A scrim over the whole tile, not a corner disc. The number
+  has to be legible against whatever icon is underneath it, and every icon on
+  the column is a different colour. */
+  cairo_rectangle(cr, tile->x, tile->y, tile->width, tile->height);
+  set_source(cr, &render->theme->overlay, 0.72);
+  cairo_fill(cr);
+
+  char text[4];
+
+  /* Ten is drawn as 0, matching the key it is reached by. */
+  snprintf(text, sizeof(text), "%d", tile->overlay_number % 10);
+
+  draw_text(cr, tile->x + tile->width / 2.0, tile->y + tile->height / 2.0,
+      tile->height * 0.5, text, &render->theme->foreground, true);
 }
 
 static void
@@ -1018,6 +1191,10 @@ saber_render_tile(const struct saber_render *render,
 
   draw_progress(render, cr, tile);
   draw_badge(render, cr, tile);
+
+  /* Last, over everything else: it is a legend the user is reading right now,
+  and a pip or a badge showing through it would only make it harder to read. */
+  draw_overlay_number(render, cr, tile);
 
   cairo_restore(cr);
 }

@@ -6,9 +6,12 @@ held, the action is reported unavailable and the panel hides it. */
 #include <stdbool.h>
 #include <string.h>
 
+#include <errno.h>
+#include <fcntl.h> /* O_CLOEXEC, for the exec-failure pipe in spawn() */
 #include <grp.h>
 #include <limits.h>
 #include <sys/types.h>
+#include <sys/wait.h> /* WIFEXITED and friends, for the child-exit report */
 #include <unistd.h>
 
 #include <gio/gio.h>
@@ -179,35 +182,117 @@ saber_session_available(const struct saber_config *config,
   }
 }
 
+/* Function purpose: Report a session command that failed, and free the pid.
+
+The status used to be discarded, which made every failure silent: spawn()
+returns as soon as fork() succeeds, so a missing or non-executable binary became
+_exit(127) in the child and nothing anywhere. A menu entry that appears to do
+nothing is the worst possible outcome for suspend or shut down, because the user
+cannot tell it from the command having worked and the machine having declined.
+
+Every status reaching here is the command's own. A failed execv never gets this
+far -- spawn() detects it through its error pipe and reports it as an error to
+the caller -- so 127 is treated as the ordinary exit status it is. Reading it as
+"could not execute" was wrong for any command that genuinely chose it, which for
+a configured override is an entirely reasonable thing to do.
+
+`data` carries the action's id, a static string from saber_session_action_id, so
+there is nothing to free here. */
 static void
 on_child_exit(GPid pid, gint status, gpointer data)
 {
-  (void)status;
-  (void)data;
+  const char *action = data != NULL ? data : "session command";
+
+  if (WIFEXITED(status)) {
+    int code = WEXITSTATUS(status);
+
+    if (code != 0) {
+      g_warning("saber: %s: exited with status %d", action, code);
+    }
+  } else if (WIFSIGNALED(status)) {
+    g_warning("saber: %s: killed by signal %d", action, WTERMSIG(status));
+  }
 
   g_spawn_close_pid(pid);
 }
 
 /* Function purpose: Start a detached child. setsid() puts the command in its own
 session so that a shutdown already in flight is not taken down with the panel it
-was invoked from. */
+was invoked from.
+
+A close-on-exec pipe carries the one thing the exit status cannot say. The child
+writes its errno if execv fails and nothing at all if it succeeds, because a
+successful exec closes the descriptor for it -- so a read of zero bytes means
+the command is running and a read of an int means it never started. Without it
+the child's _exit(127) was the only signal available, and 127 is a status a real
+command may choose for itself; a `session { }` override exiting 127 was reported
+as an execution failure it had nothing to do with.
+
+The read is bounded whatever happens: the child reaches either execv or the
+write within microseconds of the fork, and both ends of the pipe are closed on
+every path out of here. */
 static bool
-spawn(char *const *argv, GError **error)
+spawn(char *const *argv, const char *action, GError **error)
 {
+  int fds[2];
+
+  if (pipe2(fds, O_CLOEXEC) < 0) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "pipe failed");
+    return false;
+  }
+
   pid_t pid = fork();
 
   if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
     g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "fork failed");
     return false;
   }
 
   if (pid == 0) {
+    close(fds[0]);
     setsid();
     execv(argv[0], argv);
+
+    /* The write is the whole point of the child's remaining life; there is
+    nobody left to report a short one to, so its result is discarded. */
+    int failure = errno;
+    ssize_t written = write(fds[1], &failure, sizeof(failure));
+
+    (void)written;
     _exit(127);
   }
 
-  g_child_watch_add((GPid)pid, on_child_exit, NULL);
+  close(fds[1]);
+
+  int failure = 0;
+  ssize_t got;
+
+  do {
+    got = read(fds[0], &failure, sizeof(failure));
+  } while (got < 0 && errno == EINTR);
+
+  close(fds[0]);
+
+  if (got == (ssize_t)sizeof(failure)) {
+    /* The command never ran, so the child is reaped here rather than handed to
+    a watch that would report an exit status it never chose. */
+    int status;
+
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+      /* retry */
+    }
+
+    g_set_error(error, G_IO_ERROR, g_io_error_from_errno(failure), "%s: %s",
+        argv[0], g_strerror(failure));
+
+    return false;
+  }
+
+  /* The id is a static string, so it can be handed over without a copy and
+  needs no destroy notify. */
+  g_child_watch_add((GPid)pid, on_child_exit, (gpointer)action);
 
   return true;
 }
@@ -250,7 +335,7 @@ saber_session_run(const struct saber_config *config,
     } else {
       g_free(argv[0]);
       argv[0] = resolved;
-      ok = spawn(argv, error);
+      ok = spawn(argv, saber_session_action_id(action), error);
     }
 
     g_strfreev(argv);
@@ -268,5 +353,20 @@ saber_session_run(const struct saber_config *config,
     return false;
   }
 
-  return spawn((char *const *)builtin, error);
+  /* Action purpose: The override path resolves through PATH and so discovers a
+  missing command before forking; the built-ins are absolute paths and had no
+  equivalent check, so a base system without them produced a fork, an execv
+  failure and nothing else. Checked here so the failure is an error the caller
+  can show rather than a warning after the fact. */
+  if (!g_file_test(builtin[0], G_FILE_TEST_IS_EXECUTABLE)) {
+    g_set_error(error,
+        G_IO_ERROR,
+        G_IO_ERROR_NOT_FOUND,
+        "%s: %s is missing or not executable",
+        saber_session_action_id(action),
+        builtin[0]);
+    return false;
+  }
+
+  return spawn((char *const *)builtin, saber_session_action_id(action), error);
 }

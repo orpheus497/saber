@@ -32,7 +32,7 @@ usage(FILE *stream)
       "commands:\n"
       "  dash                  toggle the application grid\n"
       "  spread [app_id]       toggle the window spread, optionally filtered\n"
-      "  launch <1-9>          launch or focus favourite N\n"
+      "  launch <1-10>         launch or focus favourite N\n"
       "  overlay <on|off>      the hold-Super number overlay\n"
       "  show                  reveal the panel\n"
       "  hide                  conceal the panel\n"

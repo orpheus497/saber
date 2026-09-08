@@ -22,9 +22,11 @@ paint somebody else's menu in Saber's own theme. */
 #include <pango/pangocairo.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <saber/anim.h>
 #include <saber/dbusmenu.h>
 #include <saber/display.h>
 #include <saber/quicklist.h>
+#include <saber/render.h>
 
 #define QL_PAD_X 10
 #define QL_PAD_Y 4
@@ -118,6 +120,14 @@ struct ql_level {
   /* Cancelled by level_destroy before anything is freed, so a reply in flight
   has something safe to ask about a level that may no longer exist. */
   GCancellable *cancellable;
+
+  /* Action purpose: One tween, one-shot: the level's contents fade up as it
+  opens, so a submenu appearing under the pointer reads as arriving rather than
+  as the screen changing between two frames. The ROW highlight deliberately does
+  not fade -- a menu highlight that lags the pointer reads as the menu being
+  slow, and every desktop menu snaps it. */
+  struct saber_clock *clock;
+  struct saber_tween reveal;
 };
 
 struct ql_window {
@@ -127,6 +137,8 @@ struct ql_window {
 
 struct saber_quicklist {
   struct saber_display *display;
+  /* Borrowed. NULL means a themed icon name does not resolve. */
+  struct saber_icons *icons;
   struct saber_surface *parent;
   enum saber_edge edge;
   struct saber_theme theme;
@@ -156,6 +168,10 @@ struct saber_quicklist {
   struct saber_quicklist_handlers handlers;
   void *user;
 
+  /* The configured animation duration, copied because the menu outlives the
+  params it was opened from. 0 means animation is switched off. */
+  int config_anim_ms;
+
   struct ql_level *pointer_level;
   /* The pointer's last row-local position, kept so a scroll can re-resolve the
   hover without waiting for the pointer to move. */
@@ -179,6 +195,27 @@ level_create(struct saber_quicklist *ql,
     int32_t anchor_y,
     int32_t anchor_width,
     int32_t anchor_height);
+
+/* A desktop action waiting on its activation token. Everything it needs is
+copied, because the menu that asked for it is closed before the reply lands. */
+struct ql_action_launch {
+  struct saber_appinfo *app; /* owned */
+  char *action_id;           /* owned */
+};
+
+static void
+ql_action_with_token(const char *token, void *user)
+{
+  struct ql_action_launch *pending = user;
+
+  if (!saber_appinfo_launch(pending->app, pending->action_id, NULL, token)) {
+    g_warning("saber: failed to run action '%s'", pending->action_id);
+  }
+
+  saber_appinfo_unref(pending->app);
+  g_free(pending->action_id);
+  g_free(pending);
+}
 
 /* Icons ------------------------------------------------------------------ */
 
@@ -250,14 +287,35 @@ icon_from_data(const uint8_t *data, size_t length)
   return surface;
 }
 
-/* Action purpose: Only an absolute path is resolved. Icon-theme name lookup is
-a panel-wide concern that belongs in the shared icon module, not in three
-private copies; until that exists a themed name draws nothing rather than
-something wrong. */
+/* Function purpose: Resolve a menu row's icon, whether it is named by theme or
+given as an absolute path.
+
+Themed names used to be dropped outright, on the reasoning that theme lookup
+belonged in a shared module rather than in a third private copy. That module
+exists and is passed in now. The distinction matters because the DBusMenu
+specification names icons by THEME, so a tray application's menu is exactly the
+case that drew none of its icons.
+
+The shared resolver handles absolute paths too, so it is tried first and the
+local loader is the fallback for when no resolver was supplied. */
 static cairo_surface_t *
-icon_from_name(const char *name)
+icon_from_name(struct saber_icons *icons, const char *name)
 {
-  if (name == NULL || name[0] == '\0' || !g_path_is_absolute(name)) {
+  if (name == NULL || name[0] == '\0') {
+    return NULL;
+  }
+
+  if (icons != NULL) {
+    /* Owned by the cache, so it is referenced rather than adopted -- entry_free
+    unconditionally destroys what it holds. */
+    cairo_surface_t *shared = saber_icons_lookup(icons, name, QL_ICON * 2);
+
+    if (shared != NULL) {
+      return cairo_surface_reference(shared);
+    }
+  }
+
+  if (!g_path_is_absolute(name)) {
     return NULL;
   }
 
@@ -320,7 +378,9 @@ entries_divide(GPtrArray *entries, bool *pending)
 }
 
 static void
-entries_add_dbusmenu(GPtrArray *entries, const struct saber_dbusmenu_item *item)
+entries_add_dbusmenu(GPtrArray *entries,
+    const struct saber_dbusmenu_item *item,
+    struct saber_icons *icons)
 {
   if (!item->visible) {
     return;
@@ -342,19 +402,20 @@ entries_add_dbusmenu(GPtrArray *entries, const struct saber_dbusmenu_item *item)
   entry->icon = icon_from_data(item->icon_data, item->icon_data_len);
 
   if (entry->icon == NULL) {
-    entry->icon = icon_from_name(item->icon_name);
+    entry->icon = icon_from_name(icons, item->icon_name);
   }
 }
 
 /* Function purpose: Build one level's rows from a DBusMenu item's children,
 which is the only shape a submenu ever has. */
 static GPtrArray *
-entries_from_children(const struct saber_dbusmenu_item *item)
+entries_from_children(const struct saber_dbusmenu_item *item,
+    struct saber_icons *icons)
 {
   GPtrArray *entries = g_ptr_array_new_with_free_func(entry_free);
 
   for (guint i = 0; item->children != NULL && i < item->children->len; i++) {
-    entries_add_dbusmenu(entries, g_ptr_array_index(item->children, i));
+    entries_add_dbusmenu(entries, g_ptr_array_index(item->children, i), icons);
   }
 
   return entries;
@@ -371,7 +432,8 @@ quicklist_compose(struct saber_quicklist *ql)
 
   if (root != NULL && root->children != NULL) {
     for (guint i = 0; i < root->children->len; i++) {
-      entries_add_dbusmenu(entries, g_ptr_array_index(root->children, i));
+      entries_add_dbusmenu(entries, g_ptr_array_index(root->children, i),
+          ql->icons);
     }
 
     divide = entries->len > 0;
@@ -385,7 +447,7 @@ quicklist_compose(struct saber_quicklist *ql)
     struct ql_entry *entry = entry_new(entries, QL_ACTION,
         action->name != NULL ? action->name : action->id);
     entry->action_id = g_strdup(action->id);
-    entry->icon = icon_from_name(action->icon);
+    entry->icon = icon_from_name(ql->icons, action->icon);
   }
 
   divide = divide || entries->len > 0;
@@ -619,6 +681,20 @@ level_render(void *data,
   (void)popup;
 
   struct ql_level *level = data;
+
+  /* Action purpose: The whole level is drawn into a group and composited at the
+  reveal tween's alpha, so it fades up as one thing. Compositing once at the end
+  rather than scaling every colour keeps the rows, icons and text in step, and
+  keeps every other draw below ignorant of the fact that the menu animates.
+
+  Balanced by the pop at the end of the function, which is safe because this
+  function has no early return. */
+  double reveal = saber_tween_value(&level->reveal);
+  bool grouped = reveal < 1.0;
+
+  if (grouped) {
+    cairo_push_group(cr);
+  }
   const struct saber_theme *theme = &level->ql->theme;
 
   saber_theme_set_source(cr, &theme->background);
@@ -711,6 +787,10 @@ level_render(void *data,
 
   g_object_unref(layout);
   cairo_restore(cr);
+  if (grouped) {
+    cairo_pop_group_to_source(cr);
+    cairo_paint_with_alpha(cr, reveal);
+  }
 }
 
 /* Levels ----------------------------------------------------------------- */
@@ -802,6 +882,7 @@ level_destroy(struct ql_level *level)
   }
 
   saber_popup_destroy(level->popup);
+  saber_clock_destroy(level->clock);
   g_ptr_array_unref(level->entries);
   g_free(level);
 }
@@ -855,8 +936,33 @@ level_done(void *data, struct saber_popup *popup)
   saber_quicklist_close(ql);
 }
 
+static int
+ql_anim_ms(const struct saber_quicklist *ql)
+{
+  return ql != NULL && ql->config_anim_ms > 0 ? ql->config_anim_ms : 0;
+}
+
+/* Function purpose: Advance a level's clock on the compositor's frame timing.
+Damaging from here asks for the next frame; returning without damaging lets the
+loop stop. The one tween on this clock is one-shot, so it always stops. */
+static void
+level_frame(void *data, uint32_t time)
+{
+  struct ql_level *level = data;
+
+  if (level->popup == NULL) {
+    return;
+  }
+
+  if (saber_clock_advance(level->clock,
+          saber_clock_stamp(level->clock, time))) {
+    saber_popup_damage(level->popup);
+  }
+}
+
 static const struct saber_popup_listener level_popup_listener = {
   .configure = level_configure,
+  .frame = level_frame,
   .render = level_render,
   .done = level_done,
 };
@@ -876,6 +982,11 @@ level_create(struct saber_quicklist *ql,
   level->parent = parent;
   level->entries = entries;
   level->hovered = -1;
+  level->clock = saber_clock_create();
+  saber_tween_init(&level->reveal, 1.0);
+  saber_clock_add(level->clock, &level->reveal);
+  saber_tween_start(&level->reveal, 0.0, 1.0, ql_anim_ms(ql),
+      SABER_EASE_OUT_CUBIC, 0);
   level->selected = -1;
   level->open = -1;
   level->cancellable = g_cancellable_new();
@@ -904,6 +1015,11 @@ level_create(struct saber_quicklist *ql,
 
   if (level->popup == NULL) {
     g_object_unref(level->cancellable);
+    /* The clock was created and had the reveal tween registered on it before
+    the popup was asked for, so this path owns it exactly as level_destroy
+    does. Without it the clock and its tween array leak on every menu the
+    compositor declines to map. */
+    saber_clock_destroy(level->clock);
     g_ptr_array_unref(entries);
     g_free(level);
     return NULL;
@@ -980,7 +1096,7 @@ submenu_apply(struct ql_submenu_request *request,
 {
   struct ql_level *level = request->level;
   GPtrArray *entries = item != NULL
-      ? entries_from_children(item)
+      ? entries_from_children(item, level->ql->icons)
       : g_ptr_array_new_with_free_func(entry_free);
 
   if (level->child != NULL) {
@@ -1087,7 +1203,7 @@ level_open_submenu(struct ql_level *level, int index)
   const struct saber_dbusmenu_item *item =
       saber_dbusmenu_find(ql->menu, entry->dbusmenu_id);
   GPtrArray *entries = item != NULL
-      ? entries_from_children(item)
+      ? entries_from_children(item, level->ql->icons)
       : g_ptr_array_new_with_free_func(entry_free);
 
   if (entries->len > 0) {
@@ -1132,7 +1248,18 @@ level_activate(struct ql_level *level, int index)
   if (entry->kind == QL_DBUSMENU) {
     saber_dbusmenu_event(ql->menu, entry->dbusmenu_id);
   } else if (entry->kind == QL_ACTION && ql->app != NULL) {
-    saber_appinfo_launch(ql->app, entry->action_id, NULL, NULL);
+    /* Action purpose: With an activation token, so a desktop action's window
+    raises itself instead of arriving urgent and needing a second click. The
+    reply is asynchronous and the menu is about to be torn down, so the request
+    carries its own copy of everything it needs. */
+    struct ql_action_launch *pending = g_new0(struct ql_action_launch, 1);
+
+    pending->app = saber_appinfo_ref(ql->app);
+    pending->action_id = g_strdup(entry->action_id);
+
+    saber_display_request_activation(ql->display,
+        ql->parent != NULL ? ql->parent->wl_surface : NULL, ql->app->id,
+        ql_action_with_token, pending);
   }
 
   /* Action purpose: The owner's callbacks are invoked after the menu is gone,
@@ -1631,6 +1758,8 @@ saber_quicklist_open(const struct saber_quicklist_params *params,
   struct saber_quicklist *ql = g_new0(struct saber_quicklist, 1);
 
   ql->display = params->parent->display;
+  ql->icons = params->icons;
+  ql->config_anim_ms = params->animation_ms;
   ql->parent = params->parent;
   ql->edge = params->edge;
   ql->user = user;
@@ -1650,7 +1779,7 @@ saber_quicklist_open(const struct saber_quicklist_params *params,
   if (params->theme != NULL) {
     ql->theme = *params->theme;
   } else {
-    saber_theme_init(&ql->theme, NULL, 1.0);
+    saber_theme_init(&ql->theme, NULL, 1.0, 1.0);
   }
 
   if (params->app != NULL) {

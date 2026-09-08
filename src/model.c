@@ -375,6 +375,46 @@ saber_model_set_focus(struct saber_model *model, void *handle)
   notify(model);
 }
 
+/* Function purpose: Clear the launching flag on any tile whose launch window
+has closed, and say whether anything changed.
+
+`launching` was set from four places and cleared in exactly one -- when a window
+turned up carrying a matching app_id. An application that fails to start, or one
+whose window never resolves to the tile that launched it, therefore stayed
+marked as launching for the rest of the session. match.c already knows when a
+launch has expired, because the same window bounds the app_id matching it does;
+this is the reader that function never had.
+
+Returns whether anything changed so the caller can avoid a repaint that would
+draw exactly what is already on screen. */
+bool
+saber_model_expire_launches(struct saber_model *model)
+{
+  if (model == NULL) {
+    return false;
+  }
+
+  bool changed = false;
+
+  for (guint i = 0; i < model->items->len; i++) {
+    struct saber_item *item = g_ptr_array_index(model->items, i);
+
+    if (!item->launching ||
+        saber_match_is_launching(model->match, item->id)) {
+      continue;
+    }
+
+    item->launching = false;
+    changed = true;
+  }
+
+  if (changed) {
+    notify(model);
+  }
+
+  return changed;
+}
+
 void
 saber_model_note_launch(struct saber_model *model, const char *desktop_id)
 {

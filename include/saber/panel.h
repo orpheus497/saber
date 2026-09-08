@@ -22,6 +22,7 @@ event to the right column is this module's job, not the caller's. */
 #include <saber/theme.h>
 #include <saber/toplevel.h>
 #include <saber/trash.h>
+#include <saber/unity.h>
 
 /* Everything a column draws from. All borrowed and all must outlive the panel
 set; any of the optional modules may be NULL, in which case its tile simply is
@@ -37,6 +38,10 @@ struct saber_panel_deps {
   struct saber_trash *trash;
   struct saber_devices *devices;
   struct saber_sni *sni;
+  /* The LauncherEntry state. Optional; when it is NULL an application's
+  right-click menu carries its static Actions= only, which is what every menu
+  carried before this was passed in. */
+  struct saber_unity *unity;
   /* Also how a folder-opening tile finds a real file manager: the entry
   carrying the FileManager category, else the one registered against
   inode/directory, both filtered so a terminal can never answer. NULL leaves
@@ -142,6 +147,24 @@ saber_panels_visible(const struct saber_panels *panels);
 than panel-local ones, for the dash to hand on the press that dismissed it so
 one click both closes the dash and activates the tile under it. Returns whether
 a tile was found and activated. */
+/* Function purpose: Whether a drop at this surface-local point would land on a
+tile that can open files, for the drag-and-drop layer's accept/reject feedback.
+Asked again on every motion event, so it does no more than a hit test. */
+bool
+saber_panels_accepts_drop(struct saber_panels *panels,
+    struct wl_surface *surface,
+    double x,
+    double y);
+
+/* Function purpose: Open the dropped URIs with the application whose tile they
+landed on. Returns whether a tile took them. */
+bool
+saber_panels_drop_at(struct saber_panels *panels,
+    struct wl_surface *surface,
+    double x,
+    double y,
+    const char *const *uris);
+
 bool
 saber_panels_click_at(struct saber_panels *panels,
     struct saber_output *output,

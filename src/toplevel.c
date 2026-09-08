@@ -20,6 +20,9 @@ struct saber_toplevels {
   struct wl_list toplevels; /* struct saber_toplevel.link */
   size_t count;
 
+  /* Monotonic, never reset: the source of saber_toplevel.id. */
+  uint64_t next_id;
+
   const struct saber_toplevel_listener *listener;
   void *data;
 };
@@ -262,6 +265,7 @@ manager_handle_toplevel(void *data,
   toplevel->toplevels = toplevels;
   toplevel->handle = handle;
   toplevel->outputs = g_ptr_array_new();
+  toplevel->id = ++toplevels->next_id;
 
   wl_list_insert(toplevels->toplevels.prev, &toplevel->link);
   toplevels->count++;

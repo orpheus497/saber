@@ -132,6 +132,14 @@ of its own. */
 void
 saber_model_note_launch(struct saber_model *model, const char *desktop_id);
 
+/* Function purpose: Clear `launching` on any tile whose launch window has
+closed, so an application that never opened a window -- or whose window never
+resolved to the tile that started it -- stops being marked as starting. Returns
+whether anything changed, so a caller on a repaint path can skip a redraw that
+would produce an identical frame. */
+bool
+saber_model_expire_launches(struct saber_model *model);
+
 bool
 saber_model_pin(struct saber_model *model, const char *desktop_id);
 
@@ -141,7 +149,15 @@ saber_model_unpin(struct saber_model *model, const char *desktop_id);
 /* Function purpose: Drag-to-reorder. Indices are into the whole list; both
 must land on application tiles, since the special tiles are positional. An
 unpinned tile dropped among the favourites is pinned by the move, which is the
-Unity gesture for "keep in launcher". */
+Unity gesture for "keep in launcher".
+
+`to` is the index the item OCCUPIES AFTERWARDS, not an index into the list as
+it stands before the call. The distinction is the whole of whether a downward
+move lands one place late, so it is stated rather than left to be inferred:
+moving index 0 to 2 in [A,B,C,D] yields [B,C,A,D], with A at 2.
+
+Note for anyone auditing this: it has no caller. The drag gesture that would
+supply one is not implemented, so nothing here is exercised. */
 bool
 saber_model_move(struct saber_model *model, size_t from, size_t to);
 

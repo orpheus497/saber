@@ -1286,6 +1286,20 @@ dash_damage(struct saber_dash *dash)
 
 /* -------------------------------------------------------------- activation */
 
+/* A launch waiting on its activation token. The model and match are held
+directly rather than the dash, because the reply is asynchronous and the dash it
+came from may have been hidden -- and could in principle be destroyed -- before
+it arrives; these two outlive the dash by construction, being borrowed
+dependencies of the whole application. */
+struct dash_launch {
+  struct saber_model *model;
+  struct saber_match *match;
+  struct saber_appinfo *app; /* owned: one reference, released here */
+};
+
+static void
+dash_launch_with_token(const char *token, void *user);
+
 static void
 dash_launch(struct saber_dash *dash, int index)
 {
@@ -1296,27 +1310,60 @@ dash_launch(struct saber_dash *dash, int index)
   const struct dash_entry *entry = g_ptr_array_index(dash->results, index);
   struct saber_appinfo *app = saber_appinfo_ref(entry->app);
 
-  /* Action purpose: The dash is dismissed BEFORE the launch is recorded and
-  after the fork, so the desktop is uncovered the moment the click lands rather
-  than when the child finishes starting. */
-  if (!saber_appinfo_launch(app, NULL, NULL, NULL)) {
+  /* Action purpose: Ask for an activation token first, and start the
+  application from the answer. The dash is the primary launcher and used to pass
+  no token at all, so everything opened from it arrived unfocused and had to be
+  clicked -- which is the opposite of what a launcher is for. The request is
+  answered on the compositor's reply or on a one-second timeout, and a NULL
+  token still launches. */
+  struct dash_launch *pending = g_new0(struct dash_launch, 1);
+
+  pending->model = dash->deps.model;
+  pending->match = dash->deps.match;
+  pending->app = app;
+
+  /* Dismissed before the token arrives, not after: the desktop is uncovered the
+  moment the click lands rather than a round trip later. */
+  struct wl_surface *surface =
+      dash->surface != NULL ? dash->surface->wl_surface : NULL;
+
+  saber_display_request_activation(dash->deps.display, surface, app->id,
+      dash_launch_with_token, pending);
+
+  saber_dash_hide(dash);
+
+  return;
+}
+
+/* Function purpose: Finish a dash launch once the activation token is in hand.
+Takes ownership of the reference held for it, so it runs exactly once whichever
+way the request was answered. */
+static void
+dash_launch_with_token(const char *token, void *user)
+{
+  struct dash_launch *pending = user;
+  struct saber_model *model = pending->model;
+  struct saber_match *match = pending->match;
+  struct saber_appinfo *app = pending->app;
+
+  g_free(pending);
+
+  if (!saber_appinfo_launch(app, NULL, NULL, token)) {
     g_warning("saber: failed to launch '%s'", app->id);
     saber_appinfo_unref(app);
 
     return;
   }
 
-  saber_dash_hide(dash);
-
   /* Action purpose: The launch window is what binds the new window to its tile
   -- neither foreign-toplevel protocol carries a pid, so a launch this process
   did not record is a window with no application. The model's form notes it
   through match.c and throbs the tile; match.c alone is the fallback when the
   dash was built without one. */
-  if (dash->deps.model != NULL) {
-    saber_model_note_launch(dash->deps.model, app->id);
-  } else if (dash->deps.match != NULL) {
-    saber_match_note_launch(dash->deps.match, app->id);
+  if (model != NULL) {
+    saber_model_note_launch(model, app->id);
+  } else if (match != NULL) {
+    saber_match_note_launch(match, app->id);
   }
 
   saber_appinfo_unref(app);

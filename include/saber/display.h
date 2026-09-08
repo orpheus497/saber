@@ -155,6 +155,9 @@ struct saber_display {
   struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
   struct xdg_wm_base *wm_base;
   struct xdg_activation_v1 *activation;
+  /* In-flight activation token requests, so a pending one is answered rather
+  than leaked if the display is torn down under it. */
+  GPtrArray *activations;
   struct wl_data_device_manager *data_device_manager;
 
   /* Take this through saber_display_take_foreign_toplevels(), never by hand:
@@ -312,5 +315,32 @@ saber_display_set_cursor_scale(struct saber_display *display, int scale);
 
 void
 saber_display_flush(struct saber_display *display);
+
+/* Called with the activation token, or with NULL when the compositor does not
+advertise xdg_activation_v1, refuses, or does not answer in time. A NULL token
+is not a failure to launch: the application starts anyway and merely arrives
+without focus, which is what happened on every launch path but one before this
+existed. */
+typedef void (*saber_activation_func)(const char *token, void *user);
+
+/* Function purpose: Ask the compositor for an activation token and deliver it
+asynchronously, so anything that starts an application can hand the child an
+XDG_ACTIVATION_TOKEN and have its window raise itself instead of arriving
+urgent.
+
+Lives here rather than in the panel because the request needs three things only
+this module holds -- the activation global, the seat, and the serial of the
+press being acted on -- and because every launch path needs it. The callback is
+guaranteed to run exactly once: on the compositor's reply, on a one-second
+timeout, or synchronously with NULL when there is no activation global at all.
+
+`surface` and `app_id` may be NULL; both are hints the compositor may use to
+decide whether the request is legitimate. */
+void
+saber_display_request_activation(struct saber_display *display,
+    struct wl_surface *surface,
+    const char *app_id,
+    saber_activation_func func,
+    void *user);
 
 #endif

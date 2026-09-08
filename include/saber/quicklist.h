@@ -20,6 +20,7 @@ instead of hosting their widgets. */
 
 #include <saber/appinfo.h>
 #include <saber/config.h>
+#include <saber/render.h>
 #include <saber/surface.h>
 #include <saber/theme.h>
 
@@ -49,6 +50,12 @@ struct saber_quicklist_params {
   struct saber_surface *parent; /* the panel's layer surface */
   enum saber_edge edge;
   const struct saber_theme *theme;
+
+  /* The shared icon resolver. Optional, and when it is NULL a menu row whose
+  icon is named by theme rather than by absolute path simply draws no icon --
+  which is what every menu did before this was passed in, because the DBusMenu
+  spec names icons by theme and a tray menu therefore showed none of them. */
+  struct saber_icons *icons;
 
   /* The tile, in the panel's logical coordinates. */
   int32_t anchor_x, anchor_y, anchor_width, anchor_height;

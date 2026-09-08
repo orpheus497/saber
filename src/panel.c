@@ -350,6 +350,7 @@ panel_expire_anim(struct saber_panel *panel, int64_t now)
 {
   GHashTableIter iter;
   gpointer value;
+  bool throb_expired = false;
 
   g_hash_table_iter_init(&iter, panel->anim);
 
@@ -360,6 +361,7 @@ panel_expire_anim(struct saber_panel *panel, int64_t now)
         now - state->launch_started > SABER_LAUNCH_TIMEOUT_MS) {
       state->throbbing = false;
       state->throb_expired = true;
+      throb_expired = true;
       anim_phase_stop(&state->throb);
     }
 
@@ -369,6 +371,15 @@ panel_expire_anim(struct saber_panel *panel, int64_t now)
       state->wiggle_expired = true;
       anim_phase_stop(&state->wiggle);
     }
+  }
+
+  /* Action purpose: A throb reaching its ceiling means the launch it belonged
+  to never produced a window, so the model's own record of it is stale too.
+  Cleared here rather than on a timer because this is the one place that already
+  knows a launch has run out of time. Guarded on something having actually
+  expired, so the ordinary frame does not walk the model at all. */
+  if (throb_expired) {
+    saber_model_expire_launches(panel->set->deps.model);
   }
 }
 
@@ -1673,6 +1684,7 @@ panel_menu_params(struct saber_panel *panel,
   params->parent = panel->surface;
   params->edge = panel->set->deps.config->panel.edge;
   params->theme = panel->set->deps.theme;
+  params->icons = panel->set->deps.icons;
   params->anchor_x = 0;
   params->anchor_y = (int32_t)slot->y;
   params->anchor_width = (int32_t)panel->width;
@@ -1720,6 +1732,27 @@ panel_open_app_menu(struct saber_panel *panel,
 
   panel_menu_params(panel, slot, &params);
   params.app = item->app;
+
+  /* Action purpose: The application's DYNAMIC quicklist, which is the first
+  source BLUEPRINT names for this menu and which was parsed and then thrown
+  away -- unity.c filled these fields in for nobody, so right-clicking a tile
+  offered only the desktop entry's static Actions=. An application publishes a
+  dbusmenu object path through com.canonical.Unity.LauncherEntry; the path
+  alone cannot be opened, which is why the bus name that published it is kept
+  beside it. */
+  if (set->deps.unity != NULL && item->id != NULL) {
+    const struct saber_unity_entry *entry =
+        saber_unity_get(set->deps.unity, item->id);
+
+    if (entry != NULL && entry->quicklist != NULL &&
+        entry->quicklist[0] != '\0' && entry->bus_name != NULL &&
+        entry->bus_name[0] != '\0') {
+      params.connection = saber_unity_connection(set->deps.unity);
+      params.menu_bus_name = entry->bus_name;
+      params.menu_object_path = entry->quicklist;
+    }
+  }
+
   params.windows = windows;
   params.windows_len = count;
   params.pinned = item->pinned;
@@ -3388,6 +3421,83 @@ saber_panels_toggle_visible(struct saber_panels *panels)
   saber_panels_set_visible(panels, visible);
 
   return visible;
+}
+
+/* Function purpose: The tile under a surface-local point, if it is one that can
+be given files. Shared by the drop test and the drop itself so the feedback the
+user sees under the cursor cannot disagree with what a release actually does. */
+static struct saber_item *
+panel_drop_target(struct saber_panels *panels,
+    struct wl_surface *surface,
+    double x,
+    double y)
+{
+  if (panels == NULL || surface == NULL) {
+    return NULL;
+  }
+
+  struct saber_panel *panel = panel_for_surface(panels, surface);
+
+  if (panel == NULL || !panel->visible) {
+    return NULL;
+  }
+
+  int slot_index = panel_slot_at(panel, x, y);
+
+  if (slot_index < 0) {
+    return NULL;
+  }
+
+  const struct saber_slot *slot =
+      &g_array_index(panel->slots, struct saber_slot, slot_index);
+  struct saber_item *item = saber_model_nth(panels->deps.model, slot->item);
+
+  /* Only an application tile, and only one with a desktop entry behind it:
+  everything else on the column -- the trash, a volume, the tray -- either
+  cannot be handed a file or would need a different verb for it. */
+  if (item == NULL || item->type != SABER_ITEM_APP || item->app == NULL) {
+    return NULL;
+  }
+
+  return item;
+}
+
+bool
+saber_panels_accepts_drop(struct saber_panels *panels,
+    struct wl_surface *surface,
+    double x,
+    double y)
+{
+  return panel_drop_target(panels, surface, x, y) != NULL;
+}
+
+bool
+saber_panels_drop_at(struct saber_panels *panels,
+    struct wl_surface *surface,
+    double x,
+    double y,
+    const char *const *uris)
+{
+  struct saber_item *item = panel_drop_target(panels, surface, x, y);
+
+  if (item == NULL || uris == NULL || uris[0] == NULL) {
+    return false;
+  }
+
+  /* Action purpose: Launched with the URIs rather than bare, so the entry's
+  Exec field codes put the paths where the application expects them. No
+  activation token: the drop is the user acting on that application, and asking
+  for one would delay the open behind a round trip for a window that is about to
+  be raised by the drop itself. */
+  if (!saber_appinfo_launch(item->app, NULL, uris, NULL)) {
+    g_warning("saber: failed to open the dropped files with '%s'", item->id);
+
+    return false;
+  }
+
+  saber_model_note_launch(panels->deps.model, item->id);
+
+  return true;
 }
 
 bool

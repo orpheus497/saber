@@ -25,6 +25,7 @@ paint somebody else's menu in Saber's own theme. */
 #include <saber/dbusmenu.h>
 #include <saber/display.h>
 #include <saber/quicklist.h>
+#include <saber/render.h>
 
 #define QL_PAD_X 10
 #define QL_PAD_Y 4
@@ -127,6 +128,8 @@ struct ql_window {
 
 struct saber_quicklist {
   struct saber_display *display;
+  /* Borrowed. NULL means a themed icon name does not resolve. */
+  struct saber_icons *icons;
   struct saber_surface *parent;
   enum saber_edge edge;
   struct saber_theme theme;
@@ -179,6 +182,27 @@ level_create(struct saber_quicklist *ql,
     int32_t anchor_y,
     int32_t anchor_width,
     int32_t anchor_height);
+
+/* A desktop action waiting on its activation token. Everything it needs is
+copied, because the menu that asked for it is closed before the reply lands. */
+struct ql_action_launch {
+  struct saber_appinfo *app; /* owned */
+  char *action_id;           /* owned */
+};
+
+static void
+ql_action_with_token(const char *token, void *user)
+{
+  struct ql_action_launch *pending = user;
+
+  if (!saber_appinfo_launch(pending->app, pending->action_id, NULL, token)) {
+    g_warning("saber: failed to run action '%s'", pending->action_id);
+  }
+
+  saber_appinfo_unref(pending->app);
+  g_free(pending->action_id);
+  g_free(pending);
+}
 
 /* Icons ------------------------------------------------------------------ */
 
@@ -250,14 +274,35 @@ icon_from_data(const uint8_t *data, size_t length)
   return surface;
 }
 
-/* Action purpose: Only an absolute path is resolved. Icon-theme name lookup is
-a panel-wide concern that belongs in the shared icon module, not in three
-private copies; until that exists a themed name draws nothing rather than
-something wrong. */
+/* Function purpose: Resolve a menu row's icon, whether it is named by theme or
+given as an absolute path.
+
+Themed names used to be dropped outright, on the reasoning that theme lookup
+belonged in a shared module rather than in a third private copy. That module
+exists and is passed in now. The distinction matters because the DBusMenu
+specification names icons by THEME, so a tray application's menu is exactly the
+case that drew none of its icons.
+
+The shared resolver handles absolute paths too, so it is tried first and the
+local loader is the fallback for when no resolver was supplied. */
 static cairo_surface_t *
-icon_from_name(const char *name)
+icon_from_name(struct saber_icons *icons, const char *name)
 {
-  if (name == NULL || name[0] == '\0' || !g_path_is_absolute(name)) {
+  if (name == NULL || name[0] == '\0') {
+    return NULL;
+  }
+
+  if (icons != NULL) {
+    /* Owned by the cache, so it is referenced rather than adopted -- entry_free
+    unconditionally destroys what it holds. */
+    cairo_surface_t *shared = saber_icons_lookup(icons, name, QL_ICON * 2);
+
+    if (shared != NULL) {
+      return cairo_surface_reference(shared);
+    }
+  }
+
+  if (!g_path_is_absolute(name)) {
     return NULL;
   }
 
@@ -320,7 +365,9 @@ entries_divide(GPtrArray *entries, bool *pending)
 }
 
 static void
-entries_add_dbusmenu(GPtrArray *entries, const struct saber_dbusmenu_item *item)
+entries_add_dbusmenu(GPtrArray *entries,
+    const struct saber_dbusmenu_item *item,
+    struct saber_icons *icons)
 {
   if (!item->visible) {
     return;
@@ -342,19 +389,20 @@ entries_add_dbusmenu(GPtrArray *entries, const struct saber_dbusmenu_item *item)
   entry->icon = icon_from_data(item->icon_data, item->icon_data_len);
 
   if (entry->icon == NULL) {
-    entry->icon = icon_from_name(item->icon_name);
+    entry->icon = icon_from_name(icons, item->icon_name);
   }
 }
 
 /* Function purpose: Build one level's rows from a DBusMenu item's children,
 which is the only shape a submenu ever has. */
 static GPtrArray *
-entries_from_children(const struct saber_dbusmenu_item *item)
+entries_from_children(const struct saber_dbusmenu_item *item,
+    struct saber_icons *icons)
 {
   GPtrArray *entries = g_ptr_array_new_with_free_func(entry_free);
 
   for (guint i = 0; item->children != NULL && i < item->children->len; i++) {
-    entries_add_dbusmenu(entries, g_ptr_array_index(item->children, i));
+    entries_add_dbusmenu(entries, g_ptr_array_index(item->children, i), icons);
   }
 
   return entries;
@@ -371,7 +419,8 @@ quicklist_compose(struct saber_quicklist *ql)
 
   if (root != NULL && root->children != NULL) {
     for (guint i = 0; i < root->children->len; i++) {
-      entries_add_dbusmenu(entries, g_ptr_array_index(root->children, i));
+      entries_add_dbusmenu(entries, g_ptr_array_index(root->children, i),
+          ql->icons);
     }
 
     divide = entries->len > 0;
@@ -385,7 +434,7 @@ quicklist_compose(struct saber_quicklist *ql)
     struct ql_entry *entry = entry_new(entries, QL_ACTION,
         action->name != NULL ? action->name : action->id);
     entry->action_id = g_strdup(action->id);
-    entry->icon = icon_from_name(action->icon);
+    entry->icon = icon_from_name(ql->icons, action->icon);
   }
 
   divide = divide || entries->len > 0;
@@ -980,7 +1029,7 @@ submenu_apply(struct ql_submenu_request *request,
 {
   struct ql_level *level = request->level;
   GPtrArray *entries = item != NULL
-      ? entries_from_children(item)
+      ? entries_from_children(item, level->ql->icons)
       : g_ptr_array_new_with_free_func(entry_free);
 
   if (level->child != NULL) {
@@ -1087,7 +1136,7 @@ level_open_submenu(struct ql_level *level, int index)
   const struct saber_dbusmenu_item *item =
       saber_dbusmenu_find(ql->menu, entry->dbusmenu_id);
   GPtrArray *entries = item != NULL
-      ? entries_from_children(item)
+      ? entries_from_children(item, level->ql->icons)
       : g_ptr_array_new_with_free_func(entry_free);
 
   if (entries->len > 0) {
@@ -1132,7 +1181,18 @@ level_activate(struct ql_level *level, int index)
   if (entry->kind == QL_DBUSMENU) {
     saber_dbusmenu_event(ql->menu, entry->dbusmenu_id);
   } else if (entry->kind == QL_ACTION && ql->app != NULL) {
-    saber_appinfo_launch(ql->app, entry->action_id, NULL, NULL);
+    /* Action purpose: With an activation token, so a desktop action's window
+    raises itself instead of arriving urgent and needing a second click. The
+    reply is asynchronous and the menu is about to be torn down, so the request
+    carries its own copy of everything it needs. */
+    struct ql_action_launch *pending = g_new0(struct ql_action_launch, 1);
+
+    pending->app = saber_appinfo_ref(ql->app);
+    pending->action_id = g_strdup(entry->action_id);
+
+    saber_display_request_activation(ql->display,
+        ql->parent != NULL ? ql->parent->wl_surface : NULL, ql->app->id,
+        ql_action_with_token, pending);
   }
 
   /* Action purpose: The owner's callbacks are invoked after the menu is gone,
@@ -1631,6 +1691,7 @@ saber_quicklist_open(const struct saber_quicklist_params *params,
   struct saber_quicklist *ql = g_new0(struct saber_quicklist, 1);
 
   ql->display = params->parent->display;
+  ql->icons = params->icons;
   ql->parent = params->parent;
   ql->edge = params->edge;
   ql->user = user;

@@ -1401,12 +1401,18 @@ saber_display_flush(struct saber_display *display)
   }
 }
 
+/* Defined with the rest of the activation code below; declared here because the
+pending-request array is created before that point. */
+static void
+activation_free(gpointer data);
+
 struct saber_display *
 saber_display_create(const char *name)
 {
   struct saber_display *display = g_new0(struct saber_display, 1);
 
   wl_list_init(&display->outputs);
+  display->activations = g_ptr_array_new_with_free_func(activation_free);
   display->pointer_listeners = g_ptr_array_new_with_free_func(g_free);
 
   display->wl_display = wl_display_connect(name);
@@ -1448,11 +1454,149 @@ saber_display_create(const char *name)
   return display;
 }
 
+/* -- activation tokens --------------------------------------------------- */
+
+#define SABER_ACTIVATION_TIMEOUT_MS 1000
+
+struct saber_activation {
+  struct saber_display *display;
+  struct xdg_activation_token_v1 *token;
+  guint timeout;
+  saber_activation_func func;
+  void *user;
+};
+
+static void
+activation_free(gpointer data)
+{
+  struct saber_activation *request = data;
+
+  if (request->timeout != 0) {
+    g_source_remove(request->timeout);
+  }
+
+  if (request->token != NULL) {
+    xdg_activation_token_v1_destroy(request->token);
+  }
+
+  g_free(request);
+}
+
+/* Action purpose: Answer exactly once and then drop the request, whichever of
+the reply and the timeout arrives first. Removing it from the array is what
+frees it, so the callback runs before anything it might rely on is gone. */
+static void
+activation_finish(struct saber_activation *request, const char *token)
+{
+  saber_activation_func func = request->func;
+  void *user = request->user;
+  struct saber_display *display = request->display;
+
+  if (request->timeout != 0) {
+    g_source_remove(request->timeout);
+    request->timeout = 0;
+  }
+
+  g_ptr_array_remove_fast(display->activations, request);
+
+  if (func != NULL) {
+    func(token, user);
+  }
+}
+
+static void
+activation_token_done(void *data,
+    struct xdg_activation_token_v1 *token,
+    const char *string)
+{
+  (void)token;
+
+  activation_finish(data, string);
+}
+
+static const struct xdg_activation_token_v1_listener activation_listener = {
+  .done = activation_token_done,
+};
+
+/* Action purpose: A compositor that advertises xdg_activation_v1 and then never
+answers would otherwise swallow the launch entirely. Starting without a token
+costs the application its focus and nothing else, which is far better than not
+starting it. */
+static gboolean
+activation_timed_out(gpointer data)
+{
+  struct saber_activation *request = data;
+
+  request->timeout = 0;
+  activation_finish(request, NULL);
+
+  return G_SOURCE_REMOVE;
+}
+
+void
+saber_display_request_activation(struct saber_display *display,
+    struct wl_surface *surface,
+    const char *app_id,
+    saber_activation_func func,
+    void *user)
+{
+  if (display == NULL || func == NULL) {
+    return;
+  }
+
+  if (display->activation == NULL) {
+    func(NULL, user);
+
+    return;
+  }
+
+  struct saber_activation *request = g_new0(struct saber_activation, 1);
+
+  request->display = display;
+  request->func = func;
+  request->user = user;
+  request->token =
+      xdg_activation_v1_get_activation_token(display->activation);
+
+  xdg_activation_token_v1_add_listener(request->token, &activation_listener,
+      request);
+
+  /* The PRESS serial, not the enter serial: xdg_activation validates the
+  request against the input event being acted on. */
+  if (display->seat != NULL) {
+    xdg_activation_token_v1_set_serial(request->token,
+        display->pointer_press_serial, display->seat);
+  }
+
+  if (surface != NULL) {
+    xdg_activation_token_v1_set_surface(request->token, surface);
+  }
+
+  if (app_id != NULL) {
+    xdg_activation_token_v1_set_app_id(request->token, app_id);
+  }
+
+  xdg_activation_token_v1_commit(request->token);
+
+  request->timeout = g_timeout_add(SABER_ACTIVATION_TIMEOUT_MS,
+      activation_timed_out, request);
+
+  g_ptr_array_add(display->activations, request);
+  saber_display_flush(display);
+}
+
 void
 saber_display_destroy(struct saber_display *display)
 {
   if (display == NULL) {
     return;
+  }
+
+  /* Before the connection goes: each pending request holds a proxy and a
+  timeout, and its owner is still waiting to be told the launch may proceed. */
+  if (display->activations != NULL) {
+    g_ptr_array_free(display->activations, TRUE);
+    display->activations = NULL;
   }
 
   saber_display_detach(display);

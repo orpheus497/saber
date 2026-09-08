@@ -44,6 +44,13 @@ struct icon_dir {
   char *path; /* absolute: <base>/<theme>/<subdir> */
   int size, min, max, threshold;
   int type; /* 0 fixed, 1 scalable, 2 threshold */
+
+  /* Which theme this directory belongs to, counted in search order: the user's
+  theme is 0, its parents follow, then Adwaita, then hicolor. Directories are
+  appended before inheritance recurses, so this is monotonic. It exists because
+  the size match is only meaningful WITHIN a theme -- see
+  icon_candidate_compare. */
+  int theme_order;
 };
 
 struct icon_candidate {
@@ -56,6 +63,7 @@ struct saber_icons {
   GPtrArray *dirs;      /* struct icon_dir *, in theme search order */
   GPtrArray *fallbacks; /* char * flat directories: pixmaps */
   GHashTable *cache;    /* "name@size" -> cairo_surface_t *, NULL for a miss */
+  int theme_seq;        /* next value for icon_dir.theme_order */
   bool scanned;
 };
 
@@ -227,6 +235,11 @@ icon_collect_theme(struct saber_icons *icons,
   char **subdirs =
       g_key_file_get_string_list(keys, "Icon Theme", "Directories", &count, NULL);
 
+  /* Taken once for the whole theme, before its parents are walked, so every
+  directory this theme contributes shares one rank and sorts ahead of every
+  directory its parents contribute. */
+  int theme_order = icons->theme_seq++;
+
   for (gsize i = 0; subdirs != NULL && i < count; i++) {
     const char *sub = g_strstrip(subdirs[i]);
     int size = g_key_file_get_integer(keys, sub, "Size", NULL);
@@ -259,6 +272,7 @@ icon_collect_theme(struct saber_icons *icons,
       dir->type = g_strcmp0(type, "Scalable") == 0 ? 1
           : g_strcmp0(type, "Fixed") == 0          ? 0
                                                    : 2;
+      dir->theme_order = theme_order;
 
       g_ptr_array_add(icons->dirs, dir);
     }
@@ -376,11 +390,25 @@ icon_dir_distance(const struct icon_dir *dir, int want)
   }
 }
 
+/* Function purpose: Order the directories an icon name might be found in.
+
+Theme position first, size second -- which is the way round the icon theme
+specification requires and the reverse of what this did. Sorting on size first
+let any theme in the search path win a name outright whenever it happened to
+ship an exactly-matching fixed size, so a user's chosen theme lost icons to
+Adwaita or hicolor one at a time and the column came out visibly mixed. The
+specification is explicit that the current theme and its parents are exhausted
+before a fallback is considered; size is how you choose between directories
+*within* a theme, not between themes. */
 static int
 icon_candidate_compare(gconstpointer a, gconstpointer b)
 {
   const struct icon_candidate *left = a;
   const struct icon_candidate *right = b;
+
+  if (left->dir->theme_order != right->dir->theme_order) {
+    return left->dir->theme_order - right->dir->theme_order;
+  }
 
   if (left->distance != right->distance) {
     return left->distance - right->distance;

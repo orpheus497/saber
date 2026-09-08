@@ -31,6 +31,7 @@ linked and not merely that their headers were on the include path. */
 #include <saber/dash.h>
 #include <saber/devices.h>
 #include <saber/display.h>
+#include <saber/dnd.h>
 #include <saber/ipc.h>
 #include <saber/match.h>
 #include <saber/model.h>
@@ -162,6 +163,7 @@ struct saber_app {
   struct saber_unity *unity;
   struct saber_icons *icons;
   struct saber_panels *panels;
+  struct saber_dnd *dnd;
   struct saber_dash *dash;
   struct saber_spread *spread;
   struct saber_ipc *ipc;
@@ -318,6 +320,32 @@ ipc_pin(int sheet, void *user)
   return SABER_IPC_RESULT_NOT_BUILT;
 }
 
+/* A keybinding launch waiting on its activation token. Holds the model rather
+than the application struct, because the reply is asynchronous and only these
+two are needed once it lands. */
+struct ipc_launch {
+  struct saber_model *model;
+  struct saber_appinfo *app; /* owned: one reference, released here */
+};
+
+static void
+ipc_launch_with_token(const char *token, void *user)
+{
+  struct ipc_launch *pending = user;
+  struct saber_model *model = pending->model;
+  struct saber_appinfo *app = pending->app;
+
+  g_free(pending);
+
+  if (saber_appinfo_launch(app, NULL, NULL, token)) {
+    saber_model_note_launch(model, app->id);
+  } else {
+    g_warning("saber: failed to launch '%s'", app->id);
+  }
+
+  saber_appinfo_unref(app);
+}
+
 static enum saber_ipc_result
 ipc_launch(int favourite, void *user)
 {
@@ -345,11 +373,22 @@ ipc_launch(int favourite, void *user)
     return SABER_IPC_RESULT_FAILED;
   }
 
-  if (!saber_appinfo_launch(item->app, NULL, NULL, NULL)) {
-    return SABER_IPC_RESULT_FAILED;
-  }
+  /* Action purpose: Ask for an activation token, exactly as a click on the tile
+  does. This path is what `Logo+1..4` runs, and without a token the window it
+  starts arrives unfocused -- so the keybinding started the application and then
+  left the user to click it, which is not what the binding is for.
 
-  saber_model_note_launch(app->model, item->id);
+  The reply is asynchronous and the control connection has already been answered
+  by the time it lands, so the verb reports that the launch was accepted rather
+  than that it succeeded; a failure after this point is warned about by
+  ipc_launch_with_token. */
+  struct ipc_launch *pending = g_new0(struct ipc_launch, 1);
+
+  pending->model = app->model;
+  pending->app = saber_appinfo_ref(item->app);
+
+  saber_display_request_activation(app->display, NULL, item->id,
+      ipc_launch_with_token, pending);
 
   return SABER_IPC_RESULT_OK;
 }
@@ -547,6 +586,39 @@ on_dash_dismissed(void *user,
   app->dash_dismissing = false;
 }
 
+/* Function purpose: Drag-and-drop onto a tile, which until now was 609 lines
+that nothing constructed.
+
+A file dragged from a file manager onto an application's tile opens it with that
+application. The three callbacks are deliberately thin: dnd.c owns the protocol
+and the accept/reject handshake, panel.c owns the hit test, and this is the
+seam. */
+static bool
+on_dnd_accepts(void *user, struct wl_surface *surface, double x, double y)
+{
+  struct saber_app *app = user;
+
+  return saber_panels_accepts_drop(app->panels, surface, x, y);
+}
+
+static void
+on_dnd_drop(void *user,
+    struct wl_surface *surface,
+    double x,
+    double y,
+    char **uris)
+{
+  struct saber_app *app = user;
+
+  saber_panels_drop_at(app->panels, surface, x, y, (const char *const *)uris);
+}
+
+static const struct saber_dnd_listener app_dnd_listener = {
+  .accepts = on_dnd_accepts,
+  .motion = NULL,
+  .drop = on_dnd_drop,
+};
+
 static void
 on_spread_requested(const char *app_id, struct saber_output *output, void *user)
 {
@@ -614,6 +686,13 @@ on_toplevel_added(void *user, struct saber_toplevel *toplevel)
   app_sync_focus(app);
   app_invalidate_sheets(app);
   app_repaint(app);
+
+  /* A window opening while the spread is up belongs in it. */
+#ifdef HAVE_SPREAD
+  if (app->spread != NULL && saber_spread_is_visible(app->spread)) {
+    saber_spread_refresh(app->spread);
+  }
+#endif
 }
 
 static void
@@ -647,6 +726,16 @@ on_toplevel_closed(void *user, struct saber_toplevel *toplevel)
   app_sync_focus(app);
   app_invalidate_sheets(app);
   app_repaint(app);
+
+  /* Action purpose: An open spread holds one cell per window and had no way to
+  learn that one had gone -- saber_spread_refresh existed with no external
+  caller, so every closed window left a cell behind that still offered to raise
+  or close it. */
+#ifdef HAVE_SPREAD
+  if (app->spread != NULL && saber_spread_is_visible(app->spread)) {
+    saber_spread_refresh(app->spread);
+  }
+#endif
 }
 
 static const struct saber_toplevel_listener app_toplevel_listener = {
@@ -739,6 +828,7 @@ app_shutdown(struct saber_app *app)
   /* Before the panels: both hold a surface that owns the seat's keyboard while
   mapped, and tearing the display down under them leaves the session deaf. */
   saber_ipc_destroy(app->ipc);
+  saber_dnd_destroy(app->dnd);
   saber_dash_destroy(app->dash);
   saber_spread_destroy(app->spread);
   saber_panels_destroy(app->panels);
@@ -874,6 +964,7 @@ run(void)
     .trash = app.trash,
     .devices = app.devices,
     .sni = app.sni,
+    .unity = app.unity,
     .index = app.index,
   };
 
@@ -920,6 +1011,12 @@ run(void)
   app.spread = saber_spread_create(&spread_deps);
   saber_panels_set_spread(app.panels, on_spread_requested, &app);
 #endif
+
+  /* Action purpose: After the panels, because a drop is resolved against a
+  column's layout and the listener is handed the application. Returns NULL when
+  the compositor advertises no wl_data_device_manager, which costs
+  drag-and-drop and nothing else. */
+  app.dnd = saber_dnd_create(app.display, &app_dnd_listener, &app);
 
   /* Action purpose: The socket is also the single-instance lock. ipc.c connects
   before it unlinks, so a live panel is detected rather than having its socket

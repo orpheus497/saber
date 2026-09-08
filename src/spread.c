@@ -49,6 +49,11 @@ width and an unhittable target; this is what makes it a pointer target. */
 
 struct spread_cell {
   struct saber_toplevel *toplevel;
+
+  /* The window's identity when the cell was built. Compared as well as the
+  pointer, because the pointer alone cannot tell a live window from a different
+  one allocated at the same address after the first closed. */
+  uint64_t toplevel_id;
   char *title;
   char *subtitle;  /* the application, so two same-named windows still differ */
   char *icon_name; /* resolved once per rebuild; looked up per frame */
@@ -261,6 +266,7 @@ spread_rebuild(struct saber_spread *spread)
       struct spread_cell *cell = g_new0(struct spread_cell, 1);
 
       cell->toplevel = toplevel;
+    cell->toplevel_id = toplevel->id;
       cell->minimized =
           saber_toplevel_has_state(toplevel, SABER_TOPLEVEL_MINIMIZED);
       cell->activated =
@@ -312,7 +318,8 @@ pointer to it, and an owner that forgets to refresh must not be able to make the
 spread act on freed memory. */
 static bool
 spread_alive(const struct saber_spread *spread,
-    const struct saber_toplevel *toplevel)
+    const struct saber_toplevel *toplevel,
+    uint64_t id)
 {
   const struct wl_list *list = spread->deps.toplevels != NULL
       ? saber_toplevels_list(spread->deps.toplevels)
@@ -325,7 +332,11 @@ spread_alive(const struct saber_spread *spread,
   const struct saber_toplevel *entry;
 
   wl_list_for_each (entry, list, link) {
-    if (entry == toplevel) {
+    /* Action purpose: The id is what makes this a liveness test rather than an
+    address test. A closed window's block is routinely reused for the next one,
+    so a stale cell could otherwise match a live entry and the spread would
+    activate -- or close -- an unrelated window. */
+    if (entry == toplevel && entry->id == id) {
       return true;
     }
   }
@@ -805,7 +816,7 @@ spread_activate(struct saber_spread *spread, int index)
   const struct spread_cell *cell = g_ptr_array_index(spread->cells, index);
   struct saber_toplevel *toplevel = cell->toplevel;
 
-  if (!spread_alive(spread, toplevel)) {
+  if (!spread_alive(spread, toplevel, cell->toplevel_id)) {
     saber_spread_refresh(spread);
 
     return;
@@ -831,7 +842,7 @@ spread_close(struct saber_spread *spread, int index)
 
   const struct spread_cell *cell = g_ptr_array_index(spread->cells, index);
 
-  if (!spread_alive(spread, cell->toplevel)) {
+  if (!spread_alive(spread, cell->toplevel, cell->toplevel_id)) {
     saber_spread_refresh(spread);
 
     return;

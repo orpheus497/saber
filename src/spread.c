@@ -1234,9 +1234,17 @@ static void
 spread_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
 {
   (void)time;
-  (void)axis;
 
   struct saber_spread *spread = data;
+
+  /* Action purpose: Only the axis this listener acts on ends its gesture here.
+  spread_pointer_axis returns on the horizontal axis before taking a delta, so
+  a reset answering a horizontal stop discarded the vertical remainder a
+  half-finished gesture had earned. Resetting on the axis that did stop is
+  correct: the gesture is over and the next one starts from zero. */
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
 
   saber_scroll_reset(&spread->scroll_accum);
 }

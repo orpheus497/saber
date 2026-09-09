@@ -2284,9 +2284,14 @@ static void
 grid_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
 {
   (void)time;
-  (void)axis;
 
   struct saber_sheet_grid *grid = data;
+
+  /* Same reason as pointer_axis_stop below: a horizontal stop must not clear
+  the vertical remainder, because nothing here consumes horizontal scroll. */
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
 
   saber_scroll_reset(&grid->scroll);
 }
@@ -3137,9 +3142,19 @@ static void
 pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
 {
   (void)time;
-  (void)axis;
 
   struct saber_panels *panels = data;
+
+  /* Action purpose: Only the axis this listener acts on ends its gesture here.
+  A reset clears the whole accumulator, and the horizontal axis reaches no
+  consumer in this file -- pointer_axis returns on it before any delta is taken
+  -- so answering a horizontal stop threw away the vertical remainder a
+  half-finished wheel or touchpad gesture had earned, and the next nudge had to
+  re-earn a whole notch. The reset itself is right for the axis that did stop:
+  the gesture is over and the next one starts from zero. */
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
 
   saber_scroll_reset(&panels->scroll);
 }

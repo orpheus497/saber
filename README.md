@@ -96,6 +96,14 @@ Top to bottom, each item switchable in `items { }`:
 | **Tray item** | Activate, or its menu | Secondary activate | Context menu | Forwarded |
 | **Session** | Session menu | — | Session menu | — |
 
+**When the launcher band runs out of room, it scrolls.** Everything listed before `apps` in
+`items { order }` is pinned to the top of the column and everything after it is anchored to the
+bottom; the band takes the space left between them. A wheel anywhere on the column that is not
+over a tile with a scroll of its own — the BFB, a device, the trash, the session tile, an
+application with fewer than two windows, or the empty gap — moves the band instead. A small
+chevron appears at whichever end has more beyond it, and **the chevrons are buttons**: clicking
+one steps the band by a tile and deliberately does *not* activate the tile it is drawn over.
+
 ### Tile decoration
 
 Each is a Unity signifier drawn from a palette role, never a fixed colour:
@@ -469,9 +477,17 @@ window was dispatched into nothing.
 Stated rather than left to be discovered. Each follows from Saber being a **pure Wayland
 client** that asks `hikari-sakura` for nothing it does not already publish.
 
-* **The window spread shows no thumbnails.** The compositor advertises an *output*
-  image-capture source only, and only behind a build flag that is off by default;
-  `wlr-screencopy` has no per-window request. The spread is an icon-and-title grid.
+* **The window spread shows no thumbnails**, and the reason is a compositor build flag rather
+  than a missing protocol. `wlr-screencopy-v1` is advertised and on by default, but it captures
+  whole **outputs** — there is no per-window request in it. Its successor,
+  `ext-image-copy-capture-v1`, *does* have one: wlroots pairs it with
+  `ext_foreign_toplevel_image_capture_source`, one capture source per foreign toplevel, which is
+  exactly the handle Saber already holds for every window. `hikari-sakura` compiles that whole
+  protocol out by default (`WITH_EXT_IMAGE_CAPTURE`, off because
+  `xdg-desktop-portal-wlr` switches to it the moment it appears and yields black frames on this
+  hardware), and even with it on, it creates only the *output* source and not the toplevel one.
+  So thumbnails are two compositor-side decisions away, not impossible. The spread is an
+  icon-and-title grid until then.
 * **There is no Lock and no Logout.** `lock` is a keybinding-only compositor action with no CLI
   and no socket verb, and FreeBSD has no `logind` to ask for a session end. Both entries hide
   unless you point `session { lock, logout }` at something. A `WITH_VIRTUAL_INPUT` build can
@@ -498,13 +514,15 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   onto it. The trade is deliberate: it is also why the Dash never monopolises the session, and
   why the other monitor stays fully usable while it is open.
 * **The Dash has no blur, and will not get one — it has opacity instead.** `hikari-sakura`
-  advertises no blur protocol of any kind, and a Wayland client cannot read the screen behind
-  itself, so there is nothing to bind and nothing to sample. What a client can control exactly
-  is how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
+  advertises no blur protocol of any kind, and nothing in Wayland lets a surface composite
+  against what is behind it, so there is nothing to bind. What a client can control exactly is
+  how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
   strip and the spread backdrop are painted at, written to the surface as given rather than
   stacked out of translucent passes. At the default `1.0` nothing behind them bleeds through at
-  all. A screencopy self-blur remains possible in principle, but it is a dependency and a
-  permission question rather than a missing feature.
+  all. A `wlr-screencopy` self-blur is possible in principle — that protocol *is* advertised and
+  on by default — but it captures a still, so the blur would not follow a window moving behind
+  it, and sampling the whole screen to decorate a panel is a privacy question as much as a
+  technical one. A decision not taken, rather than a gap.
 * **Tray tooltips are not shown**, and `ToolTip` and `Category` are read off the wire and
   discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.
 * **A rejected sheet switch cannot fail the command.** `saberctl sheet N` and `pin N` answer as

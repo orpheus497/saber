@@ -28,9 +28,9 @@ only for the [`hikari-sakura`](https://github.com/orpheus497/hikari-sakura) comp
 FreeBSD.
 
 Its reason to exist is that nothing else in the desktop is **persistent**. Every `sofi` surface
-appears on a keypress and dismisses on selection. A launcher in the Unity sense is a different
-kind of object: always on screen, aimed at without looking, showing at a glance what is
-running — and it is where the system tray lives.
+appears on a keypress or a click and dismisses on selection. A launcher in the Unity sense is a
+different kind of object: always on screen, aimed at without looking, showing at a glance what
+is running — and it is where the system tray lives.
 
 It is a **pure Wayland client**. Windows are listed and acted on through
 `wlr-foreign-toplevel-management`, surfaces are placed with `wlr-layer-shell`, and the
@@ -45,23 +45,42 @@ Four programs, built to be used together, each usable on its own:
 | | Program | Written in | Role |
 |---|---|---|---|
 | 1 | [**sakura**](https://github.com/orpheus497/sakura) | Zig | **Display manager.** A TUI login manager on a FreeBSD virtual terminal. Talks to OpenPAM directly; no toolkit, no session bus, no login-manager framework |
-| 2 | [**hikari-sakura**](https://github.com/orpheus497/hikari-sakura) | C | **Compositor.** Stacking, with tiling; built on views, groups and *sheets*. Draws its own top bar and lock screen |
-| 3 | [**sofi**](https://github.com/orpheus497/sofi) | C | **Launcher.** A general-purpose indexer: application menu, notification daemon, notification history |
-| 4 | **saber** — this repository | C | **Panel.** The desktop's persistent surface |
+| 2 | [**hikari-sakura**](https://github.com/orpheus497/hikari-sakura) | C | **Compositor.** Stacking, with tiling; built on wlroots, and on *views*, *groups* and *sheets*. Draws its own top bar and lock screen |
+| 3 | [**sofi**](https://github.com/orpheus497/sofi) | C | **Overlays.** Every surface that is summoned rather than always present — application menu, control panel, sheet switcher, volume and network panes, notification history — plus the notification daemon |
+| 4 | **saber** — this repository | C | **Panel.** The one surface that is always present: launcher tiles, quicklists, the system tray and session controls, in a column that reserves its own space |
 
 ### How Saber fits
 
-Saber takes the panel surfaces and leaves the rest alone.
+**The line is persistence, and it decides every case.** Saber is on screen for the whole session
+and reserves an exclusive zone, so windows tile beside it. Every `sofi` surface is summoned, does
+one job and dismisses. The two therefore do not compete for screen area even where they cover the
+same subject — Saber's Dash is a *docked* application grid and `sofi -show drun` is a *summoned*
+one, and running both is normal.
 
 * **The compositor keeps all telemetry.** CPU, RAM, temperature, network, battery, volume,
   media and the clock live in `hikari-sakura`'s own top bar, fed by `hikari-topbar`. Saber
   duplicates none of it — a panel anchored to the left edge sits *underneath* that bar
   automatically, with nothing to configure and no height to keep in sync.
-* **`sofi` keeps notifications.** `sofi -notification-daemon` and
-  `sofi -show notification-history` are unaffected and should keep running.
+* **`sofi` keeps everything that is summoned**, and that is more than notifications. Besides
+  `sofi -notification-daemon` and `sofi -show notification-history`, it owns the **control
+  panel**, the **sheet switcher**, and the **volume** and **network** panes. Saber builds no
+  volume, network or Bluetooth menu of its own and is not going to: the top bar *reports* those,
+  `sofi` *changes* them, and a third implementation in the column would be the one place a user
+  could set a value that the other two disagree with.
 * **Saber takes the system tray, and this one is an either/or.** Exactly one process on a
-  session bus can own `org.kde.StatusNotifierWatcher`. See
+  session bus can own `org.kde.StatusNotifierWatcher`. `sofi -tray-daemon` exists and draws no
+  surface by default precisely because Saber owns the tray; run only one. See
   [Troubleshooting](#the-system-tray-is-empty).
+
+**Saber triggers `sofi` by running it.** There is no `sofi` IPC socket and none is needed: each
+surface is one invocation of the binary holding its own instance lock, so a launcher tile, a
+`hikari.conf` keybinding and a shell script all reach it the same way, and pressing the same
+trigger twice does not stack two copies. `sofi -show drun`, `-show window`, `-show sheets`,
+`-show volume`, `-show network`, `-show notification-history`. Saber ships **no** binding for any
+of them — the shipped `launcher { favourites }` seeds `sofi.desktop`, which is the application
+menu, and the rest are yours to bind in `hikari.conf` or pin. `org.sofi.Tray` is a private
+interface between two `sofi` processes and is not a handoff surface; the commands are the
+contract.
 
 ## The column
 
@@ -228,25 +247,37 @@ arrives too late.
 
 ## Making the keys work
 
-**This is the step most likely to be missed.** Saber is a layer-shell client, and a layer-shell
-client **cannot grab global keys** — there is no protocol for it. Every keyboard shortcut
-therefore has to be a `hikari.conf` binding that runs `saberctl`.
+Saber is a layer-shell client, and a layer-shell client **cannot grab global keys** — there is no
+protocol for it. Every keyboard shortcut therefore has to be a `hikari.conf` binding that runs
+`saberctl`.
 
-Add to `hikari.conf`:
+**Three already ship.** `hikari-sakura`'s own `hikari.conf` binds them, so on a stock
+configuration there is nothing to do for these:
+
+| Key | Action | Runs |
+|---|---|---|
+| `Logo`+`Shift`+`d` | `action-dash` | `saberctl dash` |
+| `Logo`+`Shift`+`e` | `action-spread` | `saberctl spread` |
+| `Logo`+`Shift`+`p` | `action-panel` | `saberctl toggle` |
+
+They are the shifted counterparts of the `sofi` keys, so the pair stays on one map: unshifted
+summons a `sofi` surface, shifted drives the panel that is already on screen.
+
+**What does not ship, and needs adding by hand,** is `saberctl launch N` and the hold-Super number
+overlay. The overlay is the one that cannot work without you: it needs a binding on the **press**
+and another on the **release** of the same key, and no such pair is shipped.
 
 ```ucl
 actions {
-  saber-dash   = "saberctl dash"
-  saber-spread = "saberctl spread"
-  saber-1      = "saberctl launch 1"
-  saber-2      = "saberctl launch 2"
-  saber-3      = "saberctl launch 3"
+  saber-1        = "saberctl launch 1"
+  saber-2        = "saberctl launch 2"
+  saber-3        = "saberctl launch 3"
+  saber-numbers  = "saberctl overlay on"
+  saber-nonumber = "saberctl overlay off"
 }
 
 bindings {
   keyboard {
-    "LA+a" = action-saber-dash
-    "LA+s" = action-saber-spread
     "LA+1" = action-saber-1
     "LA+2" = action-saber-2
     "LA+3" = action-saber-3

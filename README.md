@@ -289,9 +289,20 @@ bindings {
     "LA+1" = action-saber-1
     "LA+2" = action-saber-2
     "LA+3" = action-saber-3
+
+    "L+Alt_L" = {
+      begin = action-saber-numbers
+      end   = action-saber-nonumber
+    }
   }
 }
 ```
+
+The overlay is the `begin`/`end` form: hikari guarantees a `begin` is always followed by its
+`end`, so the numbers cannot be left on screen. `end` also fires when a further key goes down,
+which is what you want here — pressing `1` launches the favourite and takes the legend away with
+it. Hold whichever key the launch bindings sit under; with `LA+N` above, that is Logo held while
+Alt goes down.
 
 > **Why `Logo+Alt` and not `Super+N`.** The shipped `hikari.conf` is densely bound: `L+1`…`L+9`
 > are `workspace-switch-to-sheet-N` and `LS+1`…`LS+9` are `view-pin-to-sheet-N`, so both of the

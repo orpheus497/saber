@@ -575,14 +575,37 @@ on wl_pointer.axis. This is the constant that converts a continuous value into
 the same v120 currency axis_value120 already speaks. */
 #define SABER_SCROLL_NOTCH 10.0
 
+/* Function purpose: Which slot of the accumulator an axis owns, or -1 for an
+axis that is neither of the two the protocol defines. Kept here rather than in
+the header so the wl_pointer enum stays an implementation detail of this file --
+callers pass the axis they were handed and never index the array themselves. */
+static int
+scroll_axis_slot(uint32_t axis)
+{
+  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return 0;
+  }
+
+  if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+    return 1;
+  }
+
+  return -1;
+}
+
 void
 saber_scroll_detail(struct saber_scroll_accum *accum,
     uint32_t axis,
     int32_t value120)
 {
-  accum->detail = value120;
-  accum->detail_axis = axis;
-  accum->has_detail = true;
+  int slot = scroll_axis_slot(axis);
+
+  if (slot < 0) {
+    return;
+  }
+
+  accum->detail[slot] = value120;
+  accum->has_detail[slot] = true;
 }
 
 int32_t
@@ -590,16 +613,21 @@ saber_scroll_delta(struct saber_scroll_accum *accum,
     uint32_t axis,
     double value)
 {
-  bool matched = accum->has_detail && accum->detail_axis == axis;
-  int32_t detail = accum->detail;
+  int slot = scroll_axis_slot(axis);
 
-  /* Action purpose: Cleared either way. The detail belongs to the frame that
-  announced it, and a frame that described the horizontal axis must not leave
-  its delta sitting there for the next vertical event to pick up. */
-  accum->has_detail = false;
-  accum->detail = 0;
+  /* Action purpose: Only THIS axis's detail is consumed, and only this axis's
+  is cleared. Every listener records a detail unconditionally and reaches this
+  function only for the axis it acts on, so clearing both would let a frame
+  describing the axis a listener ignores destroy the detail belonging to the
+  one it does not -- which is the whole defect this slot-per-axis form fixes.
+  A detail left in the other slot is spent by that axis's own event, or dropped
+  by saber_scroll_reset when the target changes. */
+  if (slot >= 0 && accum->has_detail[slot]) {
+    int32_t detail = accum->detail[slot];
 
-  if (matched) {
+    accum->has_detail[slot] = false;
+    accum->detail[slot] = 0;
+
     return detail;
   }
 
@@ -641,9 +669,11 @@ saber_scroll_steps(struct saber_scroll_accum *accum,
 void
 saber_scroll_reset(struct saber_scroll_accum *accum)
 {
-  accum->detail = 0;
-  accum->detail_axis = 0;
-  accum->has_detail = false;
+  for (int slot = 0; slot < SABER_SCROLL_AXES; slot++) {
+    accum->detail[slot] = 0;
+    accum->has_detail[slot] = false;
+  }
+
   accum->pending = 0;
 }
 

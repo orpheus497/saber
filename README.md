@@ -28,9 +28,9 @@ only for the [`hikari-sakura`](https://github.com/orpheus497/hikari-sakura) comp
 FreeBSD.
 
 Its reason to exist is that nothing else in the desktop is **persistent**. Every `sofi` surface
-appears on a keypress and dismisses on selection. A launcher in the Unity sense is a different
-kind of object: always on screen, aimed at without looking, showing at a glance what is
-running — and it is where the system tray lives.
+appears on a keypress or a click and dismisses on selection. A launcher in the Unity sense is a
+different kind of object: always on screen, aimed at without looking, showing at a glance what
+is running — and it is where the system tray lives.
 
 It is a **pure Wayland client**. Windows are listed and acted on through
 `wlr-foreign-toplevel-management`, surfaces are placed with `wlr-layer-shell`, and the
@@ -45,23 +45,42 @@ Four programs, built to be used together, each usable on its own:
 | | Program | Written in | Role |
 |---|---|---|---|
 | 1 | [**sakura**](https://github.com/orpheus497/sakura) | Zig | **Display manager.** A TUI login manager on a FreeBSD virtual terminal. Talks to OpenPAM directly; no toolkit, no session bus, no login-manager framework |
-| 2 | [**hikari-sakura**](https://github.com/orpheus497/hikari-sakura) | C | **Compositor.** Stacking, with tiling; built on views, groups and *sheets*. Draws its own top bar and lock screen |
-| 3 | [**sofi**](https://github.com/orpheus497/sofi) | C | **Launcher.** A general-purpose indexer: application menu, notification daemon, notification history |
-| 4 | **saber** — this repository | C | **Panel.** The desktop's persistent surface |
+| 2 | [**hikari-sakura**](https://github.com/orpheus497/hikari-sakura) | C | **Compositor.** Stacking, with tiling; built on wlroots, and on *views*, *groups* and *sheets*. Draws its own top bar and lock screen |
+| 3 | [**sofi**](https://github.com/orpheus497/sofi) | C | **Overlays.** Every surface that is summoned rather than always present — application menu, control panel, sheet switcher, volume and network panes, notification history — plus the notification daemon |
+| 4 | **saber** — this repository | C | **Panel.** The one surface that is always present: launcher tiles, quicklists, the system tray and session controls, in a column that reserves its own space |
 
 ### How Saber fits
 
-Saber takes the panel surfaces and leaves the rest alone.
+**The line is persistence, and it decides every case.** Saber is on screen for the whole session
+and reserves an exclusive zone, so windows tile beside it. Every `sofi` surface is summoned, does
+one job and dismisses. The two therefore do not compete for screen area even where they cover the
+same subject — Saber's Dash is a *docked* application grid and `sofi -show drun` is a *summoned*
+one, and running both is normal.
 
 * **The compositor keeps all telemetry.** CPU, RAM, temperature, network, battery, volume,
   media and the clock live in `hikari-sakura`'s own top bar, fed by `hikari-topbar`. Saber
   duplicates none of it — a panel anchored to the left edge sits *underneath* that bar
   automatically, with nothing to configure and no height to keep in sync.
-* **`sofi` keeps notifications.** `sofi -notification-daemon` and
-  `sofi -show notification-history` are unaffected and should keep running.
+* **`sofi` keeps everything that is summoned**, and that is more than notifications. Besides
+  `sofi -notification-daemon` and `sofi -show notification-history`, it owns the **control
+  panel**, the **sheet switcher**, and the **volume** and **network** panes. Saber builds no
+  volume, network or Bluetooth menu of its own and is not going to: the top bar *reports* those,
+  `sofi` *changes* them, and a third implementation in the column would be the one place a user
+  could set a value that the other two disagree with.
 * **Saber takes the system tray, and this one is an either/or.** Exactly one process on a
-  session bus can own `org.kde.StatusNotifierWatcher`. See
+  session bus can own `org.kde.StatusNotifierWatcher`. `sofi -tray-daemon` exists and draws no
+  surface by default precisely because Saber owns the tray; run only one. See
   [Troubleshooting](#the-system-tray-is-empty).
+
+**Saber triggers `sofi` by running it.** There is no `sofi` IPC socket and none is needed: each
+surface is one invocation of the binary holding its own instance lock, so a launcher tile, a
+`hikari.conf` keybinding and a shell script all reach it the same way, and pressing the same
+trigger twice does not stack two copies. `sofi -show drun`, `-show window`, `-show sheets`,
+`-show volume`, `-show network`, `-show notification-history`. Saber ships **no** binding for any
+of them — the shipped `launcher { favourites }` seeds `sofi.desktop`, which is the application
+menu, and the rest are yours to bind in `hikari.conf` or pin. `org.sofi.Tray` is a private
+interface between two `sofi` processes and is not a handoff surface; the commands are the
+contract.
 
 ## The column
 
@@ -76,6 +95,14 @@ Top to bottom, each item switchable in `items { }`:
 | **Trash** | Open the trash | — | Open / Empty Trash | — |
 | **Tray item** | Activate, or its menu | Secondary activate | Context menu | Forwarded |
 | **Session** | Session menu | — | Session menu | — |
+
+**When the launcher band runs out of room, it scrolls.** Everything listed before `apps` in
+`items { order }` is pinned to the top of the column and everything after it is anchored to the
+bottom; the band takes the space left between them. A wheel anywhere on the column that is not
+over a tile with a scroll of its own — the BFB, a device, the trash, the session tile, an
+application with fewer than two windows, or the empty gap — moves the band instead. A small
+chevron appears at whichever end has more beyond it, and **the chevrons are buttons**: clicking
+one steps the band by a tile and deliberately does *not* activate the tile it is drawn over.
 
 ### Tile decoration
 
@@ -228,31 +255,54 @@ arrives too late.
 
 ## Making the keys work
 
-**This is the step most likely to be missed.** Saber is a layer-shell client, and a layer-shell
-client **cannot grab global keys** — there is no protocol for it. Every keyboard shortcut
-therefore has to be a `hikari.conf` binding that runs `saberctl`.
+Saber is a layer-shell client, and a layer-shell client **cannot grab global keys** — there is no
+protocol for it. Every keyboard shortcut therefore has to be a `hikari.conf` binding that runs
+`saberctl`.
 
-Add to `hikari.conf`:
+**Three already ship.** `hikari-sakura`'s own `hikari.conf` binds them, so on a stock
+configuration there is nothing to do for these:
+
+| Key | Action | Runs |
+|---|---|---|
+| `Logo`+`Shift`+`d` | `action-dash` | `saberctl dash` |
+| `Logo`+`Shift`+`e` | `action-spread` | `saberctl spread` |
+| `Logo`+`Shift`+`p` | `action-panel` | `saberctl toggle` |
+
+They are the shifted counterparts of the `sofi` keys, so the pair stays on one map: unshifted
+summons a `sofi` surface, shifted drives the panel that is already on screen.
+
+**What does not ship, and needs adding by hand,** is `saberctl launch N` and the hold-Super number
+overlay. The overlay is the one that cannot work without you: it needs a binding on the **press**
+and another on the **release** of the same key, and no such pair is shipped.
 
 ```ucl
 actions {
-  saber-dash   = "saberctl dash"
-  saber-spread = "saberctl spread"
-  saber-1      = "saberctl launch 1"
-  saber-2      = "saberctl launch 2"
-  saber-3      = "saberctl launch 3"
+  saber-1        = "saberctl launch 1"
+  saber-2        = "saberctl launch 2"
+  saber-3        = "saberctl launch 3"
+  saber-numbers  = "saberctl overlay on"
+  saber-nonumber = "saberctl overlay off"
 }
 
 bindings {
   keyboard {
-    "LA+a" = action-saber-dash
-    "LA+s" = action-saber-spread
     "LA+1" = action-saber-1
     "LA+2" = action-saber-2
     "LA+3" = action-saber-3
+
+    "L+Alt_L" = {
+      begin = action-saber-numbers
+      end   = action-saber-nonumber
+    }
   }
 }
 ```
+
+The overlay is the `begin`/`end` form: hikari guarantees a `begin` is always followed by its
+`end`, so the numbers cannot be left on screen. `end` also fires when a further key goes down,
+which is what you want here — pressing `1` launches the favourite and takes the legend away with
+it. Hold whichever key the launch bindings sit under; with `LA+N` above, that is Logo held while
+Alt goes down.
 
 > **Why `Logo+Alt` and not `Super+N`.** The shipped `hikari.conf` is densely bound: `L+1`…`L+9`
 > are `workspace-switch-to-sheet-N` and `LS+1`…`LS+9` are `view-pin-to-sheet-N`, so both of the
@@ -438,9 +488,17 @@ window was dispatched into nothing.
 Stated rather than left to be discovered. Each follows from Saber being a **pure Wayland
 client** that asks `hikari-sakura` for nothing it does not already publish.
 
-* **The window spread shows no thumbnails.** The compositor advertises an *output*
-  image-capture source only, and only behind a build flag that is off by default;
-  `wlr-screencopy` has no per-window request. The spread is an icon-and-title grid.
+* **The window spread shows no thumbnails**, and the reason is a compositor build flag rather
+  than a missing protocol. `wlr-screencopy-v1` is advertised and on by default, but it captures
+  whole **outputs** — there is no per-window request in it. Its successor,
+  `ext-image-copy-capture-v1`, *does* have one: wlroots pairs it with
+  `ext_foreign_toplevel_image_capture_source`, one capture source per foreign toplevel, which is
+  exactly the handle Saber already holds for every window. `hikari-sakura` compiles that whole
+  protocol out by default (`WITH_EXT_IMAGE_CAPTURE`, off because
+  `xdg-desktop-portal-wlr` switches to it the moment it appears and yields black frames on this
+  hardware), and even with it on, it creates only the *output* source and not the toplevel one.
+  So thumbnails are two compositor-side decisions away, not impossible. The spread is an
+  icon-and-title grid until then.
 * **There is no Lock and no Logout.** `lock` is a keybinding-only compositor action with no CLI
   and no socket verb, and FreeBSD has no `logind` to ask for a session end. Both entries hide
   unless you point `session { lock, logout }` at something. A `WITH_VIRTUAL_INPUT` build can
@@ -467,13 +525,15 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   onto it. The trade is deliberate: it is also why the Dash never monopolises the session, and
   why the other monitor stays fully usable while it is open.
 * **The Dash has no blur, and will not get one — it has opacity instead.** `hikari-sakura`
-  advertises no blur protocol of any kind, and a Wayland client cannot read the screen behind
-  itself, so there is nothing to bind and nothing to sample. What a client can control exactly
-  is how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
+  advertises no blur protocol of any kind, and nothing in Wayland lets a surface composite
+  against what is behind it, so there is nothing to bind. What a client can control exactly is
+  how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
   strip and the spread backdrop are painted at, written to the surface as given rather than
   stacked out of translucent passes. At the default `1.0` nothing behind them bleeds through at
-  all. A screencopy self-blur remains possible in principle, but it is a dependency and a
-  permission question rather than a missing feature.
+  all. A `wlr-screencopy` self-blur is possible in principle — that protocol *is* advertised and
+  on by default — but it captures a still, so the blur would not follow a window moving behind
+  it, and sampling the whole screen to decorate a panel is a privacy question as much as a
+  technical one. A decision not taken, rather than a gap.
 * **Tray tooltips are not shown**, and `ToolTip` and `Category` are read off the wire and
   discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.
 * **A rejected sheet switch cannot fail the command.** `saberctl sheet N` and `pin N` answer as

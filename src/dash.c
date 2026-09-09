@@ -1851,9 +1851,17 @@ static void
 dash_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
 {
   (void)time;
-  (void)axis;
 
   struct saber_dash *dash = data;
+
+  /* Action purpose: Only the axis this listener acts on ends its gesture here.
+  dash_pointer_axis returns on the horizontal axis before taking a delta, so a
+  reset answering a horizontal stop discarded the vertical remainder a
+  half-finished gesture had earned and made the next nudge re-earn a whole
+  notch. Resetting on the axis that did stop is correct: the gesture is over. */
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
 
   saber_scroll_reset(&dash->scroll_accum);
 }

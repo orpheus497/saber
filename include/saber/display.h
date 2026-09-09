@@ -68,6 +68,10 @@ struct saber_pointer_listener {
   void (*frame)(void *data);
 };
 
+/* Vertical and horizontal. The protocol defines no third scrolling axis, and an
+axis outside the pair is dropped rather than indexed. */
+#define SABER_SCROLL_AXES 2
+
 /* Action purpose: wl_pointer reports scroll three ways that cannot be compared
 directly -- a wheel notch as 10.0 continuous units, a touchpad as dozens of
 fractional ones per gesture, and a detented source as a separate discrete or
@@ -79,9 +83,15 @@ sub-notch remainder that makes a step cost a whole notch of travel.
 One accumulator belongs to one scroll TARGET: reset it when the target changes,
 or a half-notch left over from the tile above is spent on the tile below. */
 struct saber_scroll_accum {
-  int32_t detail; /* v120 the current frame announced ahead of its axis event */
-  uint32_t detail_axis;
-  bool has_detail;
+  /* Action purpose: One detail slot PER AXIS, rather than one slot plus a tag
+  naming the axis it came from. A frame may describe both axes, and listeners
+  record a detail unconditionally while consuming it only on the axis they act
+  on -- so with a single slot a horizontal or tilt detail overwrote a vertical
+  one already recorded, and the vertical step it belonged to silently fell back
+  to the coarse conversion. Indexed by the axis slot display.c derives; 0 is
+  vertical. */
+  int32_t detail[SABER_SCROLL_AXES];
+  bool has_detail[SABER_SCROLL_AXES];
   int32_t pending; /* accumulated v120 not yet worth a whole step */
 };
 
@@ -96,8 +106,8 @@ saber_scroll_detail(struct saber_scroll_accum *accum,
 /* Function purpose: The event's delta in v120 units -- the detail the frame
 announced when it had one, and otherwise the continuous value converted at the
 10.0-units-per-notch rate every wheel without detail reports. Call once per
-`axis` event; it consumes the detail, so a frame's detail can never be spent
-twice. Returns 0 for an axis the detail did not belong to. */
+`axis` event; it consumes this axis's detail, so a frame's detail can never be
+spent twice, and a detail recorded for the OTHER axis is left where it is. */
 int32_t
 saber_scroll_delta(struct saber_scroll_accum *accum,
     uint32_t axis,

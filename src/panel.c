@@ -58,6 +58,18 @@ does not steal clicks from a maximised window's own edge. */
 #define SABER_SEPARATOR_GAP 8.0
 #define SABER_TOKEN_TIMEOUT_MS 1000
 
+/* The band scroll arrows, in logical pixels from the edge of the scrolling
+band. The glyph is a chevron inset TIP..BASE with a half-width of ARM; BAND is
+the depth of the strip that accepts a click for it, and is deeper than the glyph
+so the affordance can be hit without being aimed at precisely. The painter and
+the hit test both derive from these, because the arrows are drawn OVER the first
+and last tile of the band -- there is no gutter in a column this narrow -- so
+anything that lets the two disagree hands the click to the tile underneath. */
+#define SABER_ARROW_TIP 2.0
+#define SABER_ARROW_BASE 6.0
+#define SABER_ARROW_ARM 4.0
+#define SABER_ARROW_BAND 10.0
+
 /* The sheet grid, in logical pixels: one wide cell for sheet 0 over a three by
 three block for 1-9. */
 #define SABER_GRID_PAD 10
@@ -221,8 +233,16 @@ struct saber_panels {
   than to the slot under the pointer -- the head band keeps its sub-notch
   remainder while its own tiles slide past, and moving onto a different tile
   drops it instead of spending it there. SABER_SCROLL_HEAD is the band itself,
-  which is what everything with no scroll of its own falls back to. */
+  which is what everything with no scroll of its own falls back to.
+
+  The PANEL is part of that identity and not merely the item and sub. Every
+  output carries its own column showing the same model, so two panels resolve
+  the same (item, sub) for what is, to the user, two different things -- and
+  with the panel left out of the comparison the accumulator was never rearmed
+  when the pointer crossed outputs, so one column spent the other's sub-notch
+  remainder. */
   struct saber_scroll_accum scroll;
+  const struct saber_panel *scroll_panel;
   size_t scroll_item;
   int scroll_sub;
 };
@@ -966,7 +986,6 @@ panel_draw_head_arrows(struct saber_panel *panel, cairo_t *cr, double width)
 
   const struct saber_theme *theme = panel->render.theme;
   double cx = width / 2.0;
-  double arm = 4.0;
 
   saber_theme_set_source(cr, &theme->foreground);
   cairo_set_line_width(cr, 1.5);
@@ -976,20 +995,58 @@ panel_draw_head_arrows(struct saber_panel *panel, cairo_t *cr, double width)
   if (panel->head_scroll > 0) {
     double base = panel->head_top;
 
-    cairo_move_to(cr, cx - arm, base + 6.0);
-    cairo_line_to(cr, cx, base + 2.0);
-    cairo_line_to(cr, cx + arm, base + 6.0);
+    cairo_move_to(cr, cx - SABER_ARROW_ARM, base + SABER_ARROW_BASE);
+    cairo_line_to(cr, cx, base + SABER_ARROW_TIP);
+    cairo_line_to(cr, cx + SABER_ARROW_ARM, base + SABER_ARROW_BASE);
     cairo_stroke(cr);
   }
 
   if (panel->head_scroll < max) {
     double base = panel->head_limit;
 
-    cairo_move_to(cr, cx - arm, base - 6.0);
-    cairo_line_to(cr, cx, base - 2.0);
-    cairo_line_to(cr, cx + arm, base - 6.0);
+    cairo_move_to(cr, cx - SABER_ARROW_ARM, base - SABER_ARROW_BASE);
+    cairo_line_to(cr, cx, base - SABER_ARROW_TIP);
+    cairo_line_to(cr, cx + SABER_ARROW_ARM, base - SABER_ARROW_BASE);
     cairo_stroke(cr);
   }
+}
+
+/* Function purpose: Which scroll arrow a surface-local point is on -- -1 for
+the one that scrolls the band back, +1 for the one that scrolls it on, 0 for
+neither. Gated on exactly the conditions panel_draw_head_arrows paints under, so
+an arrow that is not on screen cannot be clicked, and the click lands where the
+chevron is rather than on the tile it is drawn over. */
+static int
+panel_arrow_at(const struct saber_panel *panel, double x, double y)
+{
+  int max = panel_head_max_scroll(panel);
+
+  if (!panel->visible || max <= 0 ||
+      panel->head_limit <= panel->head_top) {
+    return 0;
+  }
+
+  if (x < 0.0 || x > (double)panel->width) {
+    return 0;
+  }
+
+  /* Action purpose: Clamped to the band. A band shallower than two arrow
+  strips would let the two overlap in the middle, where the upper one would
+  win every press and the lower one would be unreachable. */
+  double band =
+      MIN(SABER_ARROW_BAND, (panel->head_limit - panel->head_top) / 2.0);
+
+  if (panel->head_scroll > 0 && y >= panel->head_top &&
+      y < panel->head_top + band) {
+    return -1;
+  }
+
+  if (panel->head_scroll < max && y > panel->head_limit - band &&
+      y <= panel->head_limit) {
+    return 1;
+  }
+
+  return 0;
 }
 
 static void
@@ -2227,9 +2284,14 @@ static void
 grid_pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
 {
   (void)time;
-  (void)axis;
 
   struct saber_sheet_grid *grid = data;
+
+  /* Same reason as pointer_axis_stop below: a horizontal stop must not clear
+  the vertical remainder, because nothing here consumes horizontal scroll. */
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
 
   saber_scroll_reset(&grid->scroll);
 }
@@ -2689,12 +2751,16 @@ that belonged to the last one. Called on every scroll event rather than only on
 a change, because a target is identified by what it is and not by when it was
 last seen. */
 static void
-panel_scroll_arm(struct saber_panels *set, size_t item, int sub)
+panel_scroll_arm(struct saber_panel *panel, size_t item, int sub)
 {
-  if (set->scroll_item == item && set->scroll_sub == sub) {
+  struct saber_panels *set = panel->set;
+
+  if (set->scroll_panel == panel && set->scroll_item == item &&
+      set->scroll_sub == sub) {
     return;
   }
 
+  set->scroll_panel = panel;
   set->scroll_item = item;
   set->scroll_sub = sub;
   saber_scroll_reset(&set->scroll);
@@ -2743,7 +2809,7 @@ panel_scroll_slot(struct saber_panel *panel, int index, int32_t value120)
     struct saber_sni_item *entry =
         saber_sni_nth(set->deps.sni, (unsigned int)slot->sub);
 
-    panel_scroll_arm(set, slot->item, slot->sub);
+    panel_scroll_arm(panel, slot->item, slot->sub);
 
     /* Action purpose: Forwarded whole and negated, not truncated to an int and
     not stepped. StatusNotifierItem inherits Qt's wheel units, so 120 is one
@@ -2766,7 +2832,7 @@ panel_scroll_slot(struct saber_panel *panel, int index, int32_t value120)
   the launcher work over most of its own length instead of only over the BFB. */
   if (item != NULL && item->type == SABER_ITEM_APP &&
       saber_item_window_count(item) > 1) {
-    panel_scroll_arm(set, slot->item, -1);
+    panel_scroll_arm(panel, slot->item, -1);
 
     int steps = saber_scroll_steps(&set->scroll, value120, 120);
 
@@ -2778,7 +2844,7 @@ panel_scroll_slot(struct saber_panel *panel, int index, int32_t value120)
   }
 
   if (item != NULL && item->type == SABER_ITEM_SHEETS) {
-    panel_scroll_arm(set, slot->item, -1);
+    panel_scroll_arm(panel, slot->item, -1);
 
     int steps = saber_scroll_steps(&set->scroll, value120, 120);
 
@@ -2803,7 +2869,7 @@ panel_scroll_slot(struct saber_panel *panel, int index, int32_t value120)
   stray wheel event should be able to do -- and the launcher's own band is the
   one thing a scroll anywhere on the strip can usefully mean. The empty gap
   between the band and the tail arrives here too, with no slot at all. */
-  panel_scroll_arm(set, SABER_SCROLL_HEAD, -1);
+  panel_scroll_arm(panel, SABER_SCROLL_HEAD, -1);
 
   int steps = saber_scroll_steps(&set->scroll, value120, 120);
 
@@ -3002,6 +3068,29 @@ pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
   would fire on a drag that was never meant to be a click, and reorder is a
   drag gesture on exactly these tiles. */
   if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    /* Action purpose: The scroll arrows are painted INSIDE the first and last
+    tile of the band, so a press on one has to be claimed here -- panel_slot_at
+    tests slot rectangles only and would otherwise hand it to that tile, which
+    is how clicking an arrow came to launch an application. Claimed for every
+    button rather than the left alone: no button has a meaning on an arrow, and
+    letting the other two through would keep the same defect for the press that
+    opens a quicklist. Nothing is latched, so the release finds no pressed slot
+    and activates nothing. */
+    int arrow = panel_arrow_at(panel, panel->pointer_x, panel->pointer_y);
+
+    if (arrow != 0) {
+      panel->pressed = -1;
+      g_clear_pointer(&panel->pressed_id, g_free);
+
+      if (button == SABER_BTN_LEFT) {
+        panel_scroll_head(panel, arrow);
+      } else {
+        panel_damage(panel);
+      }
+
+      return;
+    }
+
     panel->pressed = panel->hover;
     panel_latch_pressed(panel, panel->hover);
     panel_damage(panel);
@@ -3053,9 +3142,19 @@ static void
 pointer_axis_stop(void *data, uint32_t time, uint32_t axis)
 {
   (void)time;
-  (void)axis;
 
   struct saber_panels *panels = data;
+
+  /* Action purpose: Only the axis this listener acts on ends its gesture here.
+  A reset clears the whole accumulator, and the horizontal axis reaches no
+  consumer in this file -- pointer_axis returns on it before any delta is taken
+  -- so answering a horizontal stop threw away the vertical remainder a
+  half-finished wheel or touchpad gesture had earned, and the next nudge had to
+  re-earn a whole notch. The reset itself is right for the axis that did stop:
+  the gesture is over and the next one starts from zero. */
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
 
   saber_scroll_reset(&panels->scroll);
 }
@@ -3148,6 +3247,18 @@ panel_destroy(struct saber_panel *panel)
   }
 
   g_clear_pointer(&panel->pressed_id, g_free);
+
+  /* Action purpose: The scroll identity borrows this pointer and only ever
+  compares it, so a stale one is not dereferenced -- but the allocator is free
+  to hand the same address to the next panel, and a match on that would carry
+  the dead column's sub-notch remainder into the new one. Cleared here rather
+  than left to the comparison to get lucky. */
+  if (panel->set->scroll_panel == panel) {
+    panel->set->scroll_panel = NULL;
+    panel->set->scroll_item = SABER_SCROLL_HEAD;
+    panel->set->scroll_sub = -1;
+    saber_scroll_reset(&panel->set->scroll);
+  }
 
   saber_surface_destroy(panel->surface);
   saber_clock_destroy(panel->clock);
@@ -3242,6 +3353,7 @@ saber_panels_create(const struct saber_panel_deps *deps)
   panels->deps = *deps;
   panels->list = g_ptr_array_new();
   panels->launches = g_ptr_array_new_with_free_func(launch_free);
+  panels->scroll_panel = NULL;
   panels->scroll_item = SABER_SCROLL_HEAD;
   panels->scroll_sub = -1;
 

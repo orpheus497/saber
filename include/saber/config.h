@@ -137,6 +137,15 @@ saber_config_load_status(struct saber_config *config,
 void
 saber_config_fini(struct saber_config *config);
 
+/* Where the favourites list handed back actually came from. SEEDED and FAILED
+both return the config's list, and telling them apart is what stops a failed
+read being written back over a state file that still holds the real order. */
+enum saber_config_favourites {
+  SABER_FAVOURITES_SEEDED, /* no state file; the config list seeded the run */
+  SABER_FAVOURITES_LOADED, /* the state file was read */
+  SABER_FAVOURITES_FAILED, /* the state file is present and unreadable */
+};
+
 /* Function purpose: Resolve the favourites list actually in force. The config
 list SEEDS first run; $XDG_DATA_HOME/saber/favourites holds the live order and
 wins thereafter, because drag-to-reorder must persist and rewriting a user's
@@ -145,6 +154,15 @@ bool
 saber_config_load_favourites(const struct saber_config *config,
     char ***out,
     size_t *out_len);
+
+/* Function purpose: As above, and also says which of the three cases produced
+the list. Callers that persist the order must use this form and must not save
+after SABER_FAVOURITES_FAILED. */
+bool
+saber_config_load_favourites_status(const struct saber_config *config,
+    char ***out,
+    size_t *out_len,
+    enum saber_config_favourites *status);
 
 bool
 saber_config_save_favourites(char *const *favourites, size_t len);

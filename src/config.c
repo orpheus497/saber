@@ -678,6 +678,21 @@ bool
 saber_config_load_favourites(
     const struct saber_config *config, char ***out, size_t *out_len)
 {
+  return saber_config_load_favourites_status(config, out, out_len, NULL);
+}
+
+bool
+saber_config_load_favourites_status(const struct saber_config *config,
+    char ***out,
+    size_t *out_len,
+    enum saber_config_favourites *status)
+{
+  enum saber_config_favourites outcome = SABER_FAVOURITES_SEEDED;
+
+  if (status != NULL) {
+    *status = outcome;
+  }
+
   if (out == NULL || out_len == NULL) {
     return false;
   }
@@ -688,6 +703,12 @@ saber_config_load_favourites(
 
   if (path != NULL && g_file_test(path, G_FILE_TEST_IS_REGULAR)
       && !g_file_get_contents(path, &contents, NULL, &error)) {
+    /* Action purpose: A file that is THERE and unreadable is not the same
+    answer as no file at all, and the difference is a destructive one. Both
+    paths below hand back the seed list, so a caller told only "true" would
+    write that list straight back over a state file still holding the real
+    order. The outcome is what lets it decline instead. */
+    outcome = SABER_FAVOURITES_FAILED;
     fprintf(stderr, "saber: %s: %s\n", path, error->message);
     g_error_free(error);
   }
@@ -698,6 +719,10 @@ saber_config_load_favourites(
   the live drag-to-reorder order; the config list only seeds the first run. */
   if (contents == NULL) {
     *out = config_favourites_from_config(config, out_len);
+
+    if (status != NULL) {
+      *status = outcome;
+    }
 
     return true;
   }
@@ -720,6 +745,10 @@ saber_config_load_favourites(
   *out_len = items->len;
   g_ptr_array_add(items, NULL);
   *out = (char **)g_ptr_array_free(items, FALSE);
+
+  if (status != NULL) {
+    *status = SABER_FAVOURITES_LOADED;
+  }
 
   return true;
 }

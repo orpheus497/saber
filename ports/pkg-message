@@ -1,0 +1,63 @@
+[
+{ type: install
+  message: <<EOM
+Saber is installed. Two things need doing before it is useful.
+
+1. Start it with your session. Saber is resident, not invoked, so it belongs in
+   the compositor's autostart rather than on a key binding:
+
+     echo 'saber &' >> ~/.config/hikari/autostart
+     chmod +x ~/.config/hikari/autostart
+
+   Starting it there rather than later also removes a caveat the old
+   arrangement had: a tray application asks exactly once, at its own startup,
+   whether a tray host exists, and one that finds none shows no icon and never
+   asks again. A panel that is already running when your session starts is
+   never the process that arrives too late.
+
+2. Join the operator group, if you want the session controls.
+
+   Suspend, reboot and shut down run as you. Saber installs nothing setuid or
+   setgid and writes no sudoers rule -- FreeBSD already ships the group for
+   this, and /sbin/shutdown and /dev/acpi are already set up for it:
+
+     pw groupmod operator -m <user>
+
+   The change takes effect at the user's next login. Without it Saber simply
+   HIDES those three entries rather than offering buttons that fail, so
+   declining this is a supported configuration and not a broken one.
+
+DO NOT run "sofi -tray-daemon" alongside Saber. Exactly one process on a
+session bus can own org.kde.StatusNotifierWatcher, so the two tray hosts
+cannot coexist -- you get whichever registered first, and applications that
+started before it show no icon at all. Remove it from your autostart, or
+rebuild this port with the TRAY option off to keep using it instead.
+
+Everything else about sofi is unaffected: its application menu, notification
+daemon and notification history are not superseded, and neither is the
+compositor's own top bar, which keeps all system telemetry.
+
+Saber has no theme file. It reads ui { palette } out of your hikari.conf, so
+retheming the compositor retints the panel with it. Configuration, all of it
+optional, is ~/.config/saber/saber.conf in the same UCL syntax.
+EOM
+}
+{ type: remove
+  message: <<EOM
+Saber is removed, but two references to it may remain.
+
+Remove the "saber" line from ~/.config/hikari/autostart, or the session will
+report a missing binary on every start.
+
+If you disabled "sofi -tray-daemon" when you installed Saber, re-enable it now
+or your session will have no system tray at all. Restart the applications whose
+tray icons you want afterwards: a tray application asks for a host only once, at
+its own startup.
+
+Group membership is left alone. If you added a user to the operator group for
+Saber's session controls and want that reverted:
+
+     pw groupmod operator -d <user>
+EOM
+}
+]

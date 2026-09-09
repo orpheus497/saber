@@ -1,0 +1,23 @@
+Saber is a persistent vertical panel for Wayland in the tradition of the Unity 7
+launcher, built for the hikari-sakura compositor on FreeBSD. Down its column sit
+an application menu button, pinned and running applications with their
+window-count pips and focus arrow, the sheet indicator, mounted devices, the
+trash, the system tray and the session controls.
+
+It is a pure Wayland client. Windows are listed and acted on through
+wlr-foreign-toplevel-management, surfaces are placed with wlr-layer-shell, and
+the compositor's sheets are read over its own control socket. Nothing about the
+compositor is patched or assumed beyond what it already publishes, and the panel
+draws itself with cairo and pango rather than linking a widget toolkit.
+
+Saber has no theme of its own: it reads the sixteen-colour palette out of the
+user's hikari.conf, so retheming the compositor retints the panel along with the
+top bar and the lock screen.
+
+The system tray is a StatusNotifierItem host. Exactly one process on a session
+bus may own that role, so Saber and "sofi -tray-daemon" cannot both run; build
+without the TRAY option to keep the latter.
+
+Saber is the panel layer of the Sakura desktop, alongside the sakura display
+manager, the hikari-sakura compositor and the sofi launcher, and depends on none
+of them at build time.

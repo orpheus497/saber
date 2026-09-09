@@ -1,0 +1,4 @@
+bin/saber
+bin/saberctl
+share/icons/hicolor/scalable/apps/saber.svg
+@sample etc/saber/saber.conf.sample

@@ -20,6 +20,13 @@ struct saber_model {
 
   bool loading; /* suppress persistence while the list is being built */
 
+  /* Set when the state file was present and could not be read. The list in
+  memory is then the config's seed rather than the user's order, so writing it
+  back would replace a file that still holds the real one with a list the user
+  never chose. Latched for the session: a read that failed once says nothing
+  about what the file contains, and guessing is what loses it. */
+  bool favourites_unreadable;
+
   /* One-shot, rearmed by each launch: clears `launching` when the match window
   that justified it closes. */
   guint launch_expiry;
@@ -129,6 +136,19 @@ normalise(struct saber_model *model)
 bool
 saber_model_save(const struct saber_model *model)
 {
+  /* Action purpose: Refused rather than attempted. What is in memory is the
+  seed list, not the user's order, and the file on disk is the only remaining
+  copy of the real one -- so the failure mode of saving here is silent data
+  loss, and the failure mode of declining is a pin that does not persist until
+  the panel is restarted. Reported every time, because a pin that quietly does
+  not stick is worse than one that says why. */
+  if (model->favourites_unreadable) {
+    g_warning("saber: favourites were not readable at startup; not saving over "
+              "them. Fix or remove the file and restart to persist changes.");
+
+    return false;
+  }
+
   GPtrArray *ids = g_ptr_array_new();
   size_t end = apps_end(model);
   for (size_t i = model->head; i < end; i++) {
@@ -209,7 +229,12 @@ saber_model_create(const struct saber_config *config,
 
   char **favourites = NULL;
   size_t count = 0;
-  if (saber_config_load_favourites(config, &favourites, &count)) {
+  enum saber_config_favourites source = SABER_FAVOURITES_SEEDED;
+
+  if (saber_config_load_favourites_status(config, &favourites, &count,
+          &source)) {
+    model->favourites_unreadable = source == SABER_FAVOURITES_FAILED;
+
     for (size_t i = 0; i < count; i++) {
       if (favourites[i] != NULL && *favourites[i] != '\0' &&
           saber_model_find(model, favourites[i]) == NULL) {

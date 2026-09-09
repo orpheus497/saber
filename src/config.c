@@ -701,16 +701,26 @@ saber_config_load_favourites_status(const struct saber_config *config,
   char *contents = NULL;
   GError *error = NULL;
 
-  if (path != NULL && g_file_test(path, G_FILE_TEST_IS_REGULAR)
-      && !g_file_get_contents(path, &contents, NULL, &error)) {
+  if (path != NULL && !g_file_get_contents(path, &contents, NULL, &error)) {
     /* Action purpose: A file that is THERE and unreadable is not the same
     answer as no file at all, and the difference is a destructive one. Both
     paths below hand back the seed list, so a caller told only "true" would
     write that list straight back over a state file still holding the real
-    order. The outcome is what lets it decline instead. */
-    outcome = SABER_FAVOURITES_FAILED;
-    fprintf(stderr, "saber: %s: %s\n", path, error->message);
-    g_error_free(error);
+    order. The outcome is what lets it decline instead.
+
+    The read attempt is what decides which case this is -- ONLY ENOENT means
+    "no state file, seed the run". A g_file_test() ahead of it reopened the
+    same hole this outcome exists to close: it stats, so every stat failure
+    (a directory that cannot be traversed, an I/O error, a symlink loop) and
+    everything that is not a regular file read as absence, and the seed list
+    was then cleared to overwrite whatever is really there. Testing first also
+    raced the read it guarded. */
+    if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+      outcome = SABER_FAVOURITES_FAILED;
+      fprintf(stderr, "saber: %s: %s\n", path, error->message);
+    }
+
+    g_clear_error(&error);
   }
 
   g_free(path);

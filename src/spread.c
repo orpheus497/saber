@@ -253,6 +253,18 @@ spread_rebuild(struct saber_spread *spread)
       was_cell != NULL ? was_cell->toplevel : NULL;
   uint64_t was_id = was_cell != NULL ? was_cell->toplevel_id : 0;
 
+  /* Same reasoning, for a press still in flight: a window closing elsewhere
+  while a different cell is held down must not dismiss the whole spread on
+  release instead of activating the cell actually under the pointer. */
+  const struct spread_cell *was_pressed_cell = spread->pressed >= 0 &&
+          spread->pressed < (int)spread->cells->len
+      ? g_ptr_array_index(spread->cells, spread->pressed)
+      : NULL;
+  const struct saber_toplevel *was_pressed =
+      was_pressed_cell != NULL ? was_pressed_cell->toplevel : NULL;
+  uint64_t was_pressed_id =
+      was_pressed_cell != NULL ? was_pressed_cell->toplevel_id : 0;
+
   g_ptr_array_set_size(spread->cells, 0);
 
   const struct wl_list *list = spread->deps.toplevels != NULL
@@ -321,8 +333,18 @@ spread_rebuild(struct saber_spread *spread)
     }
   }
 
-  spread->hovered = -1;
   spread->pressed = -1;
+
+  for (guint i = 0; was_pressed != NULL && i < spread->cells->len; i++) {
+    const struct spread_cell *cell = g_ptr_array_index(spread->cells, i);
+
+    if (cell->toplevel == was_pressed && cell->toplevel_id == was_pressed_id) {
+      spread->pressed = (int)i;
+      break;
+    }
+  }
+
+  spread->hovered = -1;
   spread->on_close = false;
 
   spread_layout(spread);

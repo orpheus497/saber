@@ -34,10 +34,16 @@ struct saber_ipc_report {
   bool overflow;
 };
 
+/* A keybinding opens a connection, sends one line and reads one reply; nothing
+legitimate needs longer than this to do that. Without a cap, a client that
+connects and then sends nothing occupies one of SABER_IPC_MAX_CLIENTS forever. */
+#define SABER_IPC_CLIENT_TIMEOUT_S 5
+
 struct ipc_client {
   struct saber_ipc *ipc;
   GSocket *socket;
   GSource *source;
+  guint timeout_id;
   size_t len;
   char buf[SABER_IPC_MAX_REQUEST];
 };
@@ -89,6 +95,10 @@ client_destroy(struct ipc_client *client)
   if (client->source != NULL) {
     g_source_destroy(client->source);
     g_source_unref(client->source);
+  }
+
+  if (client->timeout_id != 0) {
+    g_source_remove(client->timeout_id);
   }
 
   g_socket_close(client->socket, NULL);
@@ -415,6 +425,18 @@ client_readable(GSocket *socket, GIOCondition condition, gpointer data)
 }
 
 static gboolean
+client_timeout(gpointer data)
+{
+  struct ipc_client *client = data;
+
+  client->timeout_id = 0;
+  respond(client, "error request timed out\n");
+  client_destroy(client);
+
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
 listener_readable(GSocket *socket, GIOCondition condition, gpointer data)
 {
   struct saber_ipc *ipc = data;
@@ -463,6 +485,9 @@ listener_readable(GSocket *socket, GIOCondition condition, gpointer data)
   g_source_set_callback(
       client->source, G_SOURCE_FUNC(client_readable), client, NULL);
   g_source_attach(client->source, g_main_context_get_thread_default());
+
+  client->timeout_id = g_timeout_add_seconds(
+      SABER_IPC_CLIENT_TIMEOUT_S, client_timeout, client);
 
   return G_SOURCE_CONTINUE;
 }
@@ -637,6 +662,38 @@ saber_ipc_create(const struct saber_ipc_handlers *handlers, GError **error)
         SABER_IPC_ERROR_NO_RUNTIME_DIR,
         "XDG_RUNTIME_DIR is unset; there is nowhere to put the control "
         "socket, so keybindings cannot reach the panel");
+    return NULL;
+  }
+
+  if (runtime_dir[0] != '/') {
+    g_set_error(error,
+        SABER_IPC_ERROR,
+        SABER_IPC_ERROR_NO_RUNTIME_DIR,
+        "XDG_RUNTIME_DIR (%s) is not an absolute path",
+        runtime_dir);
+    return NULL;
+  }
+
+  struct stat runtime_st;
+
+  if (stat(runtime_dir, &runtime_st) != 0) {
+    g_set_error(error,
+        SABER_IPC_ERROR,
+        SABER_IPC_ERROR_SOCKET,
+        "could not stat XDG_RUNTIME_DIR (%s): %s",
+        runtime_dir,
+        g_strerror(errno));
+    return NULL;
+  }
+
+  if (runtime_st.st_uid != geteuid() ||
+      (runtime_st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    g_set_error(error,
+        SABER_IPC_ERROR,
+        SABER_IPC_ERROR_SOCKET,
+        "XDG_RUNTIME_DIR (%s) is not private to this user; refusing to "
+        "place the control socket there",
+        runtime_dir);
     return NULL;
   }
 

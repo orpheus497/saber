@@ -18,6 +18,10 @@ side, which is what lets a quicklist escape the column's width. */
 
 #define SABER_SCALE_UNIT 120
 
+/* Same reasoning as display.c's SABER_OUTPUT_SCALE_MAX: an unclamped value
+here flows straight into the buffer-size math in surface_pixel_size(). */
+#define SABER_FRACTIONAL_SCALE_MAX (10 * SABER_SCALE_UNIT)
+
 int
 saber_surface_panel_width(int icon_size)
 {
@@ -297,7 +301,8 @@ fractional_scale_handle_preferred(void *data,
 
   struct saber_surface *surface = data;
 
-  if (scale == 0 || scale == surface->scale_120) {
+  if (scale == 0 || scale > SABER_FRACTIONAL_SCALE_MAX ||
+      scale == surface->scale_120) {
     return;
   }
 
@@ -828,7 +833,8 @@ popup_fractional_scale_handle_preferred(void *data,
 
   struct saber_popup *popup = data;
 
-  if (scale == 0 || scale == popup->scale_120) {
+  if (scale == 0 || scale > SABER_FRACTIONAL_SCALE_MAX ||
+      scale == popup->scale_120) {
     return;
   }
 

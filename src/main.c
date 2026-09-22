@@ -14,10 +14,6 @@ linked and not merely that their headers were on the include path. */
 #include <string.h>
 #include <unistd.h>
 
-#include <grp.h>
-#include <limits.h>
-#include <sys/types.h>
-
 #include <cairo.h>
 #include <glib-unix.h>
 #include <glib.h>
@@ -38,6 +34,7 @@ linked and not merely that their headers were on the include path. */
 #include <saber/panel.h>
 #include <saber/render.h>
 #include <saber/saber.h>
+#include <saber/session.h>
 #include <saber/sheets.h>
 #include <saber/sni.h>
 #include <saber/spread.h>
@@ -100,39 +97,6 @@ report_build(void)
       glib_minor_version,
       glib_micro_version);
   printf("  cairo            %s\n", cairo_version_string());
-}
-
-/* Function purpose: Report whether this user can carry out the session actions,
-using the same test the panel itself will use to decide whether to draw them.
-
-The result is informational here and load-bearing later: Saber HIDES suspend,
-reboot and shut down when the answer is no, rather than offering buttons that
-fail. See DECISIONS_LOG D-013 for why membership of the base system's existing
-`operator` group is the whole privilege model, and why Saber ships nothing
-setuid, setgid or sudoers-shaped. */
-static bool
-in_operator_group(void)
-{
-  struct group *operator_group = getgrnam("operator");
-
-  if (operator_group == NULL) {
-    return false;
-  }
-
-  gid_t groups[NGROUPS_MAX];
-  int count = getgroups(NGROUPS_MAX, groups);
-
-  if (count < 0) {
-    return false;
-  }
-
-  for (int i = 0; i < count; i++) {
-    if (groups[i] == operator_group->gr_gid) {
-      return true;
-    }
-  }
-
-  return false;
 }
 
 static void
@@ -350,7 +314,8 @@ static enum saber_ipc_result
 ipc_launch(int favourite, void *user)
 {
   struct saber_app *app = user;
-  const struct saber_item *item = saber_model_nth(app->model, favourite - 1);
+  size_t index = saber_model_apps_begin(app->model) + (size_t)(favourite - 1);
+  const struct saber_item *item = saber_model_nth(app->model, index);
 
   if (item == NULL || item->type != SABER_ITEM_APP) {
     return SABER_IPC_RESULT_NO_FAVOURITE;
@@ -1100,7 +1065,8 @@ main(int argc, char **argv)
 
     if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--build") == 0) {
       report_build();
-      printf("  operator group   %s\n", in_operator_group() ? "yes" : "no");
+      printf("  operator group   %s\n",
+          saber_session_in_operator_group() ? "yes" : "no");
       return EXIT_SUCCESS;
     }
 

@@ -43,7 +43,7 @@ struct ipc_client {
   struct saber_ipc *ipc;
   GSocket *socket;
   GSource *source;
-  guint timeout_id;
+  GSource *timeout;
   size_t len;
   char buf[SABER_IPC_MAX_REQUEST];
 };
@@ -97,8 +97,9 @@ client_destroy(struct ipc_client *client)
     g_source_unref(client->source);
   }
 
-  if (client->timeout_id != 0) {
-    g_source_remove(client->timeout_id);
+  if (client->timeout != NULL) {
+    g_source_destroy(client->timeout);
+    g_source_unref(client->timeout);
   }
 
   g_socket_close(client->socket, NULL);
@@ -429,7 +430,7 @@ client_timeout(gpointer data)
 {
   struct ipc_client *client = data;
 
-  client->timeout_id = 0;
+  client->timeout = NULL;
   respond(client, "error request timed out\n");
   client_destroy(client);
 
@@ -486,8 +487,17 @@ listener_readable(GSocket *socket, GIOCondition condition, gpointer data)
       client->source, G_SOURCE_FUNC(client_readable), client, NULL);
   g_source_attach(client->source, g_main_context_get_thread_default());
 
-  client->timeout_id = g_timeout_add_seconds(
-      SABER_IPC_CLIENT_TIMEOUT_S, client_timeout, client);
+  /* Action purpose: g_timeout_add_seconds() attaches to the global-default
+  context, not the thread-default one client->source uses above -- harmless
+  today's one caller runs on the global-default loop, but saber_ipc_create_at
+  is documented for "a second panel on a second seat", which could mean a
+  second thread-default context. Attached explicitly here so the timeout is
+  always driven by the same loop that reads the socket, never a different
+  one. */
+  client->timeout = g_timeout_source_new_seconds(SABER_IPC_CLIENT_TIMEOUT_S);
+  g_source_set_callback(
+      client->timeout, client_timeout, client, NULL);
+  g_source_attach(client->timeout, g_main_context_get_thread_default());
 
   return G_SOURCE_CONTINUE;
 }

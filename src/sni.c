@@ -57,6 +57,13 @@ whole zone regardless of which item changed. Separate from, and shorter than,
 the per-item fetch debounce above. */
 #define SNI_CHANGED_COALESCE_MS 50
 
+/* Any session peer can call RegisterStatusNotifierItem/Host with a fresh
+object path each time; without a ceiling that grows sni->items/sni->hosts
+without bound. Far above any real desktop, same reasoning as unity.c's
+UNITY_MAX_ENTRIES. */
+#define SNI_MAX_ITEMS 256
+#define SNI_MAX_HOSTS 64
+
 static const char introspection_xml[] =
     "<node>"
     "  <interface name='org.kde.StatusNotifierWatcher'>"
@@ -786,6 +793,16 @@ register_item(struct saber_sni *sni, const char *service, const char *sender)
     return true;
   }
 
+  if (sni->items->len >= SNI_MAX_ITEMS) {
+    g_debug("saber: refusing a StatusNotifierItem registration; the tray "
+            "is at its %d-item ceiling",
+        SNI_MAX_ITEMS);
+    g_free(canonical);
+    g_free(bus_name);
+    g_free(object_path);
+    return false;
+  }
+
   struct saber_sni_item *item =
       item_create(sni, canonical, bus_name, object_path);
 
@@ -860,6 +877,13 @@ register_host(struct saber_sni *sni, const char *service, const char *sender)
 
   if (g_hash_table_contains(sni->hosts, name)) {
     return true;
+  }
+
+  if (g_hash_table_size(sni->hosts) >= SNI_MAX_HOSTS) {
+    g_debug("saber: refusing a StatusNotifierHost registration; already at "
+            "its %d-host ceiling",
+        SNI_MAX_HOSTS);
+    return false;
   }
 
   guint id = g_bus_watch_name(G_BUS_TYPE_SESSION,

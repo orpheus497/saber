@@ -116,13 +116,20 @@ output_handle_done(void *data, struct wl_output *wl_output)
   }
 }
 
+/* Action purpose: An unclamped factor flows straight into buffer-size math
+downstream. Real outputs top out around 3x; 10 leaves headroom with no
+practical display anywhere near it, so anything outside (0, 10] falls back to
+unscaled rather than being trusted. */
+#define SABER_OUTPUT_SCALE_MAX 10
+
 static void
 output_handle_scale(void *data, struct wl_output *wl_output, int32_t factor)
 {
   (void)wl_output;
 
   struct saber_output *output = data;
-  output->scale = factor > 0 ? factor : 1;
+  output->scale =
+      (factor > 0 && factor <= SABER_OUTPUT_SCALE_MAX) ? factor : 1;
 }
 
 static void
@@ -1448,6 +1455,8 @@ saber_display_create(const char *name)
   display->wl_display = wl_display_connect(name);
 
   if (display->wl_display == NULL) {
+    g_ptr_array_free(display->activations, TRUE);
+    g_ptr_array_free(display->pointer_listeners, TRUE);
     g_free(display);
     return NULL;
   }

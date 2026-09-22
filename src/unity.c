@@ -3,6 +3,7 @@
 and accumulates per-application badge state. Written fresh for Saber; sofi has
 no launcher-entry code to port from. */
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -123,7 +124,7 @@ apply_update(struct saber_unity_entry *entry,
   gdouble progress = 0.0;
 
   if (g_variant_lookup(props, "progress", "d", &progress)) {
-    entry->progress = CLAMP(progress, 0.0, 1.0);
+    entry->progress = isnan(progress) ? 0.0 : CLAMP(progress, 0.0, 1.0);
   }
 
   lookup_bool(props, "count-visible", &entry->count_visible);

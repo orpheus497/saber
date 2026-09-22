@@ -15,6 +15,7 @@ librsvg, and no glib either. It sends one line and prints one response. */
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #include <saber/ipc.h>
@@ -108,6 +109,32 @@ connect_to_panel(void)
     fprintf(stderr,
         "saberctl: XDG_RUNTIME_DIR is not set, so there is no panel socket to "
         "find.\n");
+    return -1;
+  }
+
+  if (runtime_dir[0] != '/') {
+    fprintf(stderr,
+        "saberctl: XDG_RUNTIME_DIR (%s) is not an absolute path.\n",
+        runtime_dir);
+    return -1;
+  }
+
+  struct stat runtime_st;
+
+  if (stat(runtime_dir, &runtime_st) != 0) {
+    fprintf(stderr,
+        "saberctl: cannot stat XDG_RUNTIME_DIR (%s): %s\n",
+        runtime_dir,
+        strerror(errno));
+    return -1;
+  }
+
+  if (runtime_st.st_uid != geteuid() ||
+      (runtime_st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    fprintf(stderr,
+        "saberctl: XDG_RUNTIME_DIR (%s) is not private to this user; "
+        "refusing to trust its control socket.\n",
+        runtime_dir);
     return -1;
   }
 

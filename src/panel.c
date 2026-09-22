@@ -142,6 +142,10 @@ struct saber_panel {
   enum saber_item_type pressed_type;
   char *pressed_id;
   int pressed_sub;
+  /* Stable identity of the icon at pressed_sub within a zone tile (tray
+  service string, or device mount point) -- see panel_pressed_matches. NULL
+  outside a zone tile. */
+  char *pressed_sub_id;
 
   /* Whether the column is on screen. Always true under `autohide = never`
   unless `saberctl hide` says otherwise; under `auto` it is driven by pressure
@@ -180,6 +184,7 @@ enum saber_menu_kind {
 
 struct saber_menu {
   struct saber_panels *set;
+  struct saber_panel *panel; /* which column opened it, for panel_destroy */
   enum saber_menu_kind kind;
   char *id; /* the model item's id, for an application menu */
 };
@@ -1083,6 +1088,7 @@ panel_render_surface(void *data,
   }
 
   struct saber_model *model = panel->set->deps.model;
+  size_t apps_begin = saber_model_apps_begin(model);
 
   for (guint i = 0; i < panel->slots->len; i++) {
     const struct saber_slot *slot =
@@ -1104,13 +1110,13 @@ panel_render_surface(void *data,
       .throb = 1.0,
     };
 
-    /* Action purpose: The number is the model position, because that is what
-    `saberctl launch N` resolves -- it takes saber_model_nth(model, N - 1) and
-    requires an application there. Numbering the slot instead would drift from
-    the binding the moment a non-application portion sat above the band. */
+    /* Action purpose: The number is the position within the app band, because
+    that is what `saberctl launch N` resolves -- it takes
+    saber_model_nth(model, apps_begin + N - 1) and requires an application
+    there. */
     if (panel->set->overlay && item->type == SABER_ITEM_APP &&
-        slot->item < SABER_OVERLAY_MAX) {
-      tile.overlay_number = (int)slot->item + 1;
+        slot->item - apps_begin < SABER_OVERLAY_MAX) {
+      tile.overlay_number = (int)(slot->item - apps_begin) + 1;
     }
 
     if (item->type == SABER_ITEM_APP) {
@@ -1774,10 +1780,12 @@ panel_menu_params(struct saber_panel *panel,
 }
 
 static struct saber_menu *
-panel_menu_context(struct saber_panels *set,
+panel_menu_context(struct saber_panel *panel,
     enum saber_menu_kind kind,
     const char *id)
 {
+  struct saber_panels *set = panel->set;
+
   if (set->menu_ctx != NULL) {
     g_free(set->menu_ctx->id);
     g_free(set->menu_ctx);
@@ -1786,6 +1794,7 @@ panel_menu_context(struct saber_panels *set,
   struct saber_menu *menu = g_new0(struct saber_menu, 1);
 
   menu->set = set;
+  menu->panel = panel;
   menu->kind = kind;
   menu->id = g_strdup(id);
   set->menu_ctx = menu;
@@ -1843,7 +1852,7 @@ panel_open_app_menu(struct saber_panel *panel,
 
   panel_close_menu(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
-      panel_menu_context(set, SABER_MENU_APP, item->id));
+      panel_menu_context(panel, SABER_MENU_APP, item->id));
 
   g_free(windows);
 }
@@ -1862,7 +1871,7 @@ panel_open_tray_menu(struct saber_panel *panel,
 
   panel_close_menu(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
-      panel_menu_context(set, SABER_MENU_TRAY, NULL));
+      panel_menu_context(panel, SABER_MENU_TRAY, NULL));
 
   /* The item published nothing drawable. ContextMenu is then the only thing
   left to ask, and most items answer it by doing nothing. */
@@ -1922,7 +1931,7 @@ panel_open_session_menu(struct saber_panel *panel,
 
   panel_close_menu(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
-      panel_menu_context(set, SABER_MENU_SESSION, NULL));
+      panel_menu_context(panel, SABER_MENU_SESSION, NULL));
 }
 
 static void
@@ -1942,7 +1951,7 @@ panel_open_trash_menu(struct saber_panel *panel, const struct saber_slot *slot)
 
   panel_close_menu(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
-      panel_menu_context(set, SABER_MENU_TRASH, NULL));
+      panel_menu_context(panel, SABER_MENU_TRASH, NULL));
 }
 
 /* -------------------------------------------------------------- sheet grid */
@@ -2628,12 +2637,52 @@ panel_click_tray(struct saber_panel *panel,
   }
 }
 
+/* Function purpose: A stable identity for the icon at `sub` within a zone
+tile (tray or devices), where every icon shares the same model item->id and
+`sub` itself is only a position -- unregistering an earlier icon reindexes
+every one after it. NULL when there is nothing there right now. Caller
+frees the result. */
+static char *
+panel_slot_sub_id(const struct saber_panels *set,
+    enum saber_item_type type,
+    int sub)
+{
+  if (sub < 0) {
+    return NULL;
+  }
+
+  switch (type) {
+  case SABER_ITEM_TRAY: {
+    struct saber_sni_item *entry =
+        saber_sni_nth(set->deps.sni, (unsigned int)sub);
+
+    return entry != NULL ? g_strdup(saber_sni_item_service(entry)) : NULL;
+  }
+
+  case SABER_ITEM_DEVICES: {
+    const GPtrArray *list = saber_devices_list(set->deps.devices);
+
+    if (list == NULL || (guint)sub >= list->len) {
+      return NULL;
+    }
+
+    const struct saber_device *device = g_ptr_array_index(list, sub);
+
+    return g_strdup(device->mount_point);
+  }
+
+  default:
+    return NULL;
+  }
+}
+
 /* Function purpose: Remember which tile a press landed on, by identity, so the
 release can tell whether it is still the same one. */
 static void
 panel_latch_pressed(struct saber_panel *panel, int index)
 {
   g_clear_pointer(&panel->pressed_id, g_free);
+  g_clear_pointer(&panel->pressed_sub_id, g_free);
   panel->pressed_type = SABER_ITEM_APP;
   panel->pressed_sub = -1;
 
@@ -2653,11 +2702,19 @@ panel_latch_pressed(struct saber_panel *panel, int index)
   panel->pressed_type = item->type;
   panel->pressed_id = g_strdup(item->id);
   panel->pressed_sub = slot->sub;
+
+  if (item_is_zone(item->type)) {
+    panel->pressed_sub_id =
+        panel_slot_sub_id(panel->set, item->type, slot->sub);
+  }
 }
 
-/* Function purpose: Whether a slot is still the tile that was pressed. Compares
-the id as well as the type because two tiles of the same type -- two application
-tiles, two tray items -- are otherwise indistinguishable. */
+/* Function purpose: Whether a slot is still the tile that was pressed.
+Compares the id as well as the type because two tiles of the same type -- two
+application tiles, two tray items -- are otherwise indistinguishable. Within a
+zone tile (tray, devices) `sub` is a position rather than an identity, so a
+reorder mid-press (an icon appearing or disappearing, a mount changing) is
+resolved by comparing the icon's own stable identity instead. */
 static bool
 panel_pressed_matches(const struct saber_panel *panel, int index)
 {
@@ -2670,12 +2727,22 @@ panel_pressed_matches(const struct saber_panel *panel, int index)
   const struct saber_item *item =
       saber_model_nth(panel->set->deps.model, slot->item);
 
-  if (item == NULL) {
+  if (item == NULL || item->type != panel->pressed_type ||
+      g_strcmp0(item->id, panel->pressed_id) != 0) {
     return false;
   }
 
-  return item->type == panel->pressed_type && slot->sub == panel->pressed_sub &&
-      g_strcmp0(item->id, panel->pressed_id) == 0;
+  if (!item_is_zone(item->type)) {
+    return slot->sub == panel->pressed_sub;
+  }
+
+  char *current_sub_id = panel_slot_sub_id(panel->set, item->type, slot->sub);
+  bool matches = panel->pressed_sub_id != NULL && current_sub_id != NULL &&
+      strcmp(current_sub_id, panel->pressed_sub_id) == 0;
+
+  g_free(current_sub_id);
+
+  return matches;
 }
 
 static void
@@ -3081,6 +3148,7 @@ pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
     if (arrow != 0) {
       panel->pressed = -1;
       g_clear_pointer(&panel->pressed_id, g_free);
+      g_clear_pointer(&panel->pressed_sub_id, g_free);
 
       if (button == SABER_BTN_LEFT) {
         panel_scroll_head(panel, arrow);
@@ -3112,6 +3180,7 @@ pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
   }
 
   g_clear_pointer(&panel->pressed_id, g_free);
+  g_clear_pointer(&panel->pressed_sub_id, g_free);
 }
 
 static void
@@ -3242,11 +3311,13 @@ panel_destroy(struct saber_panel *panel)
     sheet_grid_close(panel->set->grid);
   }
 
-  if (panel->set->menu != NULL) {
+  if (panel->set->menu != NULL && panel->set->menu_ctx != NULL &&
+      panel->set->menu_ctx->panel == panel) {
     saber_quicklist_close(panel->set->menu);
   }
 
   g_clear_pointer(&panel->pressed_id, g_free);
+  g_clear_pointer(&panel->pressed_sub_id, g_free);
 
   /* Action purpose: The scroll identity borrows this pointer and only ever
   compares it, so a stale one is not dereferenced -- but the allocator is free
@@ -3539,6 +3610,7 @@ saber_panels_set_visible(struct saber_panels *panels, bool visible)
       panel_set_hover(panel, -1);
       panel->pressed = -1;
       g_clear_pointer(&panel->pressed_id, g_free);
+      g_clear_pointer(&panel->pressed_sub_id, g_free);
     }
 
     panel_apply_visibility(panel);

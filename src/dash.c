@@ -139,7 +139,7 @@ enum dash_rank {
 
 struct dash_entry {
   struct saber_appinfo *app; /* held ref: a re-scan replaces the index */
-  const char *label;
+  char *label; /* validated UTF-8, unlike app->name/app->id it is drawn from */
 
   /* Case-folded once when the dash opens, so a keystroke costs three strstr
   per entry rather than three casefold allocations. */
@@ -357,6 +357,7 @@ entry_free(gpointer data)
   struct dash_entry *entry = data;
 
   saber_appinfo_unref(entry->app);
+  g_free(entry->label);
   g_free(entry->fold_name);
   g_free(entry->fold_generic);
   g_free(entry->fold_exec);
@@ -500,17 +501,21 @@ dash_build_entries(struct saber_dash *dash)
 
     struct dash_entry *entry = g_new0(struct dash_entry, 1);
     char *exec = exec_basename(app->exec);
-    char *sort_label = utf8_dup(label);
 
     entry->app = saber_appinfo_ref(app);
-    entry->label = label;
+    /* Action purpose: app->id is a filename-derived byte string that is not
+    guaranteed valid UTF-8 on this platform; app->name is validated on the way
+    in but there is no reason to trust it any less carefully here. Validating
+    once and keeping the result is what lets every consumer -- the icon
+    fallback's initial letter and the cell title alike -- rely on the same
+    guarantee instead of each deciding separately whether to trust `label`. */
+    entry->label = utf8_dup(label);
     entry->fold_name = fold(label);
     entry->fold_generic = fold(app->generic_name);
     entry->fold_exec = fold(exec);
-    entry->sort_key = g_utf8_collate_key(sort_label, -1);
+    entry->sort_key = g_utf8_collate_key(entry->label, -1);
     entry->category = entry_category(app);
 
-    g_free(sort_label);
     g_free(exec);
     g_ptr_array_add(dash->entries, entry);
   }
@@ -579,6 +584,17 @@ dash_filter(struct saber_dash *dash)
 {
   char *needle = fold(dash->query->str);
 
+  /* Action purpose: A keystroke or category change fires mid-press as often
+  as not -- the search field and the grid share one surface -- and must not
+  silently drop a press already in flight. dash->results is only a filtered
+  VIEW rebuilt here; the entry itself lives in dash->entries and is untouched
+  by a refilter, so it is looked up again by identity below instead of being
+  discarded with the rest of the old view. */
+  struct dash_entry *was_pressed = dash->pressed >= 0 &&
+          (guint)dash->pressed < dash->results->len
+      ? g_ptr_array_index(dash->results, dash->pressed)
+      : NULL;
+
   g_ptr_array_set_size(dash->results, 0);
 
   /* Action purpose: The two filters intersect. The category is checked first
@@ -606,7 +622,16 @@ dash_filter(struct saber_dash *dash)
   dash->selected = dash->results->len > 0 ? 0 : -1;
   dash->hovered = -1;
   dash->fading = -1;
+
   dash->pressed = -1;
+
+  for (guint i = 0; was_pressed != NULL && i < dash->results->len; i++) {
+    if (g_ptr_array_index(dash->results, i) == was_pressed) {
+      dash->pressed = (int)i;
+      break;
+    }
+  }
+
   dash->scroll = 0;
 
   dash_layout(dash);
@@ -1113,17 +1138,8 @@ dash_draw_cell(struct saber_dash *dash,
     distinct cell rather than as a gap in the grid. */
     char initial[8] = { 0 };
 
-    /* Action purpose: g_utf8_strncpy advances with g_utf8_next_char, which
-    trusts the lead byte's declared length -- on a truncated final sequence it
-    reads past the terminator and copies whatever follows. entry->label is
-    app->name or the filename-derived app->id, and only the former is validated
-    by glib on the way in, so the label reaching here is not guaranteed valid.
-    The file's own note at the top of fold() documents this hazard; it was not
-    applied on this path. */
-    if (g_utf8_validate(entry->label, -1, NULL)) {
-      g_utf8_strncpy(initial, entry->label, 1);
-      *initial = (char)g_ascii_toupper(*initial);
-    }
+    g_utf8_strncpy(initial, entry->label, 1);
+    *initial = (char)g_ascii_toupper(*initial);
 
     set_source_alpha(cr, &theme->dim, 0.6);
     rounded_rect(cr, x + w / 2.0 - DASH_ICON / 2.0, y + 14.0, DASH_ICON,

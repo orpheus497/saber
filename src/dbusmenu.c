@@ -23,6 +23,13 @@ that is merely busy and short enough that a wedged one reads as an empty menu
 rather than a frozen panel. */
 #define MENU_CALL_TIMEOUT_MS 2000
 
+/* Action purpose: saber_dbusmenu_refresh's g_dbus_connection_call_sync runs on
+the main loop, so its timeout is how long the WHOLE panel -- not just the menu
+being opened -- stops responding for. 300ms is enough for a merely-busy peer
+to answer and short enough that a hung one is a brief stutter rather than the
+multi-second freeze MENU_CALL_TIMEOUT_MS would otherwise allow. */
+#define MENU_SYNC_CALL_TIMEOUT_MS 300
+
 /* Action purpose: The peer decides how many rows to send, and how deeply
 nested. A menu past these bounds is either a defect or hostile, and rendering
 it is not useful either way. Both are far above any real menu. */
@@ -365,7 +372,7 @@ saber_dbusmenu_refresh(struct saber_dbusmenu *menu)
       layout_arguments(),
       G_VARIANT_TYPE("(u(ia{sv}av))"),
       G_DBUS_CALL_FLAGS_NO_AUTO_START,
-      MENU_CALL_TIMEOUT_MS,
+      MENU_SYNC_CALL_TIMEOUT_MS,
       menu->cancellable,
       &error);
 

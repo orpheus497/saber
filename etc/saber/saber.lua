@@ -1,4 +1,4 @@
--- saber.lua -- configuration for saber(1), the Hikari Sakura panel.
+-- saber.lua -- configuration for saber, the Hikari Sakura panel.
 --
 -- Lua. This file is a chunk that RETURNS a table, and that table is the
 -- configuration -- the same language hikari's own configuration is moving to,
@@ -24,6 +24,13 @@
 -- with the line number Lua gives and keeps the settings it is already running
 -- with, so a typo here cannot cost you a configured panel.
 --
+-- A VALUE THE PARSER DOES NOT RECOGNISE IS THE GENTLER CASE. `edge = "rigth"`
+-- is valid Lua, so the file loads: the word is named on stderr and that one
+-- key keeps its default, while every other key in the file still applies. The
+-- same holds for an unknown name in items.order and for an unusable colour in
+-- theme.roles -- the cost is one key, never the file. Values are matched
+-- without regard to case, so "Left" and "left" are the same word.
+--
 -- EVERY KEY IS OPTIONAL. This whole file may be deleted and Saber still
 -- starts. Each key below is written with the value it already has, so changing
 -- nothing changes nothing -- with TWO exceptions, both called out where they
@@ -41,9 +48,10 @@ return {
     -- reported by the compositor (e.g. "eDP-1").
     output = "all",
 
-    -- Which screen edge. The panel anchors to the full height of the usable
-    -- area, so it sits underneath the compositor's top bar automatically --
-    -- there is no offset to configure and none to get wrong.
+    -- Which screen edge, "left" or "right". The panel anchors to the full
+    -- height of the usable area, so it sits underneath the compositor's top
+    -- bar automatically -- there is no offset to configure and none to get
+    -- wrong.
     edge = "left",
 
     -- Icon edge length in logical pixels, 24-64. The tile is this plus the
@@ -67,13 +75,14 @@ return {
     --
     -- There is no "dodge". Hiding only when a window would overlap needs
     -- window geometry, and no foreign-toplevel protocol publishes any. See
-    -- saber(1), KNOWN LIMITS.
+    -- the README, under "Known limits".
     autohide = "never",
 
     -- How far the pointer must travel INSIDE the reveal strip before an
-    -- autohidden panel comes back. Distance, not time: a pointer that merely
-    -- stops at the edge never opens the column, and one deliberately pushed
-    -- along it does. Higher is harder. Ignored when autohide = "never".
+    -- autohidden panel comes back, 0-100000. Distance, not time: a pointer
+    -- that merely stops at the edge never opens the column, and one
+    -- deliberately pushed along it does. Higher is harder. Ignored when
+    -- autohide = "never".
     --
     -- `saberctl show`, `hide` and `toggle` override this at any time, and work
     -- under autohide = "never" too.
@@ -124,10 +133,30 @@ return {
     -- half the panel. Conventional terminal layout, 0-7 normal and 8-15
     -- bright.
     --
+    -- It is written out in full here rather than elided, because all sixteen
+    -- have to be there for the block to count and a half-written example is
+    -- no use to anybody. These ARE the built-in values -- hikari-sakura's own
+    -- palette -- so uncommenting the block changes nothing until you start
+    -- editing it. The trailing names are what each slot is for; they are what
+    -- the role derivations below talk about when they name a slot.
+    --
     -- palette = {
-    --   color0  = "#2b1e3a",
-    --   ...
-    --   color15 = "#f0edf2",
+    --   color0  = "#2b1e3a", -- base
+    --   color1  = "#c96464", -- red
+    --   color2  = "#df9f87", -- orange
+    --   color3  = "#e4b382", -- yellow
+    --   color4  = "#8e7cc3", -- violet
+    --   color5  = "#b18fc7", -- mauve
+    --   color6  = "#9fa0a6", -- grey
+    --   color7  = "#d4d4d9", -- text
+    --   color8  = "#5e5966", -- bright base
+    --   color9  = "#df8787", -- bright red
+    --   color10 = "#f2bda8", -- bright orange
+    --   color11 = "#f5cf9e", -- bright yellow
+    --   color12 = "#aba0d9", -- bright violet
+    --   color13 = "#cfaedc", -- bright mauve
+    --   color14 = "#b8b9be", -- bright grey
+    --   color15 = "#f0edf2", -- bright text
     -- },
 
     -- WHICH COLOUR CARRIES WHICH MEANING. The palette says what colours exist;
@@ -287,6 +316,11 @@ return {
     -- This SEEDS the list on first run only. The live order lives in
     -- $XDG_DATA_HOME/saber/favourites and wins from then on. Delete that file
     -- to seed from here again.
+    --
+    -- A single entry may drop the braces: `favourites = "sofi.desktop"` is
+    -- read as the one-element list it plainly is, because a one-element list
+    -- is the common case and a silent no-op is the worst available answer to
+    -- it. items.order below takes the same shorthand.
     favourites = {
       "sofi.desktop",
       "firefox.desktop",
@@ -364,7 +398,7 @@ return {
     -- Without it Saber HIDES these entries rather than offering buttons that
     -- fail. There is no built-in lock or logout: the compositor exposes no
     -- lock verb and FreeBSD has no logind, so for those two an empty string
-    -- means HIDE THE ENTRY.
+    -- means HIDE THE ENTRY. Point them at whatever you use and they appear.
     --
     -- ON LINUX all five go to logind, so an empty string is a working built-in
     -- for every one of them. An action is offered when logind says it can be

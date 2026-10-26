@@ -328,7 +328,7 @@ return {
     -- whole block is reported and ignored and the built-in palette is used.
     -- palette = { color0 = "#2b1e3a", ... color15 = "#f0edf2" },
 
-    -- Optional. Overrides any of the ten derived roles by name; see Theming.
+    -- Optional. Overrides any of the eleven derived roles by name; see Theming.
     -- roles = { accent = "color12", urgent = "#df8787" },
   },
 
@@ -546,8 +546,18 @@ host that deliberately keeps its users out of `operator`.
 bus with the interactive flag set, plus the `Lock` and `Logout` that FreeBSD cannot offer at
 all — `org.freedesktop.login1.Session.Lock` and `Manager.TerminateSession`. The interface is
 spoken rather than linked, so systemd-logind and elogind are both answered and neither is a
-dependency, and it is spoken over the GDBus the panel already links for its tray, so it adds no
-library.
+dependency, and it needs no library the panel does not already link for its tray: GDBus, out of
+glib.
+
+The *connection* is its own, and the distinction matters. The tray's is on the session bus;
+this one is on the system bus, so they are two connections and not one. Only this one has
+`exit-on-close` disclaimed, because GLib documents the connection `g_bus_get_sync` returns as a
+singleton that "will (usually) have the #GDBusConnection:exit-on-close property set to %TRUE",
+and that property as "whether the process will be terminated (by calling `raise(SIGTERM)`) if
+the connection is closed by the remote peer" — so a system `dbus-daemon` restart would otherwise
+kill the panel outright, for the sake of a probe behind a menu nobody may have opened. The
+session bus keeps the default, where quitting with the session is the correct behaviour and is
+what the tray relies on.
 
 Availability is logind's own answer: `CanSuspend`, `CanReboot` and `CanPowerOff`, where **both
 `"yes"` and `"challenge"` count as available.** `"challenge"` is polkit saying it will prompt,
@@ -599,9 +609,14 @@ apt install libwayland-dev wayland-protocols libcairo2-dev libpango1.0-dev \
 ```
 
 The second line is Debian's and Ubuntu's spelling of the same nine, verified on Ubuntu 24.04.
-`wayland-scanner` arrives with `libwayland-dev`, and `gio-unix-2.0` — which the mounted-volume
-tiles are built on, and which is a separate package from `gio-2.0` as far as `pkg-config` is
-concerned — is part of `libglib2.0-dev` rather than a package of its own.
+Two of those names carry more than they look like they do. `gio-unix-2.0` — which the
+mounted-volume tiles are built on, and which is a separate package from `gio-2.0` as far as
+`pkg-config` is concerned — is part of `libglib2.0-dev` rather than a package of its own. And
+`wayland-scanner`, which the build runs to generate the protocol sources, is in neither: it
+lives in `libwayland-bin` (`dpkg -S $(command -v wayland-scanner)`), which `libwayland-dev`
+depends on, so installing the line above does fetch it. The CI workflow names
+`libwayland-bin` explicitly all the same, on the principle that a tool the build executes
+should not arrive by someone else's dependency.
 
 **`libucl` is gone, and the reason is the interesting part.** It parsed `saber.conf` and the
 compositor's palette, it is packaged for FreeBSD, and it is not packaged for Linux at all — the
@@ -656,9 +671,19 @@ urgency resolves to the ruled literal for its ground, that Sakura's `urgent` is
 still byte-identical to that palette's `color9`, five contrast ratios recorded independently
 elsewhere, the easing endpoints and their clamping, the spring's peak of 1.0670 at t=0.3925, that
 a zero-length repeating tween settles instead of repainting for ever, and that a cancelled tween
-settles on its target rather than freezing mid-curve. It drives `saber_theme_init` directly
-instead of reading a configuration file, so it links two objects and runs on any host — including
-one that cannot link the panel itself.
+settles on its target rather than freezing mid-curve. It also asserts that every one of the
+eleven roles is a real colour — all four channels finite and within 0.0 to 1.0 — which matters
+for the roles that have a contrast floor as much as for the one that does not, because a NaN
+ratio compares false against *every* floor and would otherwise read as a pass everywhere. It
+drives `saber_theme_init` directly instead of reading a configuration file, so it links two
+objects and runs on any host — including one that cannot link the panel itself.
+
+Both drivers are run by CI, which is the point of keeping the test free of a compositor.
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds with GNU make under gcc and
+clang on Linux and runs `make test`; [`.build.yml`](.build.yml) does the same with bmake on
+FreeBSD via builds.sr.ht. Neither driver is exercised by the other's runner, which is exactly
+why both exist — a change that satisfies one dialect and breaks the other is caught by whichever
+side it broke.
 
 Saber is **not in the ports tree** yet, but a port skeleton ships under [`ports/`](ports/) —
 `Makefile`, `pkg-descr`, `pkg-message` and `pkg-plist`, with `TRAY`, `DASH` and `SPREAD` options,

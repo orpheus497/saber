@@ -54,7 +54,7 @@ static const struct saber_enum_name saber_backlight_names[] = {
   { NULL, 0 },
 };
 
-/* The ten names `theme.roles` accepts, in the order theme.h declares them.
+/* The eleven names `theme.roles` accepts, in the order theme.h declares them.
 The hyphenated spellings also answer to an underscore, as every other key
 does. */
 static const struct saber_enum_name saber_role_names[] = {

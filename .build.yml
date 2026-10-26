@@ -1,0 +1,76 @@
+# Script function and purpose: FreeBSD CI for saber. Builds the tree with the
+# bmake driver -- Makefile -- and runs `make test`, the contrast and easing
+# regression test that holds the theme's colour and animation invariants.
+# FreeBSD is the project's primary target and the only platform the bmake half
+# of the build is exercised on; the GNU make half is covered by
+# .github/workflows/build.yml.
+#
+# Action purpose: The tasks below invoke `make` and that IS bmake being run,
+# not GNU make. FreeBSD's base `make` is bmake, and bmake does not look for
+# GNUmakefile at all, so `make` in this tree reads Makefile here and
+# GNUmakefile on Linux with no detection logic and nothing generated -- which
+# is the whole reason the tree carries two drivers. `bmake` is not a command
+# name in the FreeBSD base system; spelling it that way would mean adding
+# devel/bmake to the list below to obtain a second copy of the binary
+# /usr/bin/make already is.
+image: freebsd/latest
+
+# Action purpose: Every port here backs a pkg-config module or a tool that
+# Makefile invokes, and nothing is listed that does not:
+#
+#   devel/pkgconf             the driver's own PKG_CONFIG default
+#   devel/glib20              gio-2.0 and gio-unix-2.0 -- two pkg-config
+#                             modules, one port
+#   graphics/cairo            cairo
+#   x11-toolkits/pango        pangocairo
+#   graphics/gdk-pixbuf2      gdk-pixbuf-2.0
+#   x11/libxkbcommon          xkbcommon
+#   graphics/wayland          wayland-client and wayland-cursor, and
+#                             wayland-scanner, which generates the six
+#                             *-protocol.{h,c} pairs
+#   graphics/wayland-protocols  the XML behind the four non-vendored protocols,
+#                             found through `pkg-config --variable pkgdatadir`.
+#                             The two wlr-* protocols are vendored under
+#                             protocol/ because wlr-protocols is packaged
+#                             nowhere, and need no port
+#   graphics/librsvg2-rust    librsvg-2.0
+#   lang/lua54                lua-5.4, one of the seven names the driver probes
+#
+# The first eight are the same origins sofi's own .build.yml installs. The last
+# two are saber's alone and are the origins its port skeleton and README name
+# (ports/Makefile: liblua-5.4.so:lang/lua54, and USE_GNOME=librsvg2).
+#
+# No compiler is listed: FreeBSD's base system supplies clang as cc.
+packages:
+  - devel/pkgconf
+  - devel/glib20
+  - graphics/cairo
+  - x11-toolkits/pango
+  - graphics/gdk-pixbuf2
+  - x11/libxkbcommon
+  - graphics/wayland
+  - graphics/wayland-protocols
+  - graphics/librsvg2-rust
+  - lang/lua54
+sources:
+  - https://github.com/orpheus497/saber
+tasks:
+  # Action purpose: Print the feature set and the Lua module the driver
+  # resolved, before anything is compiled. Lua is the one dependency whose
+  # pkg-config name varies by packager -- lang/lua54 installs lua-5.4.pc, where
+  # Debian installs lua5.4.pc -- so this is the cheapest way to tell a real
+  # compile failure from a name mismatch, and it is also where the two drivers
+  # are meant to answer identically.
+  - features: |
+      cd saber
+      make features
+  - build: |
+      cd saber
+      make
+  # Action purpose: `make test` links test/contrast against theme.o and anim.o
+  # and runs it. It drives saber_theme_init directly rather than reading
+  # saber.lua and speaks to no compositor, so it runs in a build VM with no
+  # session and no display.
+  - test: |
+      cd saber
+      make test

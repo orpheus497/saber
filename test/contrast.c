@@ -12,6 +12,7 @@ wrong. */
 
 #include <math.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -223,10 +224,56 @@ check_theme(const char *name, const struct saber_color *palette)
 
   /* `dim` is the structural role -- hairlines, frame outlines, tracks, and a
   menu item that is genuinely unavailable, which WCAG 2.1 exempts from any
-  contrast requirement. It is held to being a colour and nothing more, and now
-  that is what the check says as well as what it does. */
-  if (contrast(theme.dim, theme.background) < 1.0) {
-    fail(name, "dim", "not a colour");
+  contrast requirement. So it has no floor here, and the check that used to
+  stand in for one was worse than none: `contrast(dim, background) < 1.0` can
+  never be true, because the ratio is at least 1.0 by construction, and it is
+  false for a NaN channel too, since every comparison with NaN but `!=` is.
+  It asserted nothing in either the valid case or the broken one.
+  What it was reaching for is below, and applies to every role rather than to
+  this one. */
+
+  /* Action purpose: every role is a real colour. This is the invariant worth
+  asserting about a role with no contrast floor, and it is worth asserting
+  about the ten that have one as well -- a derivation that produced a NaN
+  would otherwise pass every ratio test in this file, because a NaN ratio
+  compares false against every floor. The channels are the saber_color
+  representation, 0.0 to 1.0, so anything outside that is a derivation that
+  ran past its own bounds. */
+  static const struct {
+    const char *name;
+    size_t offset;
+  } colour_roles[] = {
+    { "background", offsetof(struct saber_theme, background) },
+    { "foreground", offsetof(struct saber_theme, foreground) },
+    { "accent", offsetof(struct saber_theme, accent) },
+    { "backlight", offsetof(struct saber_theme, backlight) },
+    { "urgent", offsetof(struct saber_theme, urgent) },
+    { "badge_bg", offsetof(struct saber_theme, badge_bg) },
+    { "badge_fg", offsetof(struct saber_theme, badge_fg) },
+    { "progress", offsetof(struct saber_theme, progress) },
+    { "hint", offsetof(struct saber_theme, hint) },
+    { "dim", offsetof(struct saber_theme, dim) },
+    { "overlay", offsetof(struct saber_theme, overlay) },
+  };
+
+  for (size_t i = 0; i < sizeof(colour_roles) / sizeof(colour_roles[0]); i++) {
+    const struct saber_color *c =
+        (const struct saber_color *)((const char *)&theme +
+            colour_roles[i].offset);
+    const double channel[4] = { c->r, c->g, c->b, c->a };
+    static const char *const channel_name[4] = { "red", "green", "blue",
+      "alpha" };
+
+    for (int ch = 0; ch < 4; ch++) {
+      if (!isfinite(channel[ch]) || channel[ch] < 0.0 || channel[ch] > 1.0) {
+        char detail[96];
+
+        snprintf(detail, sizeof(detail), "%s channel is %f, not a colour",
+            channel_name[ch], channel[ch]);
+        fail(name, colour_roles[i].name, detail);
+        break;
+      }
+    }
   }
 
   /* The count disc carries a numeral, so the pair is text. */

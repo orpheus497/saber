@@ -21,11 +21,13 @@ that has not been handed the Makefile's flags still parses this header. */
 #define SABER_ETC_PREFIX "/usr/local"
 #endif
 
-#define SABER_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/saber/saber.conf"
+#define SABER_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/saber/saber.lua"
 
-/* Action purpose: The compositor's configuration is read for its `ui { palette }`
-block, so that retheming hikari retints the panel with it (BLUEPRINT.md 6.1).
-Only the palette is read; nothing else in that file is Saber's business. */
-#define SABER_HIKARI_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/hikari/hikari.conf"
+/* Action purpose: The compositor's configuration is read for two blocks, so
+that retheming hikari retints the panel with it and the desktop moves at one
+speed rather than at two unrelated ones (BLUEPRINT.md 6.1): `ui.palette` for the
+sixteen colours and `ui.animation` for the duration. Nothing else in that file
+is Saber's business, and neither block is ever written back. */
+#define SABER_HIKARI_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/hikari/hikari.lua"
 
 #endif

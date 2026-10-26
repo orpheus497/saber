@@ -1,7 +1,12 @@
-/* Script function and purpose: Parse saber.conf (UCL, via libucl), apply a
-default for every absent key, import the compositor's palette, and read and
-write the favourites state file. Nothing here is fatal: a user with no
-configuration, or a broken one, still gets a panel. */
+/* Script function and purpose: Parse saber.lua, apply a default for every
+absent key, import the compositor's palette, and read and write the favourites
+state file. Nothing here is fatal: a user with no configuration, or a broken
+one, still gets a panel.
+
+The file is a Lua chunk that returns a table, which means it is code, and it is
+run in a restricted environment rather than in Lua's own: the chunk is handed
+arithmetic, strings and tables and nothing that reaches the machine. A panel's
+settings have no reason to open a file or start a process. */
 
 #include <errno.h>
 #include <stdio.h>
@@ -10,7 +15,9 @@ configuration, or a broken one, still gets a panel. */
 
 #include <glib.h>
 #include <glib/gstdio.h>
-#include <ucl.h>
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
 
 #include <saber/config.h>
 #include <saber/saber.h>
@@ -87,115 +94,234 @@ static const enum saber_portion saber_portion_default[] = {
   SABER_PORTION_SESSION,
 };
 
-/* Action purpose: The documented keys are hyphenated (`icon-size`), but UCL
-accepts either and users copy from both the manual and hikari.conf, so the
-underscore spelling resolves to the same key rather than silently doing
-nothing. */
-static const ucl_object_t *
-config_lookup(const ucl_object_t *obj, const char *key)
+/* Action purpose: The documented keys are hyphenated (`icon-size`), which Lua
+can only write as ["icon-size"], while the underscore spelling is a bare
+identifier and is what a Lua table wants to be written with. Both resolve to the
+same key -- the underscore first -- so a file copied from the manual and a file
+written the idiomatic way say the same thing, and neither spelling is a silent
+no-op.
+
+Every helper below is written to leave the stack exactly as it found it, which
+is what lets the block readers be a flat run of calls with no bookkeeping of
+their own. This one pushes the value and returns true, or pushes nothing. */
+static bool
+config_push_field(lua_State *L, const char *key)
 {
-  if (obj == NULL) {
+  if (strchr(key, '-') != NULL) {
+    char *alternative = g_strdup(key);
+
+    for (char *c = alternative; *c != '\0'; c++) {
+      if (*c == '-') {
+        *c = '_';
+      }
+    }
+
+    lua_getfield(L, -1, alternative);
+    g_free(alternative);
+
+    if (!lua_isnil(L, -1)) {
+      return true;
+    }
+
+    lua_pop(L, 1);
+  }
+
+  lua_getfield(L, -1, key);
+
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+
+    return false;
+  }
+
+  return true;
+}
+
+/* Function purpose: Push the table `name` holds -- one of the five top-level
+blocks, or the palette and roles blocks nested in the theme. Returns false for
+an absent key and for a key that is not a table, so each caller is a single
+guarded section and no path can leave a value behind. */
+static bool
+config_push_block(lua_State *L, const char *name)
+{
+  lua_getfield(L, -1, name);
+
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+
+    return false;
+  }
+
+  return true;
+}
+
+/* Function purpose: Whether a key is written at all, in either spelling. One
+setting turns on this rather than on its value, because 180 written out by hand
+and 180 left to the default are the same number and must not mean the same
+thing. */
+static bool
+config_written(lua_State *L, const char *key)
+{
+  if (!config_push_field(L, key)) {
+    return false;
+  }
+
+  lua_pop(L, 1);
+
+  return true;
+}
+
+/* Function purpose: A copy of the string a key holds, or NULL. It is copied
+rather than handed back as the pointer Lua owns, because that pointer lives only
+as long as the value stays on the stack -- so every call site would otherwise
+have to unwind the stack in step with its own use of the string, which is the
+one piece of bookkeeping this file keeps out of them. */
+static char *
+config_dup_string(lua_State *L, const char *key)
+{
+  if (!config_push_field(L, key)) {
     return NULL;
   }
 
-  const ucl_object_t *found = ucl_object_lookup(obj, key);
+  char *value = lua_type(L, -1) == LUA_TSTRING
+      ? g_strdup(lua_tostring(L, -1))
+      : NULL;
 
-  if (found != NULL || strchr(key, '-') == NULL) {
-    return found;
-  }
+  lua_pop(L, 1);
 
-  char *alternative = g_strdup(key);
-
-  for (char *c = alternative; *c != '\0'; c++) {
-    if (*c == '-') {
-      *c = '_';
-    }
-  }
-
-  found = ucl_object_lookup(obj, alternative);
-  g_free(alternative);
-
-  return found;
+  return value;
 }
 
 static void
-config_apply_string(const ucl_object_t *obj, const char *key, char **out)
+config_apply_string(lua_State *L, const char *key, char **out)
 {
-  const ucl_object_t *entry = config_lookup(obj, key);
-  const char *value = entry == NULL ? NULL : ucl_object_tostring(entry);
+  char *value = config_dup_string(L, key);
 
   if (value == NULL) {
     return;
   }
 
   g_free(*out);
-  *out = g_strdup(value);
+  *out = value;
 }
 
 static void
-config_apply_bool(const ucl_object_t *obj, const char *key, bool *out)
+config_apply_bool(lua_State *L, const char *key, bool *out)
 {
-  const ucl_object_t *entry = config_lookup(obj, key);
-  bool value;
-
-  if (entry != NULL && ucl_object_toboolean_safe(entry, &value)) {
-    *out = value;
-  }
-}
-
-static void
-config_apply_int(
-    const ucl_object_t *obj, const char *key, int *out, int low, int high)
-{
-  const ucl_object_t *entry = config_lookup(obj, key);
-  int64_t value;
-
-  if (entry == NULL || !ucl_object_toint_safe(entry, &value)) {
+  if (!config_push_field(L, key)) {
     return;
   }
 
-  *out = (int)CLAMP(value, (int64_t)low, (int64_t)high);
+  if (lua_isboolean(L, -1)) {
+    *out = lua_toboolean(L, -1) != 0;
+  }
+
+  lua_pop(L, 1);
+}
+
+static void
+config_apply_int(lua_State *L, const char *key, int *out, int low, int high)
+{
+  if (!config_push_field(L, key)) {
+    return;
+  }
+
+  int usable = 0;
+  lua_Integer value = lua_tointegerx(L, -1, &usable);
+
+  lua_pop(L, 1);
+
+  if (usable) {
+    *out = (int)CLAMP(value, (lua_Integer)low, (lua_Integer)high);
+  }
 }
 
 static void
 config_apply_double(
-    const ucl_object_t *obj, const char *key, double *out, double low,
-    double high)
+    lua_State *L, const char *key, double *out, double low, double high)
 {
-  const ucl_object_t *entry = config_lookup(obj, key);
-  double value;
-
-  if (entry == NULL || !ucl_object_todouble_safe(entry, &value)) {
+  if (!config_push_field(L, key)) {
     return;
   }
 
-  *out = CLAMP(value, low, high);
+  int usable = 0;
+  double value = (double)lua_tonumberx(L, -1, &usable);
+
+  lua_pop(L, 1);
+
+  if (usable) {
+    *out = CLAMP(value, low, high);
+  }
 }
 
 /* Function purpose: Returns `fallback` for an absent or unrecognised key, and
 takes the value by return rather than through a pointer so no caller has to
 alias an enum through an int *. */
 static int
-config_enum(const ucl_object_t *obj, const char *key,
+config_enum(lua_State *L, const char *key,
     const struct saber_enum_name *names, int fallback, const char *where)
 {
-  const ucl_object_t *entry = config_lookup(obj, key);
-  const char *value = entry == NULL ? NULL : ucl_object_tostring(entry);
+  char *value = config_dup_string(L, key);
 
   if (value == NULL) {
     return fallback;
   }
 
+  int resolved = fallback;
+  bool known = false;
+
   for (const struct saber_enum_name *n = names; n->name != NULL; n++) {
     if (g_ascii_strcasecmp(value, n->name) == 0) {
-      return n->value;
+      resolved = n->value;
+      known = true;
+
+      break;
     }
   }
 
-  fprintf(stderr, "saber: %s: %s: unknown value \"%s\"; keeping default\n",
-      where, key, value);
+  if (!known) {
+    fprintf(stderr, "saber: %s: %s: unknown value \"%s\"; keeping default\n",
+        where, key, value);
+  }
 
-  return fallback;
+  g_free(value);
+
+  return resolved;
+}
+
+/* Function purpose: How many entries a list key holds, with a bare string
+counting as one. `favourites = "sofi.desktop"` written without braces has always
+been read as the list it plainly is, and still is: a one-element list is the
+common case, and a silent no-op is the worst available answer to it. */
+static lua_Integer
+config_list_len(lua_State *L)
+{
+  if (lua_type(L, -1) == LUA_TSTRING) {
+    return 1;
+  }
+
+  return lua_istable(L, -1) ? luaL_len(L, -1) : 0;
+}
+
+/* Function purpose: Entry `index` of the list at the top of the stack, copied
+for the same reason config_dup_string copies, and leaving the stack as it found
+it so the list stays on top across a whole loop. */
+static char *
+config_list_dup(lua_State *L, lua_Integer index)
+{
+  if (lua_type(L, -1) == LUA_TSTRING) {
+    return index == 1 ? g_strdup(lua_tostring(L, -1)) : NULL;
+  }
+
+  lua_geti(L, -1, index);
+
+  char *item = lua_type(L, -1) == LUA_TSTRING
+      ? g_strdup(lua_tostring(L, -1))
+      : NULL;
+
+  lua_pop(L, 1);
+
+  return item;
 }
 
 static void
@@ -237,7 +363,7 @@ config_defaults(struct saber_config *config)
   config->session.logout = g_strdup("");
 }
 
-/* Function purpose: Resolve which saber.conf to read. An explicit path is
+/* Function purpose: Resolve which saber.lua to read. An explicit path is
 returned whether or not it exists, so the caller reports it as missing rather
 than silently reading somebody else's file. */
 static char *
@@ -252,7 +378,7 @@ config_find(const char *path)
   char *candidate;
 
   if (xdg != NULL && *xdg != '\0') {
-    candidate = g_build_filename(xdg, "saber", "saber.conf", NULL);
+    candidate = g_build_filename(xdg, "saber", "saber.lua", NULL);
 
     if (g_file_test(candidate, G_FILE_TEST_IS_REGULAR)) {
       return candidate;
@@ -262,7 +388,7 @@ config_find(const char *path)
   }
 
   if (home != NULL && *home != '\0') {
-    candidate = g_build_filename(home, ".config", "saber", "saber.conf", NULL);
+    candidate = g_build_filename(home, ".config", "saber", "saber.lua", NULL);
 
     if (g_file_test(candidate, G_FILE_TEST_IS_REGULAR)) {
       return candidate;
@@ -279,26 +405,26 @@ config_find(const char *path)
 }
 
 static void
-config_apply_favourites(struct saber_config *config, const ucl_object_t *list)
+config_apply_favourites(struct saber_config *config, lua_State *L)
 {
-  if (list == NULL) {
+  if (!config_push_field(L, "favourites")) {
     return;
   }
 
   GPtrArray *items = g_ptr_array_new();
-  ucl_object_iter_t iterator = NULL;
-  const ucl_object_t *entry;
+  lua_Integer len = config_list_len(L);
 
-  /* Action purpose: Iterating works for a one-element list written without
-  brackets as well as for an array, so `favourites = "sofi.desktop"` is not a
-  silent no-op. */
-  while ((entry = ucl_object_iterate(list, &iterator, true)) != NULL) {
-    const char *id = ucl_object_tostring(entry);
+  for (lua_Integer i = 1; i <= len; i++) {
+    char *id = config_list_dup(L, i);
 
     if (id != NULL && *id != '\0') {
-      g_ptr_array_add(items, g_strdup(id));
+      g_ptr_array_add(items, id);
+    } else {
+      g_free(id);
     }
   }
+
+  lua_pop(L, 1);
 
   g_strfreev(config->launcher.favourites);
   config->launcher.favourites_len = items->len;
@@ -306,15 +432,14 @@ config_apply_favourites(struct saber_config *config, const ucl_object_t *list)
   config->launcher.favourites = (char **)g_ptr_array_free(items, FALSE);
 }
 
-/* Function purpose: Read a `theme { palette }` block. Returns true only for a
-complete sixteen-slot palette, which is what lets an explicit block override
-the hikari import without a half-written one doing so. */
+/* Function purpose: Read a `theme.palette` block, with the theme table on top
+of the stack. Returns true only for a complete sixteen-slot palette, which is
+what lets an explicit block override the hikari import without a half-written
+one doing so. */
 static bool
-config_apply_palette(struct saber_config *config, const ucl_object_t *theme)
+config_apply_palette(struct saber_config *config, lua_State *L)
 {
-  const ucl_object_t *block = config_lookup(theme, "palette");
-
-  if (block == NULL) {
+  if (!config_push_block(L, "palette")) {
     return false;
   }
 
@@ -326,17 +451,20 @@ config_apply_palette(struct saber_config *config, const ucl_object_t *theme)
 
     snprintf(key, sizeof(key), "color%d", slot);
 
-    const ucl_object_t *entry = ucl_object_lookup(block, key);
-    const char *spec = entry == NULL ? NULL : ucl_object_tostring(entry);
+    char *spec = config_dup_string(L, key);
 
     if (spec != NULL && saber_color_parse(spec, &palette[slot])) {
       count++;
     }
+
+    g_free(spec);
   }
+
+  lua_pop(L, 1);
 
   if (count != SABER_PALETTE_SLOTS) {
     fprintf(stderr,
-        "saber: theme { palette }: %d of %d colours usable; ignoring it\n",
+        "saber: theme.palette: %d of %d colours usable; ignoring it\n",
         count, SABER_PALETTE_SLOTS);
 
     return false;
@@ -370,25 +498,23 @@ config_palette_reference(const char *spec)
   return (int)slot;
 }
 
-/* Function purpose: Read `theme { roles }`, the per-role override block. The
-palette says which colours exist; this says which of them carries which
-meaning, and an override wins over the colour the role map would otherwise
-derive. It is what lets a user re-point one role -- urgency back onto a palette
-slot, say -- without having to rebuild the whole palette around it. An unusable
-value costs that one role and is reported, never the block. */
+/* Function purpose: Read `theme.roles`, the per-role override block, with the
+theme table on top of the stack. The palette says which colours exist; this says
+which of them carries which meaning, and an override wins over the colour the
+role map would otherwise derive. It is what lets a user re-point one role --
+urgency back onto a palette slot, say -- without having to rebuild the whole
+palette around it. An unusable value costs that one role and is reported, never
+the block. */
 static void
-config_apply_roles(struct saber_config *config, const ucl_object_t *theme)
+config_apply_roles(struct saber_config *config, lua_State *L)
 {
-  const ucl_object_t *block = config_lookup(theme, "roles");
-
-  if (block == NULL) {
+  if (!config_push_block(L, "roles")) {
     return;
   }
 
   for (const struct saber_enum_name *n = saber_role_names; n->name != NULL;
       n++) {
-    const ucl_object_t *entry = config_lookup(block, n->name);
-    const char *spec = entry == NULL ? NULL : ucl_object_tostring(entry);
+    char *spec = config_dup_string(L, n->name);
 
     if (spec == NULL) {
       continue;
@@ -398,40 +524,39 @@ config_apply_roles(struct saber_config *config, const ucl_object_t *theme)
 
     override.slot = config_palette_reference(spec);
 
-    if (override.slot < 0 && !saber_color_parse(spec, &override.color)) {
+    if (override.slot >= 0 || saber_color_parse(spec, &override.color)) {
+      config->theme.roles.role[n->value] = override;
+    } else {
       fprintf(stderr,
-          "saber: theme { roles }: %s: \"%s\" is neither colorN nor a #rrggbb "
+          "saber: theme.roles: %s: \"%s\" is neither colorN nor a #rrggbb "
           "literal; keeping the default\n",
           n->name, spec);
-
-      continue;
     }
 
-    config->theme.roles.role[n->value] = override;
+    g_free(spec);
   }
+
+  lua_pop(L, 1);
 }
 
-/* Function purpose: Read `items { order }`, the ordered portion list. An
-unrecognised name is reported rather than silently dropped -- config_enum's
-precedent -- and a repeat is ignored, because a portion is one place in the
-column and cannot be in two. */
+/* Function purpose: Read `items.order`, the ordered portion list, with the
+items table on top of the stack. An unrecognised name is reported rather than
+silently dropped -- config_enum's precedent -- and a repeat is ignored, because
+a portion is one place in the column and cannot be in two. */
 static void
-config_apply_order(struct saber_config *config, const ucl_object_t *list)
+config_apply_order(struct saber_config *config, lua_State *L)
 {
-  if (list == NULL) {
+  if (!config_push_field(L, "order")) {
     return;
   }
 
   enum saber_portion order[SABER_PORTION_COUNT];
   bool seen[SABER_PORTION_COUNT] = { false };
   size_t len = 0;
-  ucl_object_iter_t iterator = NULL;
-  const ucl_object_t *entry;
+  lua_Integer count = config_list_len(L);
 
-  /* Same reason as the favourites list: iterating covers a one-element list
-  written without brackets as well as an array. */
-  while ((entry = ucl_object_iterate(list, &iterator, true)) != NULL) {
-    const char *name = ucl_object_tostring(entry);
+  for (lua_Integer i = 1; i <= count; i++) {
+    char *name = config_list_dup(L, i);
     const struct saber_enum_name *match = NULL;
 
     for (const struct saber_enum_name *n = saber_portion_names;
@@ -445,17 +570,17 @@ config_apply_order(struct saber_config *config, const ucl_object_t *list)
 
     if (match == NULL) {
       fprintf(stderr,
-          "saber: items: order: unknown portion \"%s\"; ignoring it\n",
+          "saber: items.order: unknown portion \"%s\"; ignoring it\n",
           name == NULL ? "" : name);
-
-      continue;
-    }
-
-    if (!seen[match->value]) {
+    } else if (!seen[match->value]) {
       seen[match->value] = true;
       order[len++] = (enum saber_portion)match->value;
     }
+
+    g_free(name);
   }
+
+  lua_pop(L, 1);
 
   /* Action purpose: The application band has no key that turns it off, so an
   order that forgets to name it still gets it -- in the place the column has
@@ -523,79 +648,99 @@ config_resolve_order(struct saber_config *config)
   config->items.session = present[SABER_PORTION_SESSION];
 }
 
-/* Which of the settings a hikari.conf could also supply the saber.conf wrote
-for itself. A key written here always wins over the compositor's, so the import
-has to know what it is not allowed to answer. */
+/* Which of the settings a hikari.lua could also supply the saber.lua wrote for
+itself. A key written here always wins over the compositor's, so the import has
+to know what it is not allowed to answer. */
 struct config_written {
   bool palette;
   bool animation_ms;
 };
 
+/* Function purpose: Apply the table the chunk returned, which is on top of the
+stack. Each block is read inside its own guard, so a file that writes only one
+of them pays nothing for the other four and the stack is back where it started
+after each. */
 static void
 config_apply(struct saber_config *config,
-    const ucl_object_t *root,
+    lua_State *L,
     struct config_written *written)
 {
-  const ucl_object_t *panel = ucl_object_lookup(root, "panel");
-  const ucl_object_t *theme = ucl_object_lookup(root, "theme");
-  const ucl_object_t *launcher = ucl_object_lookup(root, "launcher");
-  const ucl_object_t *items = ucl_object_lookup(root, "items");
-  const ucl_object_t *session = ucl_object_lookup(root, "session");
+  if (config_push_block(L, "panel")) {
+    config_apply_string(L, "output", &config->panel.output);
+    config->panel.edge = config_enum(
+        L, "edge", saber_edge_names, config->panel.edge, "panel");
+    config_apply_int(L, "icon-size", &config->panel.icon_size,
+        SABER_ICON_SIZE_MIN, SABER_ICON_SIZE_MAX);
+    config_apply_int(L, "padding", &config->panel.padding,
+        SABER_PANEL_PADDING_MIN, SABER_PANEL_PADDING_MAX);
+    config->panel.autohide = config_enum(L, "autohide", saber_autohide_names,
+        config->panel.autohide, "panel");
+    config_apply_int(
+        L, "reveal-pressure", &config->panel.reveal_pressure, 0, 100000);
+    config_apply_int(
+        L, "animation-ms", &config->panel.animation_ms, 0, 10000);
 
-  config_apply_string(panel, "output", &config->panel.output);
-  config->panel.edge = config_enum(
-      panel, "edge", saber_edge_names, config->panel.edge, "panel");
-  config_apply_int(panel, "icon-size", &config->panel.icon_size,
-      SABER_ICON_SIZE_MIN, SABER_ICON_SIZE_MAX);
-  config_apply_int(panel, "padding", &config->panel.padding,
-      SABER_PANEL_PADDING_MIN, SABER_PANEL_PADDING_MAX);
-  config->panel.autohide = config_enum(panel, "autohide", saber_autohide_names,
-      config->panel.autohide, "panel");
-  config_apply_int(
-      panel, "reveal-pressure", &config->panel.reveal_pressure, 0, 100000);
-  config_apply_int(panel, "animation-ms", &config->panel.animation_ms, 0, 10000);
+    /* Action purpose: Noted before the import runs rather than inferred from
+    the value afterwards, because 180 written out by hand and 180 left to the
+    default are the same number and must not mean the same thing -- one of them
+    refuses the compositor's duration and the other asks for it. */
+    written->animation_ms = config_written(L, "animation-ms");
 
-  /* Action purpose: Noted before the import runs rather than inferred from the
-  value afterwards, because 180 written out by hand and 180 left to the default
-  are the same number and must not mean the same thing -- one of them refuses
-  the compositor's duration and the other asks for it. */
-  written->animation_ms = config_lookup(panel, "animation-ms") != NULL;
+    lua_pop(L, 1);
+  }
 
-  config_apply_bool(theme, "inherit-hikari", &config->theme.inherit_hikari);
-  config->theme.backlight = config_enum(theme, "backlight",
-      saber_backlight_names, config->theme.backlight, "theme");
-  config_apply_double(theme, "opacity", &config->theme.opacity, 0.0, 1.0);
-  config_apply_double(
-      theme, "overlay-opacity", &config->theme.overlay_opacity, 0.0, 1.0);
+  if (config_push_block(L, "theme")) {
+    config_apply_bool(L, "inherit-hikari", &config->theme.inherit_hikari);
+    config->theme.backlight = config_enum(
+        L, "backlight", saber_backlight_names, config->theme.backlight,
+        "theme");
+    config_apply_double(L, "opacity", &config->theme.opacity, 0.0, 1.0);
+    config_apply_double(
+        L, "overlay-opacity", &config->theme.overlay_opacity, 0.0, 1.0);
 
-  config_apply_favourites(config, config_lookup(launcher, "favourites"));
+    written->palette = config_apply_palette(config, L);
 
-  config_apply_bool(items, "bfb", &config->items.bfb);
-  config_apply_bool(items, "sheets", &config->items.sheets);
-  config_apply_bool(items, "devices", &config->items.devices);
-  config_apply_bool(items, "trash", &config->items.trash);
-  config_apply_bool(items, "tray", &config->items.tray);
-  config_apply_bool(items, "session", &config->items.session);
-  config_apply_order(config, config_lookup(items, "order"));
+    config_apply_roles(config, L);
 
-  config_apply_string(session, "suspend", &config->session.suspend);
-  config_apply_string(session, "reboot", &config->session.reboot);
-  config_apply_string(session, "poweroff", &config->session.poweroff);
-  config_apply_string(session, "lock", &config->session.lock);
-  config_apply_string(session, "logout", &config->session.logout);
+    lua_pop(L, 1);
+  }
 
-  written->palette = theme != NULL && config_apply_palette(config, theme);
+  if (config_push_block(L, "launcher")) {
+    config_apply_favourites(config, L);
 
-  config_apply_roles(config, theme);
+    lua_pop(L, 1);
+  }
+
+  if (config_push_block(L, "items")) {
+    config_apply_bool(L, "bfb", &config->items.bfb);
+    config_apply_bool(L, "sheets", &config->items.sheets);
+    config_apply_bool(L, "devices", &config->items.devices);
+    config_apply_bool(L, "trash", &config->items.trash);
+    config_apply_bool(L, "tray", &config->items.tray);
+    config_apply_bool(L, "session", &config->items.session);
+    config_apply_order(config, L);
+
+    lua_pop(L, 1);
+  }
+
+  if (config_push_block(L, "session")) {
+    config_apply_string(L, "suspend", &config->session.suspend);
+    config_apply_string(L, "reboot", &config->session.reboot);
+    config_apply_string(L, "poweroff", &config->session.poweroff);
+    config_apply_string(L, "lock", &config->session.lock);
+    config_apply_string(L, "logout", &config->session.logout);
+
+    lua_pop(L, 1);
+  }
 }
 
-/* Function purpose: Try each hikari.conf in turn, user first, for whichever of
-the two imports the saber.conf left open. Only a complete sixteen-slot import
+/* Function purpose: Try each hikari.lua in turn, user first, for whichever of
+the two imports the saber.lua left open. Only a complete sixteen-slot import
 counts as a palette, so a truncated or half-commented one falls through to the
 next candidate rather than tinting the panel with defaults for the missing half.
 The motion duration is taken the same way and independently -- the first
 candidate that carries an animation block answers it -- so a user whose own
-hikari.conf sets only one of the two still inherits both from where they are
+hikari.lua sets only one of the two still inherits both from where they are
 actually written. Returns whether the palette was imported, which is the one
 answer the caller cannot derive for itself. */
 static bool
@@ -608,12 +753,12 @@ config_import_hikari(
   int count = 0;
 
   if (xdg != NULL && *xdg != '\0') {
-    candidates[count++] = g_build_filename(xdg, "hikari", "hikari.conf", NULL);
+    candidates[count++] = g_build_filename(xdg, "hikari", "hikari.lua", NULL);
   }
 
   if (home != NULL && *home != '\0') {
     candidates[count++] =
-        g_build_filename(home, ".config", "hikari", "hikari.conf", NULL);
+        g_build_filename(home, ".config", "hikari", "hikari.lua", NULL);
   }
 
   candidates[count++] = g_strdup(SABER_HIKARI_SYSTEM_CONFIG);
@@ -639,6 +784,106 @@ config_import_hikari(
   }
 
   return imported;
+}
+
+/* The whole of what a configuration file may reach. Settings are data, so the
+chunk is handed arithmetic, strings and tables and nothing else: no io, no os,
+no package, no require, no load, no dofile. Nothing named here can open a file
+or start a process, and a name absent from this list is absent from the chunk's
+globals, so the sandbox is this list rather than a set of removals a chunk could
+work its way around. */
+static const char *const config_environment[] = {
+  "assert",
+  "error",
+  "ipairs",
+  "math",
+  "pairs",
+  "select",
+  "string",
+  "table",
+  "tonumber",
+  "tostring",
+  "type",
+  NULL,
+};
+
+/* Function purpose: Give the chunk on top of the stack the restricted globals
+above in place of Lua's own. _ENV is a chunk's first upvalue, which is what
+makes this one substitution cover the whole file rather than a list of deletions
+applying only where they were made. The chunk stays on top either way. */
+static bool
+config_sandbox(lua_State *L)
+{
+  lua_newtable(L);
+
+  for (int i = 0; config_environment[i] != NULL; i++) {
+    lua_getglobal(L, config_environment[i]);
+    lua_setfield(L, -2, config_environment[i]);
+  }
+
+  /* Action purpose: A main chunk always has _ENV as its first upvalue, so this
+  cannot fail in practice -- but lua_setupvalue pops nothing when it does not
+  take the value, and an unnoticed failure would run the file with Lua's real
+  globals, which is the one outcome the sandbox exists to prevent. */
+  if (lua_setupvalue(L, -2, 1) == NULL) {
+    lua_pop(L, 1);
+
+    return false;
+  }
+
+  return true;
+}
+
+/* Function purpose: Take Lua's error off the stack as a string this file owns.
+Lua reports "file:line: message", which is the whole value of passing it
+through rather than answering with a bare refusal. */
+static char *
+config_take_error(lua_State *L)
+{
+  const char *message = lua_tostring(L, -1);
+  char *copy = g_strdup(message == NULL ? "unreadable" : message);
+
+  lua_pop(L, 1);
+
+  return copy;
+}
+
+/* Function purpose: Load `path`, run it in the sandbox, and leave the table it
+returned on top of the stack. A file that will not load, will not run, or does
+not return a table is refused whole: `reload` reports it and the panel keeps the
+settings it is already running with, because a configuration applied in part is
+worse than one not applied at all. The stack is left as it was found on every
+one of those paths. */
+static bool
+config_open(lua_State *L, const char *path, char **error)
+{
+  if (luaL_loadfile(L, path) != LUA_OK) {
+    *error = config_take_error(L);
+
+    return false;
+  }
+
+  if (!config_sandbox(L)) {
+    lua_pop(L, 1);
+    *error = g_strdup_printf("%s: not a Lua chunk", path);
+
+    return false;
+  }
+
+  if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+    *error = config_take_error(L);
+
+    return false;
+  }
+
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    *error = g_strdup_printf("%s: did not return a table", path);
+
+    return false;
+  }
+
+  return true;
 }
 
 bool
@@ -668,34 +913,38 @@ saber_config_load_status(struct saber_config *config,
   struct config_written written = { false, false };
 
   if (file != NULL) {
-    struct ucl_parser *parser = ucl_parser_new(UCL_PARSER_NO_IMPLICIT_ARRAYS);
+    lua_State *L = luaL_newstate();
 
     outcome = SABER_CONFIG_UNREADABLE;
 
-    if (parser == NULL) {
+    if (L == NULL) {
       fprintf(stderr, "saber: out of memory reading %s\n", file);
-    } else if (!ucl_parser_add_file(parser, file)) {
-      const char *error = ucl_parser_get_error(parser);
-
-      /* Action purpose: A broken configuration file costs the user their
-      settings, never their panel -- report it and carry on with defaults. */
-      fprintf(stderr, "saber: %s: %s\n", file,
-          error == NULL ? "unreadable" : error);
     } else {
-      /* The parse is what the outcome turns on, not what the file contained:
-      an empty file is a valid configuration that asks for the defaults. */
-      outcome = SABER_CONFIG_LOADED;
+      /* Action purpose: The standard libraries are opened so that math, string
+      and table exist to be handed to the chunk. What the chunk can reach is
+      decided by config_environment and not by what was opened here -- io and
+      os are loaded into globals the chunk never sees. */
+      luaL_openlibs(L);
 
-      ucl_object_t *root = ucl_parser_get_object(parser);
+      char *error = NULL;
 
-      if (root != NULL) {
-        config_apply(config, root, &written);
-        ucl_object_unref(root);
+      if (!config_open(L, file, &error)) {
+        /* Action purpose: A broken configuration file costs the user their
+        settings, never their panel -- report it and carry on with defaults.
+        Lua's message already names the file and the line. */
+        fprintf(stderr, "saber: %s\n", error == NULL ? "unreadable" : error);
+        g_free(error);
+      } else {
+        /* The load is what the outcome turns on, not what the file contained:
+        a chunk returning an empty table is a valid configuration that asks for
+        the defaults. */
+        outcome = SABER_CONFIG_LOADED;
+
+        config_apply(config, L, &written);
+        lua_pop(L, 1);
       }
-    }
 
-    if (parser != NULL) {
-      ucl_parser_free(parser);
+      lua_close(L);
     }
 
     g_free(file);
@@ -706,7 +955,7 @@ saber_config_load_status(struct saber_config *config,
   /* Action purpose: Both imports hang off inherit-hikari, so the one key that
   turns the compositor's colours off turns its motion off with it -- the panel
   either follows the desktop or it does not. Either one already answered by the
-  saber.conf is left alone. */
+  saber.lua is left alone. */
   bool want_palette = !written.palette && config->theme.inherit_hikari;
   bool want_animation = !written.animation_ms && config->theme.inherit_hikari;
 

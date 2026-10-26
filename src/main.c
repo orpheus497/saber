@@ -1065,8 +1065,26 @@ main(int argc, char **argv)
 
     if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--build") == 0) {
       report_build();
-      printf("  operator group   %s\n",
-          saber_session_in_operator_group() ? "yes" : "no");
+
+      /* Action purpose: Report each session action separately rather than the
+      one privilege fact behind them, because there is no longer one fact.
+      Membership of `operator` is what decides this on FreeBSD and means
+      nothing on Linux, where logind answers per action and polkit may answer
+      "challenge" -- so a single `operator group: no` line read as the opposite
+      of the truth on a machine where every action worked. This asks the same
+      question the panel asks when it decides what to draw, so `--build` and
+      the session menu can no longer disagree.
+
+      NULL config, so this reports what the built-in commands can do and
+      ignores any `session { }` override: a report about the binary should not
+      change because a configuration file names a different command. */
+      printf("\nsession actions:\n");
+
+      for (int action = 0; action < SABER_SESSION_ACTION_COUNT; action++) {
+        printf("  %-16s %s\n", saber_session_action_id(action),
+            saber_session_available(NULL, action) ? "yes" : "no");
+      }
+
       return EXIT_SUCCESS;
     }
 

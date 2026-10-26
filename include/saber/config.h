@@ -1,9 +1,14 @@
 /* Script function and purpose: The configuration contract, as BLUEPRINT.md
-section 6 defines it. UCL via libucl -- the same dialect and the same parser as
-hikari.conf, so one syntax covers the desktop.
+section 6 defines it. Lua -- the file is a chunk that returns a table, which is
+the same language hikari's own configuration is moving to, so one syntax covers
+the desktop.
+
+Every key is accepted in both spellings, the hyphenated one the manual uses and
+the underscored one a Lua table is naturally written with, so `icon-size` and
+`icon_size` are the same key.
 
 Every key has a default and the whole file is optional: a user with no
-~/.config/saber/saber.conf gets a working panel. */
+~/.config/saber/saber.lua gets a working panel. */
 
 #if !defined(SABER_CONFIG_H)
 #define SABER_CONFIG_H
@@ -74,11 +79,11 @@ struct saber_config {
     enum saber_backlight backlight;
     double opacity;
     double overlay_opacity; /* dash and spread backdrop; applied exactly */
-    /* Populated either from hikari.conf or from an explicit theme { palette }
+    /* Populated either from hikari.lua or from an explicit theme.palette
     block; falls back to the built-in palette when neither is readable. */
     struct saber_color palette[SABER_PALETTE_SLOTS];
     bool palette_valid;
-    /* `theme { roles }`: a per-role override, each entry either a palette
+    /* `theme.roles`: a per-role override, each entry either a palette
     reference or a literal. The palette says what colours exist and this says
     which of them carries which meaning, so a user who disagrees with a derived
     role re-points it by name instead of having to rebuild the palette around

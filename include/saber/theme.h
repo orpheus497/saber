@@ -1,5 +1,5 @@
 /* Script function and purpose: The colour contract. Saber has no theme file of
-its own -- it imports hikari.conf's sixteen-slot `ui { palette }` and maps it
+its own -- it imports hikari.lua's sixteen-slot `ui.palette` and maps it
 onto semantic roles, so retheming the compositor retints the panel with it. */
 
 #if !defined(SABER_THEME_H)
@@ -36,7 +36,7 @@ enum saber_role {
 
 /* Action purpose: One override, as `theme { roles }` wrote it. A palette
 reference is kept as the slot number and resolved when the theme is built, not
-when the file is read, because the palette may still arrive from hikari.conf
+when the file is read, because the palette may still arrive from hikari.lua
 afterwards -- so `urgent = color9` keeps following a retheme the way the rest of
 the panel does. A literal is kept in `color` and `slot` is negative. */
 struct saber_role_override {
@@ -66,7 +66,7 @@ struct saber_theme {
 
   /* Whether the resolved background is a light ground. Derived from its
   luminance rather than configured, so a palette saber has never seen -- a
-  user's own, or a terminal colour scheme dropped into hikari.conf -- gets the
+  user's own, or a terminal colour scheme dropped into hikari.lua -- gets the
   right answer too. Read it through saber_theme_is_light(). */
   bool light_ground;
 
@@ -88,7 +88,7 @@ saber_color_parse(const char *spec, struct saber_color *out);
 
 /* Function purpose: Build the theme from a palette. `palette` may be NULL, in
 which case the built-in fallback is used -- a panel must come up with no
-hikari.conf present and no configuration of its own. `opacity` applies to the
+hikari.lua present and no configuration of its own. `opacity` applies to the
 background role only: the overlay role carries colour and `overlay_opacity`
 carries its alpha, so 1.0 there is a guarantee that nothing behind the dash
 strip or the spread backdrop bleeds through. */
@@ -118,20 +118,23 @@ the dark case. */
 bool
 saber_theme_is_light(const struct saber_theme *theme);
 
-/* Function purpose: Read `ui { palette }` out of a hikari.conf. Returns the
-number of slots read; anything less than SABER_PALETTE_SLOTS means the caller
-should fall back rather than render with half a palette. A missing or
-unreadable file yields 0, not an error. */
+/* Function purpose: Read `ui.palette` out of a hikari.lua, falling back to a
+top-level `palette` because the shape of that file is still settling. Returns
+the number of slots read; anything less than SABER_PALETTE_SLOTS means the
+caller should fall back rather than render with half a palette. A missing,
+unparseable or unexpectedly shaped file yields 0, not an error -- that is the
+ordinary first run. */
 int
 saber_theme_import_hikari(const char *path,
     struct saber_color palette[SABER_PALETTE_SLOTS]);
 
-/* Function purpose: Read `ui { animation }` out of a hikari.conf, so the panel
-moves at the speed the compositor moves at instead of at an unrelated one of
-its own. Returns false and leaves *duration_ms untouched when the file carries
-no usable animation block. `enabled = false` resolves to 0, which the tween
-code already treats as "settle immediately", so the compositor's two keys
-arrive here as the one number saber has always had. */
+/* Function purpose: Read `ui.animation` out of a hikari.lua, falling back to a
+top-level `animation` for the same reason, so the panel moves at the speed the
+compositor moves at instead of at an unrelated one of its own. Returns false and
+leaves *duration_ms untouched when the file carries no usable animation block.
+`enabled = false` resolves to 0, which the tween code already treats as "settle
+immediately", so the compositor's two keys arrive here as the one number saber
+has always had. */
 bool
 saber_theme_import_hikari_animation(const char *path, int *duration_ms);
 

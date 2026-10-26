@@ -1,17 +1,23 @@
-/* Script function and purpose: Colour parsing, the hikari.conf `ui { palette }`
-and `ui { animation }` imports, and the mapping of those sixteen slots onto the
-semantic roles every drawing module reads. */
+/* Script function and purpose: Colour parsing, the hikari.lua `ui.palette` and
+`ui.animation` imports, and the mapping of those sixteen slots onto the semantic
+roles every drawing module reads.
+
+The two imports live here together deliberately: they are the only places in
+the tree that open the compositor's own configuration, so there is one answer to
+where hikari's file is read and one sandbox it is read under. */
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-#include <ucl.h>
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
 
 #include <saber/theme.h>
 
 /* Action purpose: The compiled-in default is hikari-sakura's shipped palette,
-so a panel started with no hikari.conf and no configuration still comes up in
+so a panel started with no hikari.lua and no configuration still comes up in
 the desktop's own colours rather than in something invented here. */
 static const char *const saber_fallback_palette[SABER_PALETTE_SLOTS] = {
   "#2b1e3a", /* base */
@@ -212,6 +218,113 @@ saber_color_parse(const char *spec, struct saber_color *out)
   return true;
 }
 
+/* What a hikari.lua may reach while saber is the one running it. It is somebody
+else's file, read for two blocks out of it, so the sandbox is tighter than the
+compositor's own would be rather than looser: arithmetic, strings and tables,
+and nothing that opens a file or starts a process. A name absent from this list
+is absent from the chunk's globals. */
+static const char *const hikari_environment[] = {
+  "assert",
+  "error",
+  "ipairs",
+  "math",
+  "pairs",
+  "select",
+  "string",
+  "table",
+  "tonumber",
+  "tostring",
+  "type",
+  NULL,
+};
+
+/* Function purpose: Give the chunk on top of the stack the restricted globals
+above in place of Lua's own. _ENV is a chunk's first upvalue, so one
+substitution covers the whole file. The chunk stays on top either way. */
+static bool
+hikari_sandbox(lua_State *L)
+{
+  lua_newtable(L);
+
+  for (int i = 0; hikari_environment[i] != NULL; i++) {
+    lua_getglobal(L, hikari_environment[i]);
+    lua_setfield(L, -2, hikari_environment[i]);
+  }
+
+  if (lua_setupvalue(L, -2, 1) == NULL) {
+    lua_pop(L, 1);
+
+    return false;
+  }
+
+  return true;
+}
+
+/* Function purpose: The one place the compositor's configuration is opened.
+Hands back a state with the table the chunk returned on top, or NULL -- and
+NULL silently, because a missing or malformed hikari.lua is the ordinary case
+for a first run and must cost nothing but the import. Every failure closes the
+state, so neither caller has a cleanup path of its own. */
+static lua_State *
+hikari_open(const char *path)
+{
+  lua_State *L = luaL_newstate();
+
+  if (L == NULL) {
+    return NULL;
+  }
+
+  /* The standard libraries are opened so math, string and table exist to be
+  handed to the chunk; what it can reach is hikari_environment, not this. */
+  luaL_openlibs(L);
+
+  if (luaL_loadfile(L, path) != LUA_OK || !hikari_sandbox(L)
+      || lua_pcall(L, 0, 1, 0) != LUA_OK || !lua_istable(L, -1)) {
+    lua_close(L);
+
+    return NULL;
+  }
+
+  return L;
+}
+
+/* Function purpose: Push hikari's `ui.<name>` block, or a top-level block of
+the same name. hikari-sakura's own move to Lua is still settling the shape of
+its file, so both are read rather than one being guessed at, and a shape that
+carries neither simply falls through to saber's fallback. Returns false with the
+stack as it found it; on success exactly the block is left on top. */
+static bool
+hikari_push_block(lua_State *L, const char *name)
+{
+  lua_getfield(L, -1, "ui");
+
+  if (lua_istable(L, -1)) {
+    lua_getfield(L, -1, name);
+
+    if (lua_istable(L, -1)) {
+      /* Drop the enclosing ui table from under the block, so the caller sees
+      one value pushed whichever of the two shapes answered. */
+      lua_remove(L, -2);
+
+      return true;
+    }
+
+    lua_pop(L, 2);
+  } else {
+    lua_pop(L, 1);
+  }
+
+  lua_getfield(L, -1, name);
+
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+
+    return false;
+  }
+
+  return true;
+}
+
 int
 saber_theme_import_hikari(const char *path,
     struct saber_color palette[SABER_PALETTE_SLOTS])
@@ -220,48 +333,33 @@ saber_theme_import_hikari(const char *path,
     return 0;
   }
 
-  struct ucl_parser *parser = ucl_parser_new(UCL_PARSER_NO_IMPLICIT_ARRAYS);
+  lua_State *L = hikari_open(path);
 
-  if (parser == NULL) {
+  if (L == NULL) {
     return 0;
   }
 
-  /* Action purpose: A missing or unreadable hikari.conf is the ordinary case
-  for a first run and must cost nothing but the import; the caller falls back
-  on a count below SABER_PALETTE_SLOTS. */
-  if (!ucl_parser_add_file(parser, path)) {
-    ucl_parser_free(parser);
-
-    return 0;
-  }
-
-  ucl_object_t *root = ucl_parser_get_object(parser);
-
-  ucl_parser_free(parser);
-
-  if (root == NULL) {
-    return 0;
-  }
-
-  const ucl_object_t *ui = ucl_object_lookup(root, "ui");
-  const ucl_object_t *block =
-      ui == NULL ? NULL : ucl_object_lookup(ui, "palette");
   int count = 0;
 
-  for (int slot = 0; block != NULL && slot < SABER_PALETTE_SLOTS; slot++) {
-    char key[16];
+  if (hikari_push_block(L, "palette")) {
+    for (int slot = 0; slot < SABER_PALETTE_SLOTS; slot++) {
+      char key[16];
 
-    snprintf(key, sizeof(key), "color%d", slot);
+      snprintf(key, sizeof(key), "color%d", slot);
+      lua_getfield(L, -1, key);
 
-    const ucl_object_t *entry = ucl_object_lookup(block, key);
-    const char *spec = entry == NULL ? NULL : ucl_object_tostring(entry);
+      const char *spec =
+          lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : NULL;
 
-    if (spec != NULL && saber_color_parse(spec, &palette[slot])) {
-      count++;
+      if (spec != NULL && saber_color_parse(spec, &palette[slot])) {
+        count++;
+      }
+
+      lua_pop(L, 1);
     }
   }
 
-  ucl_object_unref(root);
+  lua_close(L);
 
   return count;
 }
@@ -273,38 +371,23 @@ saber_theme_import_hikari_animation(const char *path, int *duration_ms)
     return false;
   }
 
-  struct ucl_parser *parser = ucl_parser_new(UCL_PARSER_NO_IMPLICIT_ARRAYS);
+  lua_State *L = hikari_open(path);
 
-  if (parser == NULL) {
+  if (L == NULL) {
     return false;
   }
 
-  /* Same as the palette import: no hikari.conf is a first run, not an error. */
-  if (!ucl_parser_add_file(parser, path)) {
-    ucl_parser_free(parser);
-
-    return false;
-  }
-
-  ucl_object_t *root = ucl_parser_get_object(parser);
-
-  ucl_parser_free(parser);
-
-  if (root == NULL) {
-    return false;
-  }
-
-  const ucl_object_t *ui = ucl_object_lookup(root, "ui");
-  const ucl_object_t *block =
-      ui == NULL ? NULL : ucl_object_lookup(ui, "animation");
   bool imported = false;
 
-  if (block != NULL) {
-    const ucl_object_t *entry = ucl_object_lookup(block, "duration");
-    int64_t duration;
+  if (hikari_push_block(L, "animation")) {
+    lua_getfield(L, -1, "duration");
 
-    if (entry != NULL && ucl_object_toint_safe(entry, &duration)
-        && duration >= 0 && duration <= SABER_HIKARI_DURATION_MAX) {
+    int usable = 0;
+    lua_Integer duration = lua_tointegerx(L, -1, &usable);
+
+    lua_pop(L, 1);
+
+    if (usable && duration >= 0 && duration <= SABER_HIKARI_DURATION_MAX) {
       *duration_ms = (int)duration;
       imported = true;
     }
@@ -313,18 +396,17 @@ saber_theme_import_hikari_animation(const char *path, int *duration_ms)
     animate, and it is read after the duration because it overrides it -- the
     two keys arrive as one number, and zero is already what the tween code
     reads as "settle immediately". */
-    entry = ucl_object_lookup(block, "enabled");
+    lua_getfield(L, -1, "enabled");
 
-    bool enabled;
-
-    if (entry != NULL && ucl_object_toboolean_safe(entry, &enabled)
-        && !enabled) {
+    if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
       *duration_ms = 0;
       imported = true;
     }
+
+    lua_pop(L, 1);
   }
 
-  ucl_object_unref(root);
+  lua_close(L);
 
   return imported;
 }

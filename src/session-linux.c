@@ -94,13 +94,36 @@ system_bus(void)
 {
   static GDBusConnection *bus;
 
-  if (bus != NULL) {
+  /* Action purpose: a closed connection is not reused. The cache exists so the
+  probe does not reconnect on every menu open, not to pin a dead socket -- and
+  pinning one would contradict the paragraph above, which promises that a bus
+  appearing later works without a restart. The same promise has to hold for a
+  bus that went away and came back. */
+  if (bus != NULL && !g_dbus_connection_is_closed(bus)) {
     return bus;
   }
+
+  g_clear_object(&bus);
 
   GError *error = NULL;
 
   bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
+
+  /* Action purpose: do not let the system bus closing take the panel with it.
+  GLib documents g_bus_get_sync's connection as a singleton which "will
+  (usually) have the #GDBusConnection:exit-on-close property set to %TRUE", and
+  that property as "whether the process will be terminated (by calling
+  `raise(SIGTERM)`) if the connection is closed by the remote peer"
+  (gio/gdbusconnection.c). So a system dbus-daemon restart -- an ordinary
+  package upgrade -- would kill the panel outright, for the sake of a logind
+  probe behind a menu nobody may have opened.
+
+  Only the SYSTEM bus is disclaimed here. GLib's own warning on this function
+  is about the SESSION bus, where quitting with the session is correct and is
+  what the tray already relies on; this connection is not that one. */
+  if (bus != NULL) {
+    g_dbus_connection_set_exit_on_close(bus, FALSE);
+  }
 
   if (bus == NULL) {
     /* Not a warning. A machine with no system bus is a supported

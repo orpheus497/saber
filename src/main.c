@@ -409,9 +409,16 @@ app_reload_config(struct saber_app *app)
 
   saber_config_fini(&next);
 
-  saber_theme_init(&app->theme,
+  /* Action purpose: with the roles, not without them. `theme.roles` was being
+  parsed, validated and stored and then never reaching the theme, because this
+  took the wrapper that passes NULL for them -- so every override in saber.lua
+  was accepted and silently ignored. The reload path matters as much as the
+  startup one: a role edited and reloaded has to take effect without the panel
+  being restarted, which is the whole point of `saberctl reload`. */
+  saber_theme_init_with_roles(&app->theme,
       app->config.theme.palette_valid ? app->config.theme.palette : NULL,
-      app->config.theme.opacity, app->config.theme.overlay_opacity);
+      app->config.theme.opacity, app->config.theme.overlay_opacity,
+      &app->config.theme.roles);
 
   saber_panels_reload(app->panels);
   app_repaint(app);
@@ -838,9 +845,10 @@ run(void)
   memset(&app, 0, sizeof(app));
 
   saber_config_load(&app.config, NULL);
-  saber_theme_init(&app.theme,
+  saber_theme_init_with_roles(&app.theme,
       app.config.theme.palette_valid ? app.config.theme.palette : NULL,
-      app.config.theme.opacity, app.config.theme.overlay_opacity);
+      app.config.theme.opacity, app.config.theme.overlay_opacity,
+      &app.config.theme.roles);
 
   app.display = saber_display_create(NULL);
 

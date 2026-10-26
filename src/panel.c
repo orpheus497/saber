@@ -412,6 +412,27 @@ anim_state_register(struct saber_clock *clock,
   }
 }
 
+/* How far off zero a live tween is held. saber_render_tile() reads an exact
+zero as "not animating", so a tween passing through it has to miss it. A
+thousandth of a tile is 0.03px at the default 32px icon -- below a pixel at any
+scale the panel supports, and far above the precision of a double. */
+#define SABER_ANIM_FLOOR 1e-3
+
+/* Function purpose: A tween's value, kept off the renderer's zero sentinel
+while the tween is actually running. See the draw site in panel_draw() for the
+defect this exists to prevent. */
+static double
+anim_live(const struct saber_tween *tween)
+{
+  double value = saber_tween_value(tween);
+
+  if (!saber_tween_running(tween)) {
+    return value;
+  }
+
+  return value < SABER_ANIM_FLOOR ? SABER_ANIM_FLOOR : value;
+}
+
 static struct saber_anim_state *
 panel_anim(struct saber_panel *panel, const char *id)
 {
@@ -1526,10 +1547,25 @@ panel_render_surface(void *data,
         item->id != NULL ? panel_anim(panel, item->id) : NULL;
 
     if (anim != NULL) {
-      tile.throb *= saber_tween_value(&anim->insert);
-      tile.backlight = saber_tween_value(&anim->backlight);
+      /* Action purpose: a RUNNING tween is held off zero, because zero is the
+      renderer's sentinel for "this tile is not animating" and means the
+      opposite of what a tween starting at 0.0 intends. `insert`, `backlight`
+      and `fade` all start there, saber_tween_start() sets the value to `from`,
+      and saber_render_tile() reads a zero as full size (scale 1.0), full
+      opacity and the full backlight on a running tile -- so the first frame of
+      every insert, every fade and every backlight light-up drew the tile at
+      full value, then snapped to near nothing and animated back up. A visible
+      flash per tile at startup and on every launch.
+
+      Gated on running rather than clamped unconditionally, because the resting
+      values are already correct and must stay exact: `insert` and `fade` rest
+      at 1.0 -- nothing happening -- and `backlight` rests at 0.0, which is how
+      a tile that is not running draws dark. Only the live tween is nudged, and
+      only off the sentinel; see panel_anim(). */
+      tile.throb *= anim_live(&anim->insert);
+      tile.backlight = anim_live(&anim->backlight);
       tile.badge_scale = saber_tween_value(&anim->badge);
-      tile.fade = saber_tween_value(&anim->fade);
+      tile.fade = anim_live(&anim->fade);
 
       if (tile.badge.progress_visible) {
         tile.badge.progress = saber_tween_value(&anim->progress);
@@ -2063,6 +2099,40 @@ panel_close_menu(struct saber_panels *set)
   sheet_grid_close(set->grid);
 }
 
+/* Function purpose: Close the menu and have it GONE before this returns, not
+fading. Every caller that puts something else in its place needs this rather
+than panel_close_menu(), and two separate failures follow from not having it.
+
+The first is a protocol error. A close with animations on only starts the root
+popup's fade, so the popup is still alive; the grabbed popup that goes up next
+-- another quicklist, or the sheet grid -- is then not the topmost popup, which
+xdg_wm_base makes a fatal error on the whole client.
+
+The second is worse because it survives. `set->menu` is reassigned to the
+replacement while the old menu is still fading, and when that fade lands the
+old menu's teardown calls menu_closed(), which clears `set->menu`
+unconditionally -- so the OLD menu's teardown nulls the NEW menu's pointer. The
+panel then has no handle on a popup that holds the seat: nothing can close it,
+not panel_close_menu(), not saber_panels_close_menu(). Opening one menu while
+another is open is the ordinary path, and it left an undismissable menu on
+screen.
+
+The second close is what forces teardown -- see saber_quicklist_close(), which
+documents it as the one route a caller has to that, for exactly the reason the
+destroy path needs it too: a popup that outlives its parent layer surface is a
+protocol error. */
+static void
+panel_close_menu_now(struct saber_panels *set)
+{
+  panel_close_menu(set);
+
+  /* Still here means fading out, since a synchronous teardown has already
+  cleared it through menu_closed(). */
+  if (set->menu != NULL) {
+    saber_quicklist_close(set->menu);
+  }
+}
+
 static void
 menu_closed(void *user)
 {
@@ -2287,7 +2357,7 @@ panel_open_app_menu(struct saber_panel *panel,
   params.running = count > 0;
   params.offer_pin = true;
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_APP, item->id));
 
@@ -2306,7 +2376,7 @@ panel_open_tray_menu(struct saber_panel *panel,
   params.menu_bus_name = saber_sni_item_bus_name(entry);
   params.menu_object_path = saber_sni_item_menu_path(entry);
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_TRAY, NULL));
 
@@ -2366,7 +2436,7 @@ panel_open_session_menu(struct saber_panel *panel,
   params.windows = entries;
   params.windows_len = count;
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_SESSION, NULL));
 }
@@ -2386,7 +2456,7 @@ panel_open_trash_menu(struct saber_panel *panel, const struct saber_slot *slot)
   params.windows = entries;
   params.windows_len = G_N_ELEMENTS(entries);
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_TRASH, NULL));
 }
@@ -2901,7 +2971,7 @@ panel_open_sheet_grid(struct saber_panel *panel, const struct saber_slot *slot)
     return;
   }
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
 
   struct saber_sheet_grid *grid = g_new0(struct saber_sheet_grid, 1);
 
@@ -3901,8 +3971,11 @@ saber_panels_destroy(struct saber_panels *panels)
   }
 
   /* Before the listeners are dropped: closing a menu puts the panel's own pair
-  back, and doing that after they had been cleared would resurrect them. */
-  panel_close_menu(panels);
+  back, and doing that after they had been cleared would resurrect them. Gone
+  rather than fading, because the columns are about to go and a popup that
+  outlives its parent layer surface is a protocol error -- which is one of the
+  cases saber_quicklist_close() names in its own comment. */
+  panel_close_menu_now(panels);
 
   saber_display_set_output_listener(panels->deps.display, NULL, NULL);
   saber_display_remove_pointer_listener(panels->deps.display,

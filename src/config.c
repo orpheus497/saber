@@ -104,7 +104,21 @@ no-op.
 
 Every helper below is written to leave the stack exactly as it found it, which
 is what lets the block readers be a flat run of calls with no bookkeeping of
-their own. This one pushes the value and returns true, or pushes nothing. */
+their own. This one pushes the value and returns true, or pushes nothing.
+
+EVERY TABLE ACCESS IN THIS FILE IS RAW, and it has to stay that way. The whole
+reader runs AFTER lua_pcall has returned, so there is no protected frame around
+any of it: a metamethod that raises here reaches Lua's panic handler, which
+calls abort(). The chunk decides what table comes back, so it can hand over one
+whose metatable errors on a missing key -- `return _ENV` does it with nothing
+but the sandbox this file installs, since that carries __index =
+config_undefined, and `saberctl reload` on such a file killed the panel outright.
+That is the exact opposite of this file's contract, which is that a broken
+configuration costs the user their settings and never their panel.
+
+So: lua_rawget rather than lua_getfield, lua_rawgeti rather than lua_geti,
+lua_rawlen rather than luaL_len. A raw access cannot call anything, so it cannot
+fail. */
 static bool
 config_push_field(lua_State *L, const char *key)
 {
@@ -117,7 +131,8 @@ config_push_field(lua_State *L, const char *key)
       }
     }
 
-    lua_getfield(L, -1, alternative);
+    lua_pushstring(L, alternative);
+    lua_rawget(L, -2);
     g_free(alternative);
 
     if (!lua_isnil(L, -1)) {
@@ -127,7 +142,8 @@ config_push_field(lua_State *L, const char *key)
     lua_pop(L, 1);
   }
 
-  lua_getfield(L, -1, key);
+  lua_pushstring(L, key);
+  lua_rawget(L, -2);
 
   if (lua_isnil(L, -1)) {
     lua_pop(L, 1);
@@ -145,7 +161,8 @@ guarded section and no path can leave a value behind. */
 static bool
 config_push_block(lua_State *L, const char *name)
 {
-  lua_getfield(L, -1, name);
+  lua_pushstring(L, name);
+  lua_rawget(L, -2);
 
   if (!lua_istable(L, -1)) {
     lua_pop(L, 1);
@@ -301,7 +318,7 @@ config_list_len(lua_State *L)
     return 1;
   }
 
-  return lua_istable(L, -1) ? luaL_len(L, -1) : 0;
+  return lua_istable(L, -1) ? (lua_Integer)lua_rawlen(L, -1) : 0;
 }
 
 /* Function purpose: Entry `index` of the list at the top of the stack, copied
@@ -314,7 +331,7 @@ config_list_dup(lua_State *L, lua_Integer index)
     return index == 1 ? g_strdup(lua_tostring(L, -1)) : NULL;
   }
 
-  lua_geti(L, -1, index);
+  lua_rawgeti(L, -1, index);
 
   char *item = lua_type(L, -1) == LUA_TSTRING
       ? g_strdup(lua_tostring(L, -1))

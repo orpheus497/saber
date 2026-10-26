@@ -1,8 +1,20 @@
 # [COMMENT] Script function and purpose: Build Saber, the vertical panel of the
-# Hikari Sakura desktop. FreeBSD only, BSD make only (DECISIONS_LOG D-007 --
-# this deliberately mirrors hikari-sakura's Makefile idiom rather than sofi's
+# Hikari Sakura desktop, with bmake -- which is what `make` is on FreeBSD. This
+# deliberately mirrors hikari-sakura's Makefile idiom rather than sofi's
 # inherited meson, so one contributor moves between the compositor and the
-# panel without changing build tooling).
+# panel without changing build tooling (D-007).
+#
+# [COMMENT] Action purpose: GNUmakefile builds the same tree with GNU make,
+# which is what `make` is on Linux. Two drivers rather than one portable one,
+# because there is no portable one to write: the conditionals, shell assignment
+# and variable modifiers a build of this shape needs are not in POSIX make, and
+# the two dialects spell every one of them differently. What makes that safe
+# rather than merely duplicated is that GNU make looks for GNUmakefile BEFORE
+# Makefile while bmake does not look for GNUmakefile at all -- so each `make`
+# finds its own dialect with no detection logic and nothing generated -- and
+# that every object, protocol and XML path lives once, in build/sources.mk,
+# which both dialects parse identically. Only logic is written twice, and
+# `make features` answers identically under both.
 
 # [COMMENT] Action purpose: Every WITH_* switch below is tested with
 # `defined(X) && ${X:tu} != "NO"` rather than the shorter `.ifdef X`, because
@@ -31,47 +43,31 @@ PREFIX ?= /usr/local
 PKG_CONFIG ?= pkg-config
 ETC_PREFIX ?= ${PREFIX}
 
-# [COMMENT] Action purpose: Saber is FreeBSD-only and says so at the top of the
-# build rather than failing later with a confusing link error. The platform
-# interfaces it relies on -- getfsstat(2) behind GUnixMountMonitor, kqueue
-# behind GFileMonitor, the operator-group privilege model, sysctl -- have no
-# portable equivalent, and pretending otherwise would only produce a binary
-# that misbehaves. See BLUEPRINT.md section 9.
-.if ${OS} != "FreeBSD"
-.error Saber is FreeBSD-only. See BLUEPRINT.md section 0 and DECISIONS_LOG D-012.
-.endif
+# [COMMENT] Action purpose: The FreeBSD-only gate that stood here is gone, and
+# what it claimed is worth recording because two thirds of it was never true of
+# the source. It justified itself on getfsstat(2) behind GUnixMountMonitor and
+# kqueue behind GFileMonitor -- but saber calls neither, and never did. Both
+# reach it only through GLib, which backs them with getfsstat and kqueue on
+# FreeBSD and with /proc/self/mountinfo and inotify on Linux, so devices.c and
+# trash.c were portable all along. The one BSD libc call in the tree,
+# closefrom(2) at src/appinfo.c, has carried a POSIX fallback since it was
+# written.
+#
+# What was genuinely FreeBSD-shaped was the privilege model, and it is now one
+# backend of two: session-freebsd.c keeps the operator-group path and
+# session-linux.c speaks to logind. The other two blockers were this driver's
+# own dialect, answered by GNUmakefile, and libucl, which is packaged for
+# FreeBSD and not for Linux and has been replaced by Lua (R-105).
+#
+# OS is still read, because the archive and the privilege report differ between
+# platforms even though the sources no longer do.
 
-# [COMMENT] Action purpose: OBJS holds only what exists. It grows one phase at a
-# time as PLANS.md schedules each module -- Phase 3 adds config/theme/display/
-# surface/render/anim, Phase 4 the window model, and so on. Listing modules
-# before they are written would break the build for anyone who checks out an
-# intermediate commit, which is the whole reason the phases are separate.
-OBJS = \
-	anim.o \
-	appinfo.o \
-	buffer.o \
-	config.o \
-	dash.o \
-	dbusmenu.o \
-	devices.o \
-	display.o \
-	dnd.o \
-	ipc.o \
-	main.o \
-	match.o \
-	model.o \
-	panel.o \
-	quicklist.o \
-	render.o \
-	session.o \
-	sheets.o \
-	sni.o \
-	spread.o \
-	surface.o \
-	theme.o \
-	toplevel.o \
-	trash.o \
-	unity.o
+# [COMMENT] Action purpose: OBJS, CTL_OBJS, the protocol lists and the XML
+# paths behind them live in build/sources.mk, which GNUmakefile includes too.
+# They are the whole of what the two drivers would otherwise have to keep in
+# step by hand, and the only part of a build of this shape that can be written
+# in a dialect both `make`s parse identically.
+.include "build/sources.mk"
 
 # [COMMENT] Action purpose: saberctl(1) is a second binary, not a mode of the
 # first, and links NOTHING but libc. It runs on every bound keypress (D-008),
@@ -81,11 +77,10 @@ OBJS = \
 # GError -- but not one glib library, which is why it gets its own CFLAGS and
 # no LIBS at all. Verified: `saber` needs 17 shared libraries, `saberctl` needs
 # exactly libc.so.7.
-CTL_OBJS = saberctl.o
 
 WAYLAND_PROTOCOLS != ${PKG_CONFIG} --variable pkgdatadir wayland-protocols
 
-.PHONY: all clean distclean dist install uninstall groupcheck features FORCE
+.PHONY: all clean distclean dist install uninstall groupcheck features test FORCE
 .PATH: src
 
 # Allow specification of /extra/ CFLAGS and LDFLAGS
@@ -184,8 +179,28 @@ PIXBUF_LIBS != ${PKG_CONFIG} --libs gdk-pixbuf-2.0
 RSVG_CFLAGS != ${PKG_CONFIG} --cflags librsvg-2.0
 RSVG_LIBS != ${PKG_CONFIG} --libs librsvg-2.0
 
-UCL_CFLAGS != ${PKG_CONFIG} --cflags libucl
-UCL_LIBS != ${PKG_CONFIG} --libs libucl
+# [COMMENT] Action purpose: Lua is spelled differently by every packager --
+# FreeBSD's lang/lua54 port installs lua-5.4.pc, Debian and Ubuntu install
+# lua5.4.pc, and several distributions provide an unversioned lua.pc alias.
+# Probing a list is the only thing that works everywhere; hardcoding any one
+# name breaks on some host that has Lua installed and working. GNUmakefile
+# probes the same list in the same order.
+#
+# This replaced libucl (R-105), which was packaged for FreeBSD and not for
+# Linux at all -- the `libucl` an apt-based distribution offers is an unrelated
+# compression library carrying none of the ucl_parser_* symbols, so the panel
+# could not be linked there. Lua is MIT, which the project's permissive-only
+# dependency rule requires, and is in the base ports and in every distribution.
+LUA_CANDIDATES = lua5.4 lua-5.4 lua54 lua5.3 lua-5.3 lua53 lua
+LUA_PKG != for c in lua5.4 lua-5.4 lua54 lua5.3 lua-5.3 lua53 lua; do \
+	if ${PKG_CONFIG} --exists $$c 2>/dev/null; then echo $$c; break; fi; done
+
+.if empty(LUA_PKG)
+.error No Lua pkg-config module found. Tried: ${LUA_CANDIDATES}
+.endif
+
+LUA_CFLAGS != ${PKG_CONFIG} --cflags ${LUA_PKG}
+LUA_LIBS != ${PKG_CONFIG} --libs ${LUA_PKG}
 
 XKBCOMMON_CFLAGS != ${PKG_CONFIG} --cflags xkbcommon
 XKBCOMMON_LIBS != ${PKG_CONFIG} --libs xkbcommon
@@ -197,7 +212,7 @@ CFLAGS += \
 	${GIO_CFLAGS} \
 	${PIXBUF_CFLAGS} \
 	${RSVG_CFLAGS} \
-	${UCL_CFLAGS} \
+	${LUA_CFLAGS} \
 	${XKBCOMMON_CFLAGS}
 
 LIBS = \
@@ -207,7 +222,7 @@ LIBS = \
 	${GIO_LIBS} \
 	${PIXBUF_LIBS} \
 	${RSVG_LIBS} \
-	${UCL_LIBS} \
+	${LUA_LIBS} \
 	${XKBCOMMON_LIBS} \
 	-lm
 
@@ -219,21 +234,7 @@ LIBS = \
 # Two of the six are vendored under protocol/ because wlr-protocols is not
 # packaged on FreeBSD; the other four come from wayland-protocols. Both
 # hikari-sakura and sofi vendor the same way for the same reason.
-PROTOCOL_HEADERS = \
-	xdg-shell-protocol.h \
-	xdg-activation-v1-protocol.h \
-	viewporter-protocol.h \
-	fractional-scale-v1-protocol.h \
-	wlr-layer-shell-unstable-v1-protocol.h \
-	wlr-foreign-toplevel-management-unstable-v1-protocol.h
-
-PROTOCOL_OBJS = \
-	xdg-shell-protocol.o \
-	xdg-activation-v1-protocol.o \
-	viewporter-protocol.o \
-	fractional-scale-v1-protocol.o \
-	wlr-layer-shell-unstable-v1-protocol.o \
-	wlr-foreign-toplevel-management-unstable-v1-protocol.o
+# The two lists are in build/sources.mk, included above.
 
 # Must sit after every `CFLAGS +=` above. `:N-pthread` drops the single flag in
 # the pkg-config set that would otherwise drag libthr into saberctl.
@@ -341,15 +342,8 @@ wlr-virtual-pointer-unstable-v1-protocol.c:
 # would put two protocols into the panel binary that the panel never speaks.
 #
 # It needs xkbcommon to compile the keymap it hands the compositor, which is
-# already a dependency of `saber` itself, and no cairo, pango, glib or ucl.
-VINPUT_PROTOCOL_HEADERS = \
-	virtual-keyboard-unstable-v1-protocol.h \
-	wlr-virtual-pointer-unstable-v1-protocol.h
-
-VINPUT_PROTOCOL_OBJS = \
-	virtual-keyboard-unstable-v1-protocol.o \
-	wlr-virtual-pointer-unstable-v1-protocol.o
-
+# already a dependency of `saber` itself, and no cairo, pango, glib or Lua.
+# Its two protocol lists are in build/sources.mk, included above.
 VINPUT_CFLAGS = -Wall -I. ${WAYLAND_CFLAGS} ${XKBCOMMON_CFLAGS}
 VINPUT_LIBS = ${WAYLAND_LIBS} ${XKBCOMMON_LIBS}
 
@@ -373,6 +367,18 @@ features:
 	@echo "WITH_DASH            = ${WITH_DASH:U(off)}"
 	@echo "WITH_SPREAD          = ${WITH_SPREAD:U(off)}"
 	@echo "WITH_VIRTUAL_INPUT   = ${WITH_VIRTUAL_INPUT:U(off)}"
+	@echo "LUA                  = ${LUA_PKG}"
+
+# [COMMENT] Action purpose: The contrast and easing regression test links
+# theme.o and anim.o and nothing else. Every colour defect the panel has had
+# was found by measurement and nothing but a measurement keeps it fixed, so the
+# test has to be runnable anywhere -- including on a host that cannot link the
+# panel itself, which is why it drives saber_theme_init directly rather than
+# reading saber.lua.
+test: ${PROTOCOL_HEADERS} ${TEST_OBJS}
+	${CC} ${LDFLAGS} ${CFLAGS} -o test/contrast ${.CURDIR}/test/contrast.c \
+		${TEST_OBJS} ${CAIRO_LIBS} ${GIO_LIBS} ${LUA_LIBS} -lm
+	@./test/contrast
 
 clean:
 	@echo "cleaning generated protocol sources"
@@ -384,7 +390,7 @@ clean:
 	@rm -f ${OBJS} ${PROTOCOL_OBJS} ${CTL_OBJS}
 	@rm -f vinput.o ${VINPUT_PROTOCOL_OBJS}
 	@echo "cleaning executables"
-	@rm -f saber saberctl vinput
+	@rm -f saber saberctl vinput test/contrast
 
 distclean: clean
 	@rm -f saber-${VERSION}.tar.gz
@@ -395,8 +401,11 @@ saber-${VERSION}.tar.gz: version.h
 		src/*.c \
 		include/saber/*.h \
 		protocol/*.xml \
-		etc/saber/saber.conf \
+		test/*.c \
+		etc/saber/saber.lua \
+		build/sources.mk \
 		Makefile \
+		GNUmakefile \
 		compile_flags.txt \
 		.clang-format \
 		LICENSE \
@@ -421,7 +430,7 @@ install: saber saberctl
 		${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps
 	install -m 555 saber ${DESTDIR}${PREFIX}/bin
 	install -m 555 saberctl ${DESTDIR}${PREFIX}/bin
-	install -m 644 etc/saber/saber.conf ${DESTDIR}${ETC_PREFIX}/etc/saber
+	install -m 644 etc/saber/saber.lua ${DESTDIR}${ETC_PREFIX}/etc/saber
 	@${MAKE} -C${.CURDIR} groupcheck
 
 # [COMMENT] Action purpose: Report operator-group membership; never change it.
@@ -446,5 +455,5 @@ groupcheck:
 uninstall:
 	rm -f ${DESTDIR}${PREFIX}/bin/saber
 	rm -f ${DESTDIR}${PREFIX}/bin/saberctl
-	rm -f ${DESTDIR}${ETC_PREFIX}/etc/saber/saber.conf
+	rm -f ${DESTDIR}${ETC_PREFIX}/etc/saber/saber.lua
 	rm -f ${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps/saber.svg

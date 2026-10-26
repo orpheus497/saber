@@ -260,6 +260,22 @@ hikari_sandbox(lua_State *L)
   return true;
 }
 
+/* How many VM instructions the compositor's configuration gets before it is
+taken to have hung. Reading somebody else's file must not be able to stop the
+panel starting, and the two blocks wanted from it cost a few hundred. */
+#define SABER_HIKARI_STEPS 2000000
+
+/* Function purpose: End a chunk that has run too long, through Lua's own error
+path, so a hikari.lua that does not finish simply fails the import like any
+other unusable file. */
+static void
+hikari_runaway(lua_State *L, lua_Debug *activation)
+{
+  (void)activation;
+
+  luaL_error(L, "the file did not finish");
+}
+
 /* Function purpose: The one place the compositor's configuration is opened.
 Hands back a state with the table the chunk returned on top, or NULL -- and
 NULL silently, because a missing or malformed hikari.lua is the ordinary case
@@ -277,6 +293,7 @@ hikari_open(const char *path)
   /* The standard libraries are opened so math, string and table exist to be
   handed to the chunk; what it can reach is hikari_environment, not this. */
   luaL_openlibs(L);
+  lua_sethook(L, hikari_runaway, LUA_MASKCOUNT, SABER_HIKARI_STEPS);
 
   if (luaL_loadfile(L, path) != LUA_OK || !hikari_sandbox(L)
       || lua_pcall(L, 0, 1, 0) != LUA_OK || !lua_istable(L, -1)) {

@@ -834,14 +834,37 @@ config_sandbox(lua_State *L)
   return true;
 }
 
+/* How many VM instructions a configuration file gets before it is taken to
+have hung. The shipped file needs a few hundred, so this is generous by three
+orders of magnitude, and the only thing it stops is a file that never finishes:
+`while true do end` would otherwise hang the panel instead of being refused,
+and a panel that stops answering is worse than one running the old settings. */
+#define SABER_CONFIG_STEPS 2000000
+
+/* Function purpose: End a chunk that has run too long, through Lua's own error
+path, so a file that does not finish is refused on exactly the terms a file
+that will not parse is -- including being reported at the line it was still on,
+which is the one piece of information that makes a runaway loop findable. */
+static void
+config_runaway(lua_State *L, lua_Debug *activation)
+{
+  lua_getinfo(L, "Sl", activation);
+  luaL_error(L, "%s:%d: the file did not finish", activation->short_src,
+      activation->currentline);
+}
+
 /* Function purpose: Take Lua's error off the stack as a string this file owns.
 Lua reports "file:line: message", which is the whole value of passing it
-through rather than answering with a bare refusal. */
+through rather than answering with a bare refusal. A chunk can also raise
+something that is not a string, and then there is nothing to pass through, so
+the file is named here instead. */
 static char *
-config_take_error(lua_State *L)
+config_take_error(lua_State *L, const char *path)
 {
   const char *message = lua_tostring(L, -1);
-  char *copy = g_strdup(message == NULL ? "unreadable" : message);
+  char *copy = message != NULL
+      ? g_strdup(message)
+      : g_strdup_printf("%s: refused: what it raised is not a message", path);
 
   lua_pop(L, 1);
 
@@ -858,7 +881,7 @@ static bool
 config_open(lua_State *L, const char *path, char **error)
 {
   if (luaL_loadfile(L, path) != LUA_OK) {
-    *error = config_take_error(L);
+    *error = config_take_error(L, path);
 
     return false;
   }
@@ -870,8 +893,10 @@ config_open(lua_State *L, const char *path, char **error)
     return false;
   }
 
+  lua_sethook(L, config_runaway, LUA_MASKCOUNT, SABER_CONFIG_STEPS);
+
   if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-    *error = config_take_error(L);
+    *error = config_take_error(L, path);
 
     return false;
   }

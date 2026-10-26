@@ -962,13 +962,13 @@ dash_draw_search(struct saber_dash *dash, cairo_t *cr)
   double glyph_width = 12.0;
   double filter_x = x + w - 12.0 - filter_width;
 
-  set_source_alpha(cr, filtered ? &theme->accent : &theme->dim, 1.0);
+  set_source_alpha(cr, filtered ? &theme->accent : &theme->hint, 1.0);
   cairo_move_to(cr, filter_x, y + (h - filter_height) / 2.0);
   pango_cairo_show_layout(cr, layout);
   draw_filter_glyph(cr, filter_x - 7.0 - glyph_width, y + h / 2.0 - 4.5,
       glyph_width);
 
-  set_source_alpha(cr, &theme->dim, 1.0);
+  set_source_alpha(cr, &theme->hint, 1.0);
   draw_magnifier(cr, x + 18.0, y + h / 2.0 - 1.5, 5.5);
 
   double text_x = x + 32.0;
@@ -989,7 +989,7 @@ dash_draw_search(struct saber_dash *dash, cairo_t *cr)
   int text_width, text_height;
 
   pango_layout_get_pixel_size(layout, &text_width, &text_height);
-  saber_theme_set_source(cr, empty ? &theme->dim : &theme->foreground);
+  saber_theme_set_source(cr, empty ? &theme->hint : &theme->foreground);
   cairo_move_to(cr, text_x, y + (h - text_height) / 2.0);
   pango_cairo_show_layout(cr, layout);
 
@@ -1058,7 +1058,7 @@ dash_draw_strip(struct saber_dash *dash, cairo_t *cr)
     }
 
     if (chip->icon == NULL) {
-      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
+      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->hint);
       draw_all_glyph(cr, chip->x + chip->width / 2.0, cy, DASH_STRIP_ICON - 6.0);
     } else if (icon != NULL) {
       draw_icon(cr, icon, chip->x + chip->width / 2.0, cy, DASH_STRIP_ICON,
@@ -1071,7 +1071,7 @@ dash_draw_strip(struct saber_dash *dash, cairo_t *cr)
       pango_layout_set_width(layout, (int)((chip->width - 4.0) * PANGO_SCALE));
       pango_layout_set_text(layout, chip->label, -1);
       pango_layout_get_pixel_size(layout, &text_width, &text_height);
-      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
+      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->hint);
       cairo_move_to(cr, chip->x + (chip->width - text_width) / 2.0,
           cy - text_height / 2.0);
       pango_cairo_show_layout(cr, layout);
@@ -1304,7 +1304,7 @@ dash_render(void *data,
         (int)((dash->panel_width - 2.0 * DASH_PAD) * PANGO_SCALE));
     pango_layout_set_height(layout, 0);
     pango_layout_set_text(layout, "No matching applications", -1);
-    saber_theme_set_source(cr, &theme->dim);
+    saber_theme_set_source(cr, &theme->hint);
     cairo_move_to(cr, dash->panel_x + DASH_PAD, dash->grid_y + 24.0);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);

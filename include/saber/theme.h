@@ -16,9 +16,9 @@ struct saber_color {
 /* The conventional terminal layout: 0-7 normal, 8-15 bright. */
 #define SABER_PALETTE_SLOTS 16
 
-/* The ten semantic roles, named so configuration can address one. Every drawing
-module still reads the struct fields below; this enum exists for the override
-block and for nothing else. */
+/* The eleven semantic roles, named so configuration can address one. Every
+drawing module still reads the struct fields below; this enum exists for the
+override block and for nothing else. */
 enum saber_role {
   SABER_ROLE_BACKGROUND,
   SABER_ROLE_FOREGROUND,
@@ -28,11 +28,12 @@ enum saber_role {
   SABER_ROLE_BADGE_BG,
   SABER_ROLE_BADGE_FG,
   SABER_ROLE_PROGRESS,
+  SABER_ROLE_HINT,
   SABER_ROLE_DIM,
   SABER_ROLE_OVERLAY,
 };
 
-#define SABER_ROLE_COUNT 10
+#define SABER_ROLE_COUNT 11
 
 /* Action purpose: One override, as `theme.roles` wrote it. A palette
 reference is kept as the slot number and resolved when the theme is built, not
@@ -61,7 +62,17 @@ struct saber_theme {
   struct saber_color badge_bg;     /* count disc */
   struct saber_color badge_fg;
   struct saber_color progress;     /* progress overlay */
-  struct saber_color dim;          /* empty sheets, unavailable actions */
+
+  /* Recessed content the user still has to read: the dash placeholder, its
+  empty-state line, an unselected filter chip, the number of an empty sheet.
+  Split out of `dim` because the two wanted opposite things from the same
+  colour -- see the derivation in src/theme.c. */
+  struct saber_color hint;
+
+  /* Structural quiet: hairlines, frame outlines, scrollbar tracks, the
+  progress track, and a menu item that is genuinely unavailable -- which WCAG
+  2.1 exempts from any contrast floor, unlike everything `hint` now carries. */
+  struct saber_color dim;
   struct saber_color overlay;      /* dash/spread backdrop: colour only */
 
   /* Whether the resolved background is a light ground. Derived from its

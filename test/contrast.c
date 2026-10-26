@@ -179,15 +179,52 @@ check_theme(const char *name, const struct saber_color *palette)
 
   char hex[8];
 
-  printf("  %-12s light_ground=%d\n", name, saber_theme_is_light(&theme) ? 1 : 0);
+  char hint_hex[8];
+
+  format_hex(theme.hint, hint_hex);
+  printf("  %-12s light_ground=%d  hint=%s at %.2f:1\n", name,
+      saber_theme_is_light(&theme) ? 1 : 0, hint_hex,
+      contrast(theme.hint, theme.background));
 
   /* Text-bearing roles. */
   check_text(name, "foreground", theme.foreground, theme.background);
   check_text(name, "accent", theme.accent, theme.background);
   check_text(name, "urgent", theme.urgent, theme.background);
 
-  /* `dim` is the deliberately low-contrast role -- empty sheets, unavailable
-  actions -- so it is held to the graphical-object floor and nothing more. */
+  /* `hint` carries recessed content that is still read: the dash placeholder,
+  its empty-state line, an unselected filter chip, the number of an empty
+  sheet. It is held to the graphical-object floor and no higher, because
+  holding it to body AA would stop it reading as recessed at all -- the whole
+  point of the role.
+
+  This is the floor the comment here used to claim while the code checked only
+  that the colour existed. It did not catch what it was written to catch:
+  `dim` was carrying this content on palette[8], at 1.34:1 and 1.16:1 against
+  two of the three shipped grounds. */
+  double hint = contrast(theme.hint, theme.background);
+
+  if (hint < AA_MARK && !exempt(name, "hint", hint)) {
+    char detail[96];
+
+    format_hex(theme.hint, hex);
+    snprintf(detail, sizeof(detail),
+        "%s on ground is %.2f:1, below the 3:1 graphical-object floor", hex,
+        hint);
+    fail(name, "hint", detail);
+  }
+
+  /* The same guard the backlight split needed, for the same reason: the two
+  roles are only separate while they resolve to different colours, and a map
+  that quietly recollided them would put the hairlines and the placeholder back
+  on one value without failing anything. */
+  if (same_colour(theme.hint, theme.dim)) {
+    fail(name, "hint", "identical to dim -- the roles have recollided");
+  }
+
+  /* `dim` is the structural role -- hairlines, frame outlines, tracks, and a
+  menu item that is genuinely unavailable, which WCAG 2.1 exempts from any
+  contrast requirement. It is held to being a colour and nothing more, and now
+  that is what the check says as well as what it does. */
   if (contrast(theme.dim, theme.background) < 1.0) {
     fail(name, "dim", "not a colour");
   }

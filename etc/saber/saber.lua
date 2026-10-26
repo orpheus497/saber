@@ -131,7 +131,7 @@ return {
     -- },
 
     -- WHICH COLOUR CARRIES WHICH MEANING. The palette says what colours exist;
-    -- these ten roles say what each one is FOR. The defaults are derived from
+    -- these eleven roles say what each one is FOR. The defaults are derived from
     -- the palette by measurement rather than read off fixed slot numbers,
     -- because the same slot does not mean the same thing in two palettes --
     -- slot 1 is a red in one of hikari-sakura's three themes and a muted green
@@ -155,7 +155,15 @@ return {
     --   badge_fg    the ink on the count disc      the better of color0 and
     --                                              color15 against badge_bg
     --   progress    the progress overlay           follows accent
-    --   dim         empty sheets, dead actions     color8
+    --   hint        recessed content that is        the background, walked out
+    --               still read: the dash            towards color6 until it
+    --               placeholder, its empty-state    reads 3.6:1 against the
+    --               line, an unselected filter      column
+    --               chip, the number of an
+    --               empty sheet
+    --   dim         hairlines, frame outlines,     color8
+    --               tracks, a genuinely
+    --               unavailable menu item
     --   overlay     dash and spread backdrop       follows background --
     --                                              colour only; its alpha is
     --                                              overlay_opacity, below
@@ -168,6 +176,19 @@ return {
     -- to BE slot 8 -- the same slot as dim -- so "running" and "unavailable"
     -- were the same colour on every theme, and on two of the three shipped
     -- palettes that colour was invisible against the column.
+    --
+    -- `hint` is derived for the second half of that same defect, which the
+    -- backlight split left behind: dim was also carrying the recessed content
+    -- a user has to READ, and slot 8 measures 2.29:1, 1.34:1 and 1.16:1
+    -- against the three shipped grounds -- so "Search applications", "No
+    -- matching applications" and the numbers in the sheet grid were invisible
+    -- on two of the three themes. It is settled AT 3.6:1 rather than lifted
+    -- above it, because a placeholder that outreads the labels around it has
+    -- stopped being a placeholder; taking color6 outright would do that on the
+    -- default palette, where it measures 5.97:1.
+    --
+    -- 3.6:1 is also what sofi settles its own `hint` at, by the same walk, so
+    -- a placeholder in the dash and one in a sofi panel recede together.
     --
     -- URGENCY IS THE ONE ROLE THE PALETTE DOES NOT CONTROL. It is a literal
     -- held outside the palette and picked by the ground it is painted on:
@@ -206,6 +227,7 @@ return {
     --   badge_bg   = "color9",
     --   badge_fg   = "color0",
     --   progress   = "color12",
+    --   hint       = "#7c7986",
     --   dim        = "color8",
     --   overlay    = "color0",
     -- },

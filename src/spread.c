@@ -696,7 +696,7 @@ spread_draw_cell(struct saber_spread *spread,
   if (cell->subtitle != NULL) {
     pango_layout_set_height(layout, -1);
     pango_layout_set_text(layout, cell->subtitle, -1);
-    saber_theme_set_source(cr, &theme->dim);
+    saber_theme_set_source(cr, &theme->hint);
     cairo_move_to(cr, x + 10.0,
         y + 20.0 + SPREAD_ICON + 12.0 + title_height);
     pango_cairo_show_layout(cr, layout);
@@ -738,7 +738,7 @@ spread_draw_header(struct saber_spread *spread, cairo_t *cr)
   pango_layout_set_width(layout, (int)(spread->width * PANGO_SCALE));
   pango_layout_set_text(layout, text, -1);
 
-  saber_theme_set_source(cr, count == 0 ? &theme->dim : &theme->foreground);
+  saber_theme_set_source(cr, count == 0 ? &theme->hint : &theme->foreground);
   cairo_move_to(cr, 0.0, SPREAD_MARGIN / 2.0);
   pango_cairo_show_layout(cr, layout);
 

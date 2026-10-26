@@ -2491,7 +2491,10 @@ grid_render(void *data,
 
     int count = grid->counts[sheet];
     bool marked = sheet == grid->hovered || sheet == grid->selected;
-    const struct saber_color *ink = &theme->dim;
+    /* The hint role and not the dim one: this ink draws the sheet's number,
+    which is how the user picks the cell, so it has to be read even on a sheet
+    holding nothing. The frame below stays dim, because that is a hairline. */
+    const struct saber_color *ink = &theme->hint;
 
     if (sheet == grid->current) {
       saber_theme_set_source(cr, &theme->accent);
@@ -2506,7 +2509,7 @@ grid_render(void *data,
     }
 
     /* An empty sheet keeps its outline, so the grid still reads as ten places,
-    and keeps the dim ink, so it reads as an empty one. */
+    and keeps the recessed ink, so it reads as an empty one. */
     saber_theme_set_source(cr, marked ? &theme->accent : &theme->dim);
     cairo_set_line_width(cr, marked ? 2.0 : 1.0);
     cairo_rectangle(cr, x + 0.5, y + 0.5, w - 1.0, h - 1.0);

@@ -64,6 +64,22 @@ fraction is set so the fill is no weaker than it has always been on the default
 theme and is plainly visible on the light one. */
 #define SABER_BACKLIGHT_MIX 0.45
 
+/* What the hint role is settled at against the column. It is deliberately
+under body AA: this is content that has to read as recessed -- a placeholder
+behind what the user is typing, the number of a sheet holding nothing -- so
+holding it to 4.5:1 would put it level with the labels it sits beneath. It is
+equally deliberately above the 3:1 graphical-object floor, because every one of
+those things is still text or a glyph somebody has to make out.
+
+It is the figure sofi's own `hint` is settled at, and by the same walk, so a
+placeholder in the dash and one in a sofi panel recede by the same amount
+rather than by two numbers that happen to look similar. The two land on the
+same literal on the two derived palettes and one step apart on Sakura, because
+sofi rounds each step of the walk to bytes before measuring it and this works
+in doubles throughout -- a difference of 1/255 in a tone nobody is meant to
+read closely. */
+#define SABER_HINT_TARGET 3.6
+
 /* The compositor validates its own duration over this range, and a value
 outside it is a typo rather than an intention worth inheriting. */
 #define SABER_HIKARI_DURATION_MAX 1000
@@ -146,6 +162,52 @@ mix_towards(const struct saber_color *base,
   out.b += (towards->b - base->b) * mix;
 
   return out;
+}
+
+/* Function purpose: A tone that sits AT `target` against `ground` rather than
+above it, walked out from the ground towards `slot` and stopped at the first
+whole percent that reaches it.
+
+This is what a recession needs, and both of the obvious alternatives get it
+wrong on one of the three shipped palettes. Taking the grey slot outright gives
+2.29:1 on Sakura, 1.34:1 on Sakura Dark and 1.16:1 on Sakura Light -- a
+placeholder and a sheet number nobody can read on two of the three. Lifting the
+slot until it clears instead leaves Sakura's own grey untouched at 5.97:1,
+brighter than the body text it is supposed to sit behind. Walking out from the
+ground caps it from below, and only where the walk cannot reach the target at
+all is the slot carried past itself, towards white on a dark ground and black on
+a light one.
+
+Towards the extreme rather than towards the text colour, for the reason the
+accent family already takes that route: a blend towards a near-grey text colour
+reaches the ratio by draining the hue out of the tone. */
+static struct saber_color
+settle_to(const struct saber_color *ground,
+    const struct saber_color *slot,
+    double target)
+{
+  for (int step = 1; step <= 100; step++) {
+    struct saber_color out = mix_towards(ground, slot, step / 100.0);
+
+    if (contrast_ratio(ground, &out) >= target) {
+      return out;
+    }
+  }
+
+  struct saber_color extreme = *slot;
+
+  extreme.r = extreme.g = extreme.b =
+      relative_luminance(ground) >= SABER_LIGHT_GROUND ? 0.0 : 1.0;
+
+  for (int step = 1; step <= 100; step++) {
+    struct saber_color out = mix_towards(slot, &extreme, step / 100.0);
+
+    if (contrast_ratio(ground, &out) >= target) {
+      return out;
+    }
+  }
+
+  return extreme;
 }
 
 /* Function purpose: Hand back the override for a role if the configuration
@@ -482,7 +544,7 @@ saber_theme_init_with_roles(struct saber_theme *theme,
   accent retints the backlight and the progress bar, a new urgent takes the
   count disc with it, and the badge ink is then measured against whatever the
   disc actually ended up being. A positional map cannot do that -- it is why
-  the same ten indices read correctly on one palette and wrongly on the next.
+  the same fixed indices read correctly on one palette and wrongly on the next.
 
   The ground comes first because the urgency literal is chosen by it. */
   theme->background =
@@ -515,6 +577,21 @@ saber_theme_init_with_roles(struct saber_theme *theme,
 
   theme->progress =
       role_value(theme, roles, SABER_ROLE_PROGRESS, theme->accent);
+
+  /* Action purpose: `hint` is settled against the column from the grey slot,
+  not taken from it. The defect this repairs is the same shape as the
+  backlight/dim collision above and was left behind by it: `dim` was carrying
+  both the hairlines and the recessed text, and palette[8] reads at 2.29:1,
+  1.34:1 and 1.16:1 against the three shipped grounds -- so the dash's "Search
+  applications", its "No matching applications" line and the numbers in the
+  sheet grid were invisible on two of the three themes. Separating them lets
+  each sit where it belongs: see settle_to() for why neither taking the slot nor
+  lifting it works, and SABER_HINT_TARGET for the figure. */
+  theme->hint = role_value(theme, roles, SABER_ROLE_HINT,
+      settle_to(&theme->background, &theme->palette[6], SABER_HINT_TARGET));
+
+  /* `dim` keeps palette[8] and keeps the structural work: hairlines, frame
+  outlines, tracks, and a menu item that is genuinely unavailable. */
   theme->dim = role_value(theme, roles, SABER_ROLE_DIM, theme->palette[8]);
   theme->overlay =
       role_value(theme, roles, SABER_ROLE_OVERLAY, theme->background);

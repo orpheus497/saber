@@ -66,6 +66,7 @@ static const struct saber_enum_name saber_role_names[] = {
   { "badge-bg", SABER_ROLE_BADGE_BG },
   { "badge-fg", SABER_ROLE_BADGE_FG },
   { "progress", SABER_ROLE_PROGRESS },
+  { "hint", SABER_ROLE_HINT },
   { "dim", SABER_ROLE_DIM },
   { "overlay", SABER_ROLE_OVERLAY },
   { NULL, 0 },

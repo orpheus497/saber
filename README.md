@@ -179,7 +179,7 @@ Unity's mechanics are reproduced; Unity's Ambiance colours are not.
 rendered correctly. They are positionally identical and semantically divergent: slot 1 is a red
 on Sakura, a muted dark red on Sakura Dark and a muted **emerald green** on Sakura Light. A role
 map pinned to slot numbers is therefore right for exactly one palette and paints urgency green
-on another, which is why the ten roles are *derived* from whatever palette is in force rather
+on another, which is why the eleven roles are *derived* from whatever palette is in force rather
 than indexed out of it.
 
 | Role | What it paints | Where it comes from |
@@ -192,7 +192,8 @@ than indexed out of it.
 | `badge_bg` | The count disc | follows `urgent` |
 | `badge_fg` | The ink on the count disc | whichever of `color0` and `color15` measures better against `badge_bg` |
 | `progress` | The progress overlay | follows `accent` |
-| `dim` | Empty sheets, unavailable actions | `color8` |
+| `hint` | Recessed content that is still read: the dash placeholder, its empty-state line, an unselected filter chip, the number of an empty sheet | the background, walked out towards `color6` until it reads 3.6:1 against the column |
+| `dim` | Hairlines, frame outlines, tracks, a genuinely unavailable menu item | `color8` |
 | `overlay` | Dash strip and spread backdrop | follows `background`, colour only — its alpha is `overlay-opacity` |
 
 **`accent` and `badge_fg` are picked by measured contrast, not by a fixed slot**, which is what
@@ -207,6 +208,21 @@ not have to declare which kind it is.
 an unavailable action were painted in the same colour on every palette — and on two of the three
 shipped ones that colour was invisible against the column: 1.34:1 on Sakura Dark, 1.16:1 on
 Sakura Light. It is now a derived tone of the column itself and cannot collide with `dim` again.
+
+**`hint` no longer shares it either**, which is the other half of the same defect. `dim` was
+carrying two jobs with opposite requirements: the hairlines and outlines, which have to stay
+quiet, and the content a user actually reads — "Search applications", "No matching
+applications", an unselected filter chip, the number of an empty sheet — which has to stay
+legible. On `palette[8]` that content measured 2.29:1, 1.34:1 and 1.16:1 against the three
+shipped grounds, so on two of the three themes the sheet numbers and the dash placeholder were
+not there. `hint` is *settled at* 3.6:1 rather than lifted above it: a placeholder that outreads
+the labels around it has stopped being a placeholder, and taking `color6` outright would do
+exactly that on the default palette, where it measures 5.97:1. It resolves to `#7c7986`,
+`#6f6f74` and `#6a6d74` on the three palettes — the same figure, and the same walk, sofi settles
+its own `hint` at, so a placeholder in the dash and one in a sofi panel recede together. `dim`
+keeps `color8` and keeps the structural work, including the one thing in its list that genuinely
+has no contrast floor: WCAG 2.1 exempts the text of an inactive component, which is what a
+greyed-out menu item is.
 
 ### Urgency is the one colour the palette does not control
 
@@ -634,8 +650,9 @@ default configuration in `${ETC_PREFIX}/etc/saber/saber.lua`, and the BFB emblem
 
 `make test` builds and runs the contrast and easing regression test, and it is the reason the
 colour work in [Theming](#theming) can be stated rather than hoped for. It checks WCAG AA across
-all three shipped palettes and the compiled-in fallback, that `backlight` and `dim` have not
-recollided, that urgency resolves to the ruled literal for its ground, that Sakura's `urgent` is
+all three shipped palettes and the compiled-in fallback, that `hint` clears the 3:1
+graphical-object floor, that neither `backlight` nor `hint` has recollided with `dim`, that
+urgency resolves to the ruled literal for its ground, that Sakura's `urgent` is
 still byte-identical to that palette's `color9`, five contrast ratios recorded independently
 elsewhere, the easing endpoints and their clamping, the spring's peak of 1.0670 at t=0.3925, that
 a zero-length repeating tween settles instead of repainting for ever, and that a cancelled tween

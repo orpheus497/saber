@@ -45,7 +45,7 @@ stays legible against the lightest, so a single value is a choice of which
 theme to fail on. The dark pick is byte-identical to the shipped palette's
 bright red, which is what urgency already resolved to there, so the default
 theme is unchanged by the split. Both are overridable by name through
-`theme { roles { urgent } }`, which is also the only way a dropped-in terminal
+`theme.roles.urgent`, which is also the only way a dropped-in terminal
 colour scheme can take this one role back. */
 #define SABER_URGENT_ON_DARK "#df8787"
 #define SABER_URGENT_ON_LIGHT "#9b2226"

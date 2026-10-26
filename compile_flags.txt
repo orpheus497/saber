@@ -16,3 +16,4 @@
 -I/usr/local/include/harfbuzz
 -I/usr/local/include/libpng16
 -I/usr/local/include/libxml2
+-I/usr/local/include/lua54

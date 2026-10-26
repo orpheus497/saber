@@ -34,7 +34,7 @@ enum saber_role {
 
 #define SABER_ROLE_COUNT 10
 
-/* Action purpose: One override, as `theme { roles }` wrote it. A palette
+/* Action purpose: One override, as `theme.roles` wrote it. A palette
 reference is kept as the slot number and resolved when the theme is built, not
 when the file is read, because the palette may still arrive from hikari.lua
 afterwards -- so `urgent = color9` keeps following a retheme the way the rest of
@@ -98,7 +98,7 @@ saber_theme_init(struct saber_theme *theme,
     double opacity,
     double overlay_opacity);
 
-/* Function purpose: saber_theme_init, with the `theme { roles }` overrides
+/* Function purpose: saber_theme_init, with the `theme.roles` overrides
 applied over the derived defaults. `roles` may be NULL, which is exactly
 saber_theme_init. An override wins over the default, and the roles are resolved
 in dependency order, so overriding a role the map derives from carries the

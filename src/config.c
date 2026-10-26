@@ -54,7 +54,7 @@ static const struct saber_enum_name saber_backlight_names[] = {
   { NULL, 0 },
 };
 
-/* The ten names `theme { roles }` accepts, in the order theme.h declares them.
+/* The ten names `theme.roles` accepts, in the order theme.h declares them.
 The hyphenated spellings also answer to an underscore, as every other key
 does. */
 static const struct saber_enum_name saber_role_names[] = {
@@ -82,7 +82,7 @@ static const struct saber_enum_name saber_portion_names[] = {
   { NULL, 0 },
 };
 
-/* The order the column carried before `items { order }` existed, and what an
+/* The order the column carried before `items.order` existed, and what an
 absent key still means. */
 static const enum saber_portion saber_portion_default[] = {
   SABER_PORTION_BFB,
@@ -160,7 +160,7 @@ setting turns on this rather than on its value, because 180 written out by hand
 and 180 left to the default are the same number and must not mean the same
 thing. */
 static bool
-config_written(lua_State *L, const char *key)
+config_key_written(lua_State *L, const char *key)
 {
   if (!config_push_field(L, key)) {
     return false;
@@ -684,7 +684,7 @@ config_apply(struct saber_config *config,
     the value afterwards, because 180 written out by hand and 180 left to the
     default are the same number and must not mean the same thing -- one of them
     refuses the compositor's duration and the other asks for it. */
-    written->animation_ms = config_written(L, "animation-ms");
+    written->animation_ms = config_key_written(L, "animation-ms");
 
     lua_pop(L, 1);
   }
@@ -807,6 +807,20 @@ static const char *const config_environment[] = {
   NULL,
 };
 
+/* Function purpose: Refuse a read of a name the sandbox does not hold, naming
+it and saying what it was most likely meant to be. Reached through the
+environment's __index, so `edge = left` reports the undefined `left` at its own
+line instead of quietly setting nothing. */
+static int
+config_undefined(lua_State *L)
+{
+  const char *name = lua_tostring(L, 2);
+
+  return luaL_error(L,
+      "%s is not defined; a word used as a value needs quoting, as in \"%s\"",
+      name == NULL ? "that name" : name, name == NULL ? "..." : name);
+}
+
 /* Function purpose: Give the chunk on top of the stack the restricted globals
 above in place of Lua's own. _ENV is a chunk's first upvalue, which is what
 makes this one substitution cover the whole file rather than a list of deletions
@@ -820,6 +834,22 @@ config_sandbox(lua_State *L)
     lua_getglobal(L, config_environment[i]);
     lua_setfield(L, -2, config_environment[i]);
   }
+
+  /* Action purpose: Reading a name this environment does not hold is an error
+  rather than nil, and that is the single most useful thing this sandbox does
+  for somebody migrating a file by hand.
+
+  Every value in the configuration this format replaced was a bare word --
+  `edge = left`, `autohide = never`, `backlight = palette`, `urgent = color9`.
+  All four are valid Lua that reads an undefined global, so without this they
+  would each evaluate to nil, the key would be absent rather than wrong, and
+  the setting would be silently dropped while the file loaded without
+  complaint. A key that does nothing and says nothing is worse than a file that
+  is refused, because the refusal names the line. */
+  lua_newtable(L);
+  lua_pushcfunction(L, config_undefined);
+  lua_setfield(L, -2, "__index");
+  lua_setmetatable(L, -2);
 
   /* Action purpose: A main chunk always has _ENV as its first upvalue, so this
   cannot fail in practice -- but lua_setupvalue pops nothing when it does not

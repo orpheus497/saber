@@ -55,7 +55,7 @@ enum saber_portion {
 #define SABER_PORTION_COUNT 7
 
 /* The column is icon_size plus a symmetric gutter. This is the DEFAULT gutter,
-not the gutter: panel { padding } overrides it, so a user who wants a tighter
+not the gutter: panel.padding overrides it, so a user who wants a tighter
 or a roomier column is not asking for a recompile. */
 #define SABER_PANEL_PADDING 12
 
@@ -67,8 +67,8 @@ struct saber_config {
     int padding;   /* added to icon_size for the column's width */
     enum saber_autohide autohide;
     int reveal_pressure;
-    /* An explicit `panel { animation-ms }` wins. Absent, the compositor's own
-    `ui { animation }` supplies it while theme.inherit_hikari is true, so the
+    /* An explicit `panel.animation-ms` wins. Absent, the compositor's own
+    `ui.animation` supplies it while theme.inherit_hikari is true, so the
     desktop moves at one speed rather than at two unrelated ones. Absent both,
     the built-in default stands. */
     int animation_ms;

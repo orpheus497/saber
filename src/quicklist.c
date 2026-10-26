@@ -15,8 +15,6 @@ paint somebody else's menu in Saber's own theme. */
 
 #include <sys/mman.h>
 
-#include <dev/evdev/input-event-codes.h>
-
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib.h>
 #include <pango/pangocairo.h>
@@ -27,6 +25,10 @@ paint somebody else's menu in Saber's own theme. */
 #include <saber/display.h>
 #include <saber/quicklist.h>
 #include <saber/render.h>
+
+/* linux/input-event-codes.h is a Linux header; the one button code the menu
+reads is stable and is spelled out rather than pulled in through a shim. */
+#define QL_BTN_LEFT 0x110
 
 #define QL_PAD_X 10
 #define QL_PAD_Y 4
@@ -122,10 +124,11 @@ struct ql_level {
   GCancellable *cancellable;
 
   /* Action purpose: One tween, one-shot: the level's contents fade up as it
-  opens, so a submenu appearing under the pointer reads as arriving rather than
-  as the screen changing between two frames. The ROW highlight deliberately does
-  not fade -- a menu highlight that lags the pointer reads as the menu being
-  slow, and every desktop menu snaps it. */
+  opens and the root's runs back down on dismissal, so a menu appearing under
+  the pointer reads as arriving rather than as the screen changing between two
+  frames, and one being dismissed reads as leaving. The ROW highlight
+  deliberately does not fade -- a menu highlight that lags the pointer reads as
+  the menu being slow, and every desktop menu snaps it. */
   struct saber_clock *clock;
   struct saber_tween reveal;
 };
@@ -180,12 +183,24 @@ struct saber_quicklist {
   uint32_t serial;
   bool pressed;
   bool closing;
+
+  /* Action purpose: The root level fades back out before its popup goes, so the
+  menu outlives its own dismissal by one animation. `fading_out` is that window
+  -- the submenus are already gone, the seat is already back and no input
+  reaches the menu -- and `teardown` is the idle that frees it, because a popup
+  cannot be destroyed from inside the frame callback that noticed the fade had
+  landed. */
+  bool fading_out;
+  guint teardown;
   bool held;     /* the panel's keyboard hold is ours to release */
   bool listening; /* the display's listeners are ours to put back */
 };
 
 static void
 level_destroy(struct ql_level *level);
+
+static gboolean
+ql_teardown_idle(gpointer data);
 
 static struct ql_level *
 level_create(struct saber_quicklist *ql,
@@ -957,6 +972,20 @@ level_frame(void *data, uint32_t time)
   if (saber_clock_advance(level->clock,
           saber_clock_stamp(level->clock, time))) {
     saber_popup_damage(level->popup);
+
+    return;
+  }
+
+  /* Action purpose: Nothing is moving any more, so a dismissal that was waiting
+  for this level's fade has arrived -- but the popup is NOT destroyed from in
+  here. The surface layer reads the popup again as this returns, so freeing it
+  on this stack is a read of freed memory; an idle does it with the main loop
+  back in charge. Only the root fades out, so only the root can be the one
+  waiting. */
+  struct saber_quicklist *ql = level->ql;
+
+  if (ql->fading_out && level->parent == NULL && ql->teardown == 0) {
+    ql->teardown = g_idle_add(ql_teardown_idle, ql);
   }
 }
 
@@ -1492,7 +1521,7 @@ quicklist_pointer_button(void *data,
 
   struct saber_quicklist *ql = data;
 
-  if (button != BTN_LEFT) {
+  if (button != QL_BTN_LEFT) {
     return;
   }
 
@@ -1871,33 +1900,56 @@ saber_quicklist_open(const struct saber_quicklist_params *params,
   return ql;
 }
 
-void
-saber_quicklist_close(struct saber_quicklist *ql)
+/* Function purpose: Give the seat and the panel's keyboard hold back. Split out
+because a dismissal gives up its input the moment it is asked for, a whole
+animation before the popup it was drawn on goes: a menu on its way out must not
+take a click, and the column underneath has to be reachable again immediately.
+*/
+static void
+ql_release_input(struct saber_quicklist *ql)
+{
+  if (ql->held) {
+    ql->held = false;
+    saber_surface_hold_keyboard(ql->parent, false);
+  }
+
+  if (ql->listening) {
+    ql->listening = false;
+    saber_display_remove_pointer_listener(ql->display,
+        &quicklist_pointer_listener, ql);
+    saber_display_set_keyboard_listener(ql->display, ql->prev_keyboard,
+        ql->prev_keyboard_data);
+  }
+}
+
+/* Function purpose: Everything the menu holds, let go at once, the menu itself
+included. The animated dismissal arrives here when the root's fade lands; a zero
+duration, a second close, a popup the compositor has already dismissed and an
+unmapped menu all come straight through without waiting for a frame. */
+static void
+ql_teardown(struct saber_quicklist *ql)
 {
   /* Closing is re-entrant by design: a `closed` handler is free to call this
   again, and popup_done can arrive while an activation is already tearing the
   menu down. */
-  if (ql == NULL || ql->closing) {
+  if (ql->closing) {
     return;
   }
 
   bool mapped = ql->root != NULL;
 
   ql->closing = true;
+  ql->fading_out = false;
+
+  if (ql->teardown != 0) {
+    g_source_remove(ql->teardown);
+    ql->teardown = 0;
+  }
 
   level_destroy(ql->root);
   ql->root = NULL;
 
-  if (ql->held) {
-    saber_surface_hold_keyboard(ql->parent, false);
-  }
-
-  if (ql->listening) {
-    saber_display_remove_pointer_listener(ql->display,
-        &quicklist_pointer_listener, ql);
-    saber_display_set_keyboard_listener(ql->display, ql->prev_keyboard,
-        ql->prev_keyboard_data);
-  }
+  ql_release_input(ql);
 
   if (mapped) {
     saber_display_flush(ql->display);
@@ -1931,4 +1983,60 @@ saber_quicklist_close(struct saber_quicklist *ql)
   }
 
   g_free(ql);
+}
+
+static gboolean
+ql_teardown_idle(gpointer data)
+{
+  struct saber_quicklist *ql = data;
+
+  ql->teardown = 0;
+  ql_teardown(ql);
+
+  return G_SOURCE_REMOVE;
+}
+
+void
+saber_quicklist_close(struct saber_quicklist *ql)
+{
+  if (ql == NULL || ql->closing) {
+    return;
+  }
+
+  /* Action purpose: A second close while the first is still fading out finishes
+  it rather than restarting it. That is also the one route a caller has to a
+  menu it must be rid of this instant -- a column being destroyed takes its
+  parent layer surface with it, and a popup that outlives its parent is a
+  protocol error -- so panel.c closing an already-closing menu is the ordinary
+  path, not an edge case. */
+  if (ql->fading_out) {
+    ql_teardown(ql);
+
+    return;
+  }
+
+  /* Action purpose: The root's reveal runs backwards and the popup goes when it
+  lands, so the menu leaves the way it arrived. Three cases cannot wait for
+  that: an unmapped menu has nothing to fade, `animation-ms = 0` means there is
+  no animation to wait for, and a popup the compositor has already dismissed
+  will never deliver another frame to notice the landing on.
+
+  The submenus go now whatever happens. They are separate popups which must be
+  destroyed innermost first, and fading a chain out from the inside is motion
+  nobody asked for; leaving a row has always closed them outright. */
+  if (ql->root == NULL || ql_anim_ms(ql) <= 0 || ql->root->popup == NULL ||
+      ql->root->popup->done) {
+    ql_teardown(ql);
+
+    return;
+  }
+
+  ql->fading_out = true;
+  level_close_children(ql->root);
+  ql_release_input(ql);
+  saber_display_flush(ql->display);
+  saber_tween_start(&ql->root->reveal,
+      saber_tween_value(&ql->root->reveal), 0.0, ql_anim_ms(ql),
+      SABER_EASE_OUT_CUBIC, saber_clock_now(ql->root->clock));
+  saber_popup_damage(ql->root->popup);
 }

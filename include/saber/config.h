@@ -62,6 +62,10 @@ struct saber_config {
     int padding;   /* added to icon_size for the column's width */
     enum saber_autohide autohide;
     int reveal_pressure;
+    /* An explicit `panel { animation-ms }` wins. Absent, the compositor's own
+    `ui { animation }` supplies it while theme.inherit_hikari is true, so the
+    desktop moves at one speed rather than at two unrelated ones. Absent both,
+    the built-in default stands. */
     int animation_ms;
   } panel;
 
@@ -74,6 +78,12 @@ struct saber_config {
     block; falls back to the built-in palette when neither is readable. */
     struct saber_color palette[SABER_PALETTE_SLOTS];
     bool palette_valid;
+    /* `theme { roles }`: a per-role override, each entry either a palette
+    reference or a literal. The palette says what colours exist and this says
+    which of them carries which meaning, so a user who disagrees with a derived
+    role re-points it by name instead of having to rebuild the palette around
+    it. Unset entries leave the derived default in place. */
+    struct saber_theme_roles roles;
   } theme;
 
   struct {

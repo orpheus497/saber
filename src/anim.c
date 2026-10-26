@@ -47,9 +47,9 @@ saber_ease(enum saber_easing easing, double t)
     }
 
   /* Action purpose: A decaying cosine rather than a true spring solve. It is
-  zero at t=0, overshoots once around t=0.3 and has decayed to within a quarter
-  percent of 1.0 by t=1, where the clamp above lands it exactly -- which is all
-  a 150ms launch throb needs and costs one exp and one cos. */
+  zero at t=0, overshoots once to 1.0670 at t=0.3925 and has decayed to within a
+  quarter percent of 1.0 by t=1, where the clamp above lands it exactly -- which
+  is all a 150ms launch throb needs and costs one exp and one cos. */
   case SABER_EASE_SPRING:
     return 1.0 - exp(-6.0 * t) * cos(6.0 * t);
 
@@ -187,6 +187,49 @@ saber_tween_advance(struct saber_tween *tween, int64_t now_ms)
       tween->from + (tween->to - tween->from) * saber_ease(tween->easing, t);
 
   return true;
+}
+
+void
+saber_hover_init(struct saber_hover *hover)
+{
+  saber_tween_init(&hover->enter, 0.0);
+  saber_tween_init(&hover->leave, 0.0);
+}
+
+void
+saber_hover_add(struct saber_clock *clock, struct saber_hover *hover)
+{
+  saber_clock_add(clock, &hover->enter);
+  saber_clock_add(clock, &hover->leave);
+}
+
+void
+saber_hover_leave(struct saber_hover *hover, int duration_ms, int64_t now_ms)
+{
+  saber_tween_start(&hover->leave, hover->enter.value, 0.0, duration_ms,
+      SABER_EASE_OUT_CUBIC, now_ms);
+}
+
+void
+saber_hover_enter(struct saber_hover *hover, int duration_ms, int64_t now_ms)
+{
+  saber_tween_start(&hover->enter, 0.0, 1.0, duration_ms, SABER_EASE_OUT_CUBIC,
+      now_ms);
+}
+
+void
+saber_hover_rest(struct saber_hover *hover)
+{
+  saber_tween_stop(&hover->enter);
+  hover->enter.value = 0.0;
+}
+
+void
+saber_hover_clear(struct saber_hover *hover)
+{
+  saber_hover_rest(hover);
+  saber_tween_stop(&hover->leave);
+  hover->leave.value = 0.0;
 }
 
 struct saber_clock *

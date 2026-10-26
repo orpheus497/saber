@@ -47,6 +47,23 @@ static const struct saber_enum_name saber_backlight_names[] = {
   { NULL, 0 },
 };
 
+/* The ten names `theme { roles }` accepts, in the order theme.h declares them.
+The hyphenated spellings also answer to an underscore, as every other key
+does. */
+static const struct saber_enum_name saber_role_names[] = {
+  { "background", SABER_ROLE_BACKGROUND },
+  { "foreground", SABER_ROLE_FOREGROUND },
+  { "accent", SABER_ROLE_ACCENT },
+  { "backlight", SABER_ROLE_BACKLIGHT },
+  { "urgent", SABER_ROLE_URGENT },
+  { "badge-bg", SABER_ROLE_BADGE_BG },
+  { "badge-fg", SABER_ROLE_BADGE_FG },
+  { "progress", SABER_ROLE_PROGRESS },
+  { "dim", SABER_ROLE_DIM },
+  { "overlay", SABER_ROLE_OVERLAY },
+  { NULL, 0 },
+};
+
 static const struct saber_enum_name saber_portion_names[] = {
   { "bfb", SABER_PORTION_BFB },
   { "apps", SABER_PORTION_APPS },
@@ -331,6 +348,69 @@ config_apply_palette(struct saber_config *config, const ucl_object_t *theme)
   return true;
 }
 
+/* Function purpose: Resolve a "colorN" palette reference, 0-15. Returns -1 for
+anything else, which is what tells the caller to read the value as a literal
+instead -- the same two forms the compositor's own colour keys take. */
+static int
+config_palette_reference(const char *spec)
+{
+  if (spec == NULL || g_ascii_strncasecmp(spec, "color", 5) != 0) {
+    return -1;
+  }
+
+  const char *digits = spec + 5;
+  char *end = NULL;
+  int64_t slot = g_ascii_strtoll(digits, &end, 10);
+
+  if (end == digits || end == NULL || *end != '\0' || slot < 0
+      || slot >= SABER_PALETTE_SLOTS) {
+    return -1;
+  }
+
+  return (int)slot;
+}
+
+/* Function purpose: Read `theme { roles }`, the per-role override block. The
+palette says which colours exist; this says which of them carries which
+meaning, and an override wins over the colour the role map would otherwise
+derive. It is what lets a user re-point one role -- urgency back onto a palette
+slot, say -- without having to rebuild the whole palette around it. An unusable
+value costs that one role and is reported, never the block. */
+static void
+config_apply_roles(struct saber_config *config, const ucl_object_t *theme)
+{
+  const ucl_object_t *block = config_lookup(theme, "roles");
+
+  if (block == NULL) {
+    return;
+  }
+
+  for (const struct saber_enum_name *n = saber_role_names; n->name != NULL;
+      n++) {
+    const ucl_object_t *entry = config_lookup(block, n->name);
+    const char *spec = entry == NULL ? NULL : ucl_object_tostring(entry);
+
+    if (spec == NULL) {
+      continue;
+    }
+
+    struct saber_role_override override = { .set = true, .slot = -1 };
+
+    override.slot = config_palette_reference(spec);
+
+    if (override.slot < 0 && !saber_color_parse(spec, &override.color)) {
+      fprintf(stderr,
+          "saber: theme { roles }: %s: \"%s\" is neither colorN nor a #rrggbb "
+          "literal; keeping the default\n",
+          n->name, spec);
+
+      continue;
+    }
+
+    config->theme.roles.role[n->value] = override;
+  }
+}
+
 /* Function purpose: Read `items { order }`, the ordered portion list. An
 unrecognised name is reported rather than silently dropped -- config_enum's
 precedent -- and a repeat is ignored, because a portion is one place in the
@@ -443,8 +523,18 @@ config_resolve_order(struct saber_config *config)
   config->items.session = present[SABER_PORTION_SESSION];
 }
 
-static bool
-config_apply(struct saber_config *config, const ucl_object_t *root)
+/* Which of the settings a hikari.conf could also supply the saber.conf wrote
+for itself. A key written here always wins over the compositor's, so the import
+has to know what it is not allowed to answer. */
+struct config_written {
+  bool palette;
+  bool animation_ms;
+};
+
+static void
+config_apply(struct saber_config *config,
+    const ucl_object_t *root,
+    struct config_written *written)
 {
   const ucl_object_t *panel = ucl_object_lookup(root, "panel");
   const ucl_object_t *theme = ucl_object_lookup(root, "theme");
@@ -464,6 +554,12 @@ config_apply(struct saber_config *config, const ucl_object_t *root)
   config_apply_int(
       panel, "reveal-pressure", &config->panel.reveal_pressure, 0, 100000);
   config_apply_int(panel, "animation-ms", &config->panel.animation_ms, 0, 10000);
+
+  /* Action purpose: Noted before the import runs rather than inferred from the
+  value afterwards, because 180 written out by hand and 180 left to the default
+  are the same number and must not mean the same thing -- one of them refuses
+  the compositor's duration and the other asks for it. */
+  written->animation_ms = config_lookup(panel, "animation-ms") != NULL;
 
   config_apply_bool(theme, "inherit-hikari", &config->theme.inherit_hikari);
   config->theme.backlight = config_enum(theme, "backlight",
@@ -488,15 +584,23 @@ config_apply(struct saber_config *config, const ucl_object_t *root)
   config_apply_string(session, "lock", &config->session.lock);
   config_apply_string(session, "logout", &config->session.logout);
 
-  return theme != NULL && config_apply_palette(config, theme);
+  written->palette = theme != NULL && config_apply_palette(config, theme);
+
+  config_apply_roles(config, theme);
 }
 
-/* Function purpose: Try each hikari.conf in turn, user first. Only a complete
-sixteen-slot import counts, so a truncated or half-commented palette falls
-through to the next candidate rather than tinting the panel with defaults for
-the missing half. */
+/* Function purpose: Try each hikari.conf in turn, user first, for whichever of
+the two imports the saber.conf left open. Only a complete sixteen-slot import
+counts as a palette, so a truncated or half-commented one falls through to the
+next candidate rather than tinting the panel with defaults for the missing half.
+The motion duration is taken the same way and independently -- the first
+candidate that carries an animation block answers it -- so a user whose own
+hikari.conf sets only one of the two still inherits both from where they are
+actually written. Returns whether the palette was imported, which is the one
+answer the caller cannot derive for itself. */
 static bool
-config_import_hikari(struct saber_config *config)
+config_import_hikari(
+    struct saber_config *config, bool want_palette, bool want_animation)
 {
   const char *xdg = g_getenv("XDG_CONFIG_HOME");
   const char *home = g_getenv("HOME");
@@ -516,13 +620,19 @@ config_import_hikari(struct saber_config *config)
 
   struct saber_color palette[SABER_PALETTE_SLOTS];
   bool imported = false;
+  bool animated = false;
 
   for (int i = 0; i < count; i++) {
-    if (!imported
+    if (want_palette && !imported
         && saber_theme_import_hikari(candidates[i], palette)
                == SABER_PALETTE_SLOTS) {
       memcpy(config->theme.palette, palette, sizeof(palette));
       imported = true;
+    }
+
+    if (want_animation && !animated) {
+      animated = saber_theme_import_hikari_animation(
+          candidates[i], &config->panel.animation_ms);
     }
 
     g_free(candidates[i]);
@@ -555,7 +665,7 @@ saber_config_load_status(struct saber_config *config,
   config_defaults(config);
 
   char *file = config_find(path);
-  bool explicit_palette = false;
+  struct config_written written = { false, false };
 
   if (file != NULL) {
     struct ucl_parser *parser = ucl_parser_new(UCL_PARSER_NO_IMPLICIT_ARRAYS);
@@ -579,7 +689,7 @@ saber_config_load_status(struct saber_config *config,
       ucl_object_t *root = ucl_parser_get_object(parser);
 
       if (root != NULL) {
-        explicit_palette = config_apply(config, root);
+        config_apply(config, root, &written);
         ucl_object_unref(root);
       }
     }
@@ -593,8 +703,19 @@ saber_config_load_status(struct saber_config *config,
 
   config_resolve_order(config);
 
-  if (!explicit_palette && config->theme.inherit_hikari) {
-    config->theme.palette_valid = config_import_hikari(config);
+  /* Action purpose: Both imports hang off inherit-hikari, so the one key that
+  turns the compositor's colours off turns its motion off with it -- the panel
+  either follows the desktop or it does not. Either one already answered by the
+  saber.conf is left alone. */
+  bool want_palette = !written.palette && config->theme.inherit_hikari;
+  bool want_animation = !written.animation_ms && config->theme.inherit_hikari;
+
+  if (want_palette || want_animation) {
+    bool imported = config_import_hikari(config, want_palette, want_animation);
+
+    if (want_palette) {
+      config->theme.palette_valid = imported;
+    }
   }
 
   if (status != NULL) {

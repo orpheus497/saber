@@ -90,6 +90,25 @@ struct saber_tile {
   double throb;  /* scale multiplier; 1.0 for none */
   double wiggle; /* horizontal offset in logical pixels */
 
+  /* How far the backlight's own fade has travelled, 0..1. `running` is the
+  application's state and this is the motion towards it, so the two disagree for
+  exactly the length of one animation -- a tile that has just exited is still
+  showing a backlight on its way out. Left at 0 by a caller that does not
+  animate, which draws the unfaded backlight `running` has always drawn. */
+  double backlight;
+
+  /* Scale multiplier on the count disc, for the pop when the number behind it
+  changes; 0 and 1.0 both mean its nominal radius. */
+  double badge_scale;
+
+  /* Multiplier on the icon-and-label alpha, for a label being replaced under a
+  tile that stays put -- the sheet number. 0 and 1.0 both mean fully opaque. */
+  double fade;
+
+  /* Vertical displacement of the focus arrow alone, in logical pixels, for the
+  arrow still on its way between two tiles. The rest of the tile is unmoved. */
+  double focus_offset;
+
   /* The number this tile answers to from `saberctl launch N`, drawn over the
   icon while the overlay is up and 0 the rest of the time. Deliberately not the
   badge: a tile can carry a count and a number at once, and they mean different

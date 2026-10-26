@@ -80,12 +80,13 @@ struct saber_spread {
   int fading;
 
   /* The spread's clock. Both tweens are one-shot -- `reveal` fades the grid up
-  once on open, `hover_in`/`hover_out` cross-fade a cell -- so the loop settles
-  by itself and cannot pin a core the way an unbounded repeat did (D-036). */
+  once on open and back down on dismissal, `hover_fade` cross-fades a cell -- so
+  the loop settles by itself and cannot pin a core the way an unbounded repeat
+  did (D-036). */
   struct saber_clock *clock;
   bool revealing;
   struct saber_tween reveal;
-  struct saber_tween hover_in, hover_out;
+  struct saber_hover hover_fade;
   int pressed;
   bool on_close; /* the pointer is over the hovered cell's close disc */
   int scroll;
@@ -118,6 +119,14 @@ struct saber_spread {
 
   bool listening;
   bool hiding;
+
+  /* Action purpose: The grid sinks and fades out before the surface goes, so
+  the spread outlives its own dismissal by one animation. `closing` is that
+  window -- no input reaches it while it stands -- and `teardown` is the idle
+  that does the freeing, because the surface cannot be destroyed from inside the
+  frame callback that noticed the fade had landed. */
+  bool closing;
+  guint teardown;
 };
 
 /* ------------------------------------------------------------- primitives */
@@ -615,9 +624,9 @@ spread_draw_cell(struct saber_spread *spread,
   double hover = 0.0;
 
   if (index == spread->hovered) {
-    hover = saber_tween_value(&spread->hover_in);
+    hover = saber_hover_value(&spread->hover_fade);
   } else if (index == spread->fading) {
-    hover = saber_tween_value(&spread->hover_out);
+    hover = saber_hover_fading(&spread->hover_fade);
   }
 
   rounded_rect(cr, x + 5.0, y + 5.0, w - 10.0, h - 10.0, SPREAD_RADIUS);
@@ -844,6 +853,12 @@ static void
 spread_damage(struct saber_spread *spread);
 
 static void
+spread_teardown(struct saber_spread *spread);
+
+static gboolean
+spread_teardown_idle(gpointer data);
+
+static void
 spread_configure(void *data,
     struct saber_surface *surface,
     int width,
@@ -898,6 +913,17 @@ spread_frame(void *data, uint32_t time)
   if (saber_clock_advance(spread->clock,
           saber_clock_stamp(spread->clock, time))) {
     saber_surface_damage(spread->surface);
+
+    return;
+  }
+
+  /* Action purpose: Nothing is moving any more, so a dismissal that was waiting
+  for its fade has arrived -- but the surface is NOT destroyed from in here.
+  The surface layer reads the surface again as this returns, so freeing it on
+  this stack is a read of freed memory; an idle does it with the main loop back
+  in charge. */
+  if (spread->closing && spread->teardown == 0) {
+    spread->teardown = g_idle_add(spread_teardown_idle, spread);
   }
 }
 
@@ -983,17 +1009,13 @@ spread_set_hover(struct saber_spread *spread, int index, bool on_close)
   spread->fading = spread->hovered;
 
   if (spread->fading >= 0) {
-    saber_tween_start(&spread->hover_out,
-        saber_tween_value(&spread->hover_in), 0.0, duration,
-        SABER_EASE_OUT_CUBIC, now);
+    saber_hover_leave(&spread->hover_fade, duration, now);
   }
 
   if (index >= 0) {
-    saber_tween_start(&spread->hover_in, 0.0, 1.0, duration,
-        SABER_EASE_OUT_CUBIC, now);
+    saber_hover_enter(&spread->hover_fade, duration, now);
   } else {
-    saber_tween_stop(&spread->hover_in);
-    spread->hover_in.value = 0.0;
+    saber_hover_rest(&spread->hover_fade);
   }
 
   spread->hovered = index;
@@ -1444,11 +1466,9 @@ saber_spread_create(const struct saber_spread_deps *deps)
 
   spread->clock = saber_clock_create();
   saber_tween_init(&spread->reveal, 1.0);
-  saber_tween_init(&spread->hover_in, 0.0);
-  saber_tween_init(&spread->hover_out, 0.0);
+  saber_hover_init(&spread->hover_fade);
   saber_clock_add(spread->clock, &spread->reveal);
-  saber_clock_add(spread->clock, &spread->hover_in);
-  saber_clock_add(spread->clock, &spread->hover_out);
+  saber_hover_add(spread->clock, &spread->hover_fade);
   spread->columns = 1;
   spread->visible_rows = 1;
 
@@ -1480,7 +1500,13 @@ saber_spread_destroy(struct saber_spread *spread)
     return;
   }
 
+  /* An animated dismissal cannot outlive the spread, so the teardown it was
+  waiting on a frame for happens here instead. */
   saber_spread_hide(spread);
+
+  if (spread->closing) {
+    spread_teardown(spread);
+  }
 
   g_ptr_array_unref(spread->cells);
   g_free(spread->filter);
@@ -1500,13 +1526,18 @@ saber_spread_destroy(struct saber_spread *spread)
 bool
 saber_spread_is_visible(const struct saber_spread *spread)
 {
-  return spread != NULL && spread->surface != NULL;
+  /* A spread fading out is already dismissed as far as every caller is
+  concerned: it takes no input, and `saberctl spread` must raise a new one
+  rather than report one still on screen. */
+  return spread != NULL && spread->surface != NULL && !spread->closing;
 }
 
 void
 saber_spread_refresh(struct saber_spread *spread)
 {
-  if (spread == NULL || spread->surface == NULL) {
+  /* Nothing is rebuilt into a grid that is fading out: the cells it is showing
+  are the ones the dismissal was asked for. */
+  if (!saber_spread_is_visible(spread)) {
     return;
   }
 
@@ -1522,6 +1553,12 @@ saber_spread_show(struct saber_spread *spread,
 {
   if (spread == NULL) {
     return false;
+  }
+
+  /* A spread still fading out owns the surface the new one needs, so its
+  teardown happens now rather than being waited for. */
+  if (spread->closing) {
+    spread_teardown(spread);
   }
 
   g_free(spread->filter);
@@ -1589,37 +1626,60 @@ saber_spread_show(struct saber_spread *spread,
   return true;
 }
 
-void
-saber_spread_hide(struct saber_spread *spread)
+/* Function purpose: Give the seat back. Split out because a dismissal gives up
+its input the moment it is asked for, a whole animation before the surface it
+was drawn on goes: a grid on its way out must not take a click, and the desktop
+behind it has to be reachable again immediately. */
+static void
+spread_release_input(struct saber_spread *spread)
 {
-  /* Hiding is re-entrant by design: the surface's `closed` callback lands here,
-  and an activation hides the spread from inside an input event. */
-  if (spread == NULL || spread->surface == NULL || spread->hiding) {
+  if (!spread->listening) {
+    return;
+  }
+
+  saber_display_remove_pointer_listener(spread->deps.display,
+      &spread_pointer_listener, spread);
+  saber_display_set_keyboard_listener(spread->deps.display,
+      spread->prev_keyboard, spread->prev_keyboard_data);
+  spread->listening = false;
+}
+
+/* Function purpose: Everything the spread holds, let go at once. The animated
+dismissal arrives here when its fade lands; a zero duration, a second
+dismissal, a compositor-closed surface and saber_spread_destroy all come
+straight through without waiting for a frame. */
+static void
+spread_teardown(struct saber_spread *spread)
+{
+  if (spread->hiding) {
     return;
   }
 
   spread->hiding = true;
+  spread->closing = false;
+
+  if (spread->teardown != 0) {
+    g_source_remove(spread->teardown);
+    spread->teardown = 0;
+  }
+
   spread->revealing = false;
   spread->fading = -1;
   saber_tween_stop(&spread->reveal);
   spread->reveal.value = 1.0;
-  saber_tween_stop(&spread->hover_in);
-  spread->hover_in.value = 0.0;
-  saber_tween_stop(&spread->hover_out);
-  spread->hover_out.value = 0.0;
+  saber_hover_clear(&spread->hover_fade);
+
+  /* The surface took its frame callbacks with it while the tweens above were
+  still marked running, so no advance ever recorded them stopping -- without
+  this the next open anchors its fade against a stale timestamp. */
   saber_clock_reset(spread->clock);
 
-  saber_surface_destroy(spread->surface);
-  spread->surface = NULL;
-
-  if (spread->listening) {
-    saber_display_remove_pointer_listener(spread->deps.display,
-        &spread_pointer_listener, spread);
-    saber_display_set_keyboard_listener(spread->deps.display,
-        spread->prev_keyboard, spread->prev_keyboard_data);
-    spread->listening = false;
+  if (spread->surface != NULL) {
+    saber_surface_destroy(spread->surface);
+    spread->surface = NULL;
   }
 
+  spread_release_input(spread);
   saber_display_flush(spread->deps.display);
 
   g_ptr_array_set_size(spread->cells, 0);
@@ -1635,6 +1695,55 @@ saber_spread_hide(struct saber_spread *spread)
   spread->hiding = false;
 }
 
+static gboolean
+spread_teardown_idle(gpointer data)
+{
+  struct saber_spread *spread = data;
+
+  spread->teardown = 0;
+  spread_teardown(spread);
+
+  return G_SOURCE_REMOVE;
+}
+
+void
+saber_spread_hide(struct saber_spread *spread)
+{
+  /* Hiding is re-entrant by design: the surface's `closed` callback lands here,
+  and an activation hides the spread from inside an input event. */
+  if (spread == NULL || spread->surface == NULL || spread->hiding) {
+    return;
+  }
+
+  /* Action purpose: A second dismissal while the first is still fading out
+  finishes it rather than restarting it. Asking twice means the caller wants the
+  spread gone, not gone more slowly. */
+  if (spread->closing) {
+    spread_teardown(spread);
+
+    return;
+  }
+
+  /* Action purpose: The reveal runs backwards and the surface goes when it
+  lands, so the grid leaves the way it arrived instead of snapping off the
+  screen. Two cases cannot wait for that: `animation-ms = 0` means there is no
+  animation to wait for, and a surface the compositor has already closed will
+  never deliver another frame to notice the landing on. */
+  if (spread->surface->closed || spread_anim_ms(spread) <= 0) {
+    spread_teardown(spread);
+
+    return;
+  }
+
+  spread->closing = true;
+  spread_release_input(spread);
+  saber_display_flush(spread->deps.display);
+  saber_tween_start(&spread->reveal, saber_tween_value(&spread->reveal), 0.0,
+      spread_anim_ms(spread), SABER_EASE_OUT_CUBIC,
+      saber_clock_now(spread->clock));
+  spread_damage(spread);
+}
+
 bool
 saber_spread_toggle(struct saber_spread *spread,
     const char *app_id,
@@ -1644,7 +1753,7 @@ saber_spread_toggle(struct saber_spread *spread,
     return false;
   }
 
-  if (spread->surface != NULL) {
+  if (saber_spread_is_visible(spread)) {
     char *wanted = fold_filter(app_id);
     bool same = g_strcmp0(wanted, spread->filter) == 0;
 

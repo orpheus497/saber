@@ -26,8 +26,14 @@ PKG_CONFIG ?= pkg-config
 # manager's prefix is a panel the desktop's own .desktop scanning may not find.
 # ETC_PREFIX stays independent of it so configuration lands in /etc rather than
 # /usr/etc.
+#
+# Action purpose: ETC_PREFIX is EMPTY rather than "/", because every use of it
+# already supplies the separator -- `${ETC_PREFIX}/etc/saber`. Setting it to a
+# slash makes each of those a doubled one, which the filesystem accepts and
+# `saber --build` then prints verbatim as `//etc/saber/saber.lua`, reading like
+# a bug in the path handling rather than the cosmetic artefact it is.
 PREFIX ?= /usr
-ETC_PREFIX ?= /
+ETC_PREFIX ?=
 
 # Function purpose: Non-empty when a WITH_* switch is set to anything but "no"
 # in any case. Both halves are load-bearing: an unset switch must read as off,

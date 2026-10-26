@@ -14,8 +14,11 @@
 -- and a handful of basic functions, and with no io, no os, no package, no
 -- require, no load and no dofile -- a panel's settings have no reason to open
 -- a file or start a process. Note also that every value is a Lua value: the
--- words are quoted strings, so `edge = "left"` and not `edge = left`, which
--- would be an empty variable rather than a side of the screen.
+-- words are quoted strings, so `edge = "left"` and not `edge = left`. The
+-- unquoted form reads a name nothing defines, so the file is refused and the
+-- message names the word and says to quote it -- which matters most if you are
+-- carrying a saber.conf over by hand, because every value in that format was
+-- an unquoted word.
 --
 -- A FILE THAT WILL NOT PARSE IS REFUSED, NOT PARTLY APPLIED. Saber reports it
 -- with the line number Lua gives and keeps the settings it is already running
@@ -184,12 +187,15 @@ return {
     -- gets the right answer without having to say which kind it is.
     --
     -- A KNOWN LIMIT, ON ONE PALETTE. Under hikari-sakura's SAKURA DARK the
-    -- accent cannot reach the 4.5:1 that text wants against the background:
-    -- every candidate in that palette measures between 2.5 and 2.8:1. The best
-    -- available is chosen and the shortfall stands rather than being papered
-    -- over with a colour the theme does not contain. The accent is a mark
-    -- rather than body text, so it reads -- but it is under the bar, and
-    -- overriding `accent` here is the way out.
+    -- accent cannot reach the 4.5:1 that text wants against the background.
+    -- Its two candidates measure 2.54:1 (color12) and 1.67:1 (color4), and
+    -- color13 -- which is not a candidate, because color12 is the slot the
+    -- compositor marks a focused window with and that correspondence is worth
+    -- more than a ratio nobody can read either way -- reaches only 2.73:1.
+    -- The better of the two is chosen and the shortfall stands rather than
+    -- being papered over with a colour the theme does not contain. The accent
+    -- is a mark rather than body text, so it reads -- but it is under the bar,
+    -- and overriding `accent` here is the way out.
     --
     -- roles = {
     --   background = "color0",
@@ -316,33 +322,45 @@ return {
   },
 
   session = {
-    -- An EMPTY string means "use the built-in command" for the three power
-    -- actions. The built-ins rely on membership of FreeBSD's operator group,
-    -- which already owns /sbin/shutdown (setuid root, group-executable) and
-    -- /dev/acpi (group-writable):
+    -- An EMPTY string means "use the built-in command", and what the built-in
+    -- is depends on the platform. Saber installs nothing setuid or setgid and
+    -- writes no sudoers rule and no polkit rule on either.
+    --
+    -- ON FREEBSD the three power actions go through membership of the base
+    -- system's operator group, which already owns /sbin/shutdown (setuid root,
+    -- group-executable) and /dev/acpi (group-writable):
     --
     --   suspend    acpiconf -s3
     --   reboot     shutdown -r now    (never /sbin/reboot, which is not
     --                                 setuid)
     --   poweroff   shutdown -p now
     --
-    -- Saber installs nothing setuid or setgid and writes no sudoers rule. If
-    -- you are not in the group, an administrator runs:
+    -- If you are not in the group, an administrator runs:
     --
     --   pw groupmod operator -m <user>
     --
     -- Without it Saber HIDES these entries rather than offering buttons that
-    -- fail. Set a string here only to override -- e.g. "sudo shutdown -p now"
-    -- on a host that deliberately keeps its users out of operator.
+    -- fail. There is no built-in lock or logout: the compositor exposes no
+    -- lock verb and FreeBSD has no logind, so for those two an empty string
+    -- means HIDE THE ENTRY.
+    --
+    -- ON LINUX all five go to logind, so an empty string is a working built-in
+    -- for every one of them. An action is offered when logind says it can be
+    -- done -- "challenge" counts, because that means it will ask you rather
+    -- than refuse -- and hidden otherwise. One caveat on lock: logind signals
+    -- whichever screen locker holds the session, and with no locker running
+    -- the screen does not lock and nothing reports a failure, because that is
+    -- not something the interface can be asked. Naming your locker here is the
+    -- way to be certain.
+    --
+    -- Set a string on either platform to override the built-in -- e.g.
+    -- "sudo shutdown -p now" on a host that deliberately keeps its users out
+    -- of operator, or a locker of your own choosing.
     suspend  = "",
     reboot   = "",
     poweroff = "",
-
-    -- For these two an empty string means HIDE THE ENTRY, because there is
-    -- nothing to run: the compositor exposes no lock verb and FreeBSD has no
-    -- logind. Point them at whatever you use and they appear.
-    lock   = "",
-    logout = "",
+    lock     = "",
+    logout   = "",
   },
 }
 

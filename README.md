@@ -2,7 +2,7 @@
 <p align="center"><i>The persistent vertical panel of the Hikari Sakura desktop — launcher, running indicators, quicklists, application menu, window spread, system tray and session controls, in one always-present column.</i></p>
 
 <p align="center">
-  <b>FreeBSD only.</b> ·
+  <b>FreeBSD and Linux.</b> ·
   <a href="#building">Building</a> ·
   <a href="#configuration">Configuration</a> ·
   <a href="#making-the-keys-work">Keybindings</a> ·
@@ -24,8 +24,8 @@
 ## What Saber is
 
 Saber is a vertical panel for Wayland in the tradition of the Unity 7 launcher, built for and
-only for the [`hikari-sakura`](https://github.com/orpheus497/hikari-sakura) compositor on
-FreeBSD.
+only for the [`hikari-sakura`](https://github.com/orpheus497/hikari-sakura) compositor. It
+builds, links and runs on FreeBSD and on Linux — see [Building](#building).
 
 Its reason to exist is that nothing else in the desktop is **persistent**. Every `sofi` surface
 appears on a keypress or a click and dismisses on selection. A launcher in the Unity sense is a
@@ -106,7 +106,7 @@ one steps the band by a tile and deliberately does *not* activate the tile it is
 
 ### Tile decoration
 
-Each is a Unity signifier drawn from a palette role, never a fixed colour:
+Each is a Unity signifier drawn from a [theme role](#theming), never a fixed colour:
 
 | Signifier | Meaning |
 |---|---|
@@ -150,64 +150,200 @@ There are **no thumbnails**, and that is a design decision forced by the composi
 
 ## Theming
 
-Saber has no theme file. It reads `ui { palette }` straight out of your `hikari.conf`, so the
+Saber has no theme file. It reads `ui { palette }` straight out of your `hikari.lua`, so the
 panel is painted from the same sixteen colours as the compositor, its top bar and its lock
-screen. Drop a terminal colour scheme into `hikari.conf` and the whole desktop follows, panel
+screen. Drop a terminal colour scheme into `hikari.lua` and the whole desktop follows, panel
 included.
+
+`$XDG_CONFIG_HOME/hikari/hikari.lua` is read first, then `~/.config/hikari/hikari.lua`, then
+`${ETC_PREFIX}/etc/hikari/hikari.lua`. The palette and the animation duration are the only two
+blocks of that file Saber reads, and it writes neither back. The reader is deliberately tolerant
+while the compositor's own Lua shape settles: the colours are taken from `ui { palette }` or
+from a top-level `palette`, the duration from `ui { animation }` or a top-level `animation`, and
+a missing, unparseable or unexpectedly shaped file costs nothing and falls through to the
+built-in palette, which is `hikari-sakura`'s own Sakura. That last case is the ordinary first
+run.
+
+It is somebody else's file, read for two blocks, so it runs in the same restricted environment
+as your own configuration — but deliberately not under the same strictness, because `hikari.lua`
+may legitimately read globals Saber does not provide, and refusing the import over one of them
+would fail a file the compositor itself accepts. See [Configuration](#configuration).
+Keybindings are read by hikari out of its own `hikari.conf` — see
+[Making the keys work](#making-the-keys-work).
 
 Unity's mechanics are reproduced; Unity's Ambiance colours are not.
 
+### The sixteen slots are positional, not semantic
+
+`hikari-sakura` ships three palettes — Sakura, Sakura Dark and Sakura Light — and all three are
+rendered correctly. They are positionally identical and semantically divergent: slot 1 is a red
+on Sakura, a muted dark red on Sakura Dark and a muted **emerald green** on Sakura Light. A role
+map pinned to slot numbers is therefore right for exactly one palette and paints urgency green
+on another, which is why the ten roles are *derived* from whatever palette is in force rather
+than indexed out of it.
+
+| Role | What it paints | Where it comes from |
+|---|---|---|
+| `background` | The column itself | `color0` |
+| `foreground` | Pips, separators, text | `color15` |
+| `accent` | Focus arrow, current sheet | whichever of `color12` and `color4` measures better against the background |
+| `backlight` | The running-tile fill | the background, moved 45% of the way towards `accent` |
+| `urgent` | Wiggle tint, urgent badge | a literal red chosen by the ground — the one exception, below |
+| `badge_bg` | The count disc | follows `urgent` |
+| `badge_fg` | The ink on the count disc | whichever of `color0` and `color15` measures better against `badge_bg` |
+| `progress` | The progress overlay | follows `accent` |
+| `dim` | Empty sheets, unavailable actions | `color8` |
+| `overlay` | Dash strip and spread backdrop | follows `background`, colour only — its alpha is `overlay-opacity` |
+
+**`accent` and `badge_fg` are picked by measured contrast, not by a fixed slot**, which is what
+makes them right for a palette Saber has never seen: your own, or the terminal colour scheme
+dropped into `hikari.lua` that this page has already invited. On Sakura and Sakura Dark the
+accent resolves to `color12`; on Sakura Light `color4` reads better against the light
+ground — 4.97:1 against 3.32:1 — and is taken instead. Light or dark is measured from the
+background's own WCAG relative luminance rather than configured, so an unfamiliar palette does
+not have to declare which kind it is.
+
+**`backlight` no longer shares `palette[8]` with `dim`.** It did, so a running application and
+an unavailable action were painted in the same colour on every palette — and on two of the three
+shipped ones that colour was invisible against the column: 1.34:1 on Sakura Dark, 1.16:1 on
+Sakura Light. It is now a derived tone of the column itself and cannot collide with `dim` again.
+
+### Urgency is the one colour the palette does not control
+
+Every other role comes from your palette. `urgent` — and the `badge_bg` that follows it — is a
+literal red, chosen by whether the ground is light or dark:
+
+```
+dark ground   #df8787          light ground   #9b2226
+```
+
+The reason is arithmetic rather than taste. No single red clears WCAG AA against both Sakura
+Dark's ground and Sakura Light's, because the two required luminance windows do not intersect,
+so one literal would be a choice of which theme to fail on. On Sakura it resolves to `#df8787`,
+which is byte-identical to that palette's own `color9` and is what urgency already was there, so
+the default desktop is unchanged by the split. Both literals are overridable, and
+`theme { roles { urgent = "color9" } }` is how urgency goes back under a palette's control.
+
+### Overriding a role
+
+`theme { roles { } }` overrides all ten by name. Each takes either a palette reference
+(`"colorN"`) or a literal (`"#rgb"`, `"#rrggbb"`, `"#rrggbbaa"`), and what you write wins over
+the computed value:
+
+```lua
+theme = {
+  roles = {
+    accent = "color13",  -- a palette slot
+    urgent = "#b03030",  -- or a literal
+  },
+},
+```
+
+**A slot reference resolves when the theme is built, not when the file is read**, so an override
+still follows a palette that arrives from `hikari.lua` afterwards: `accent = "color13"` keeps
+tracking a retheme exactly as the rest of the panel does. Derived roles follow what they derive
+from — re-point `accent` and the backlight and the progress bar move with it, re-point `urgent`
+and the count disc goes too, with the badge ink re-measured against whatever the disc ended up
+being. All ten are overridable, derived or not, so no colour the panel paints with is out of
+reach.
+
+Every colour decision above is held by `make test`, because every colour defect this panel has
+had was found by measurement and nothing but a measurement keeps it fixed. One shortfall is
+accepted rather than fixed, and it is stated under [Known limits](#known-limits).
+
 ## Configuration
 
-`~/.config/saber/saber.conf`, in UCL — the same syntax and the same parser as `hikari.conf`.
-**Every key is optional and the whole file may be deleted**; the values below are the defaults.
-A copy with all of this documented in place is installed at
-`${ETC_PREFIX}/etc/saber/saber.conf`, where `ETC_PREFIX` defaults to `PREFIX`.
+`~/.config/saber/saber.lua`, in Lua: a chunk that **returns a table**, which is the language the
+compositor's own configuration is moving to, so one syntax covers the desktop. **Every key is
+optional and the whole file may be deleted**; the values below are the defaults. A copy with all
+of this documented in place is installed at `${ETC_PREFIX}/etc/saber/saber.lua`, and it is the
+fullest reference in the tree for what each key does.
 
-```ucl
-panel {
-  output          = "all"    # all | primary | <output name, e.g. eDP-1>
-  edge            = left     # left | right
-  icon-size       = 32       # 24-64
-  padding         = 12       # 0-64; column width is icon-size + padding, so 32+12 = 44px
-  autohide        = never    # never | auto  -- see the note below
-  reveal-pressure = 240      # push distance to reveal an autohidden panel
-  animation-ms    = 180      # 0 disables animation; governs all of it
-}
+Four things hold for the whole file:
 
-theme {
-  inherit-hikari  = true     # import ui { palette } from hikari.conf
-  backlight       = palette  # palette | dominant | off  -- see the note below
-  opacity         = 0.92     # the column itself
-  overlay-opacity = 1.00     # dash strip and spread backdrop; 1.0 = opaque
+* **Either key spelling works.** The manual writes `icon-size`, `animation-ms` and
+  `overlay-opacity`, and Lua can only write a hyphenated key as `["icon-size"]`, so the
+  underscored spelling answers to the same key. `icon_size = 32` and `["icon-size"] = 32` are one
+  setting, not two, and a file mixing the two reads both. The keys and their meanings did not
+  change when the format did.
+* **It is code, and it is sandboxed.** The chunk runs with `math`, `string`, `table` and a
+  handful of basic functions — `assert`, `error`, `ipairs`, `pairs`, `select`, `tonumber`,
+  `tostring`, `type` — installed in place of Lua's own globals, and with no `io`, no `os`, no
+  `package`, no `require`, no `load` and no `dofile`. A panel's settings have no reason to open a
+  file or start a process. This is deliberately stricter than awesome or neovim, which hand their
+  configurations the whole language.
+* **An unquoted word is refused, not quietly dropped.** Every value in the format this replaced
+  was a bare word — `edge = left`, `autohide = never`, `backlight = palette`,
+  `urgent = color9` — and all four are valid Lua reading an undefined global. Each would
+  evaluate to `nil`, so the key would be absent rather than wrong and the setting would vanish
+  while the file loaded without complaint: precisely the keys a hand migration is trying to carry
+  over, lost in silence. So reading a name the environment does not hold is an error, reported at
+  the line the word is on — `left is not defined; a word used as a value needs quoting, as in
+  "left"`. `math` and `string` stay reachable, so a computed configuration still loads.
+* **A file that will not parse is refused, not partly applied.** A syntax error, a chunk that
+  does not finish, and a chunk that returns anything other than a table are all refused whole:
+  Saber reports it with the line number Lua gives, and `reload` keeps the settings the panel is
+  already running with. The instruction budget behind the second one sits three orders of
+  magnitude above what the shipped file needs, so the only thing it can reject is a loop that was
+  never going to terminate. A typo cannot cost you a configured panel.
 
-  # Optional. Overrides the hikari import; all sixteen must be present or the
-  # whole block is ignored and the built-in palette is used.
-  # palette { color0 = "#1c1c1c"; ... color15 = "#f0edf2" }
-}
+```lua
+return {
+  panel = {
+    output          = "all",     -- all | primary | <output name, e.g. eDP-1>
+    edge            = "left",    -- left | right
+    icon_size       = 32,        -- 24-64
+    padding         = 12,        -- 0-64; column width is icon_size + padding, so 32+12 = 44px
+    autohide        = "never",   -- never | auto  -- see the note below
+    reveal_pressure = 240,       -- push distance to reveal an autohidden panel
 
-launcher {
-  # No default. Omit this and the launcher starts with running windows only.
-  favourites = [ "sofi.desktop", "firefox.desktop" ]
-}
+    -- Commented out on purpose: writing this key at all takes the decision off
+    -- the compositor. See the note below.
+    -- animation_ms = 180,
+  },
 
-items {
-  bfb = true; sheets = true; devices = true
-  trash = true; tray = true; session = true
+  theme = {
+    inherit_hikari  = true,      -- import ui { palette } and ui { animation } from hikari.lua
+    backlight       = "palette", -- palette | dominant | off  -- see the note below
+    opacity         = 0.92,      -- the column itself
+    overlay_opacity = 1.00,      -- dash strip and spread backdrop; 1.0 = opaque
 
-  # Top-to-bottom order of the column. "apps" is the launcher band and its
-  # position is the split: everything before it is pinned to the top, everything
-  # after it to the bottom. Unknown names warn and are ignored; duplicates count
-  # once; omitting "apps" reinserts it after "bfb". The booleans above act as a
-  # filter over this list.
-  order = [ "bfb", "apps", "sheets", "devices", "trash", "tray", "session" ]
-}
+    -- Optional. Overrides the hikari import; all sixteen must be present or the
+    -- whole block is reported and ignored and the built-in palette is used.
+    -- palette = { color0 = "#2b1e3a", ... color15 = "#f0edf2" },
 
-session {
-  # Empty = use the built-in operator-group command. See Session controls.
-  suspend = ""; reboot = ""; poweroff = ""
-  # Empty = HIDE the entry. There is nothing to run by default; see Known limits.
-  lock = ""; logout = ""
+    -- Optional. Overrides any of the ten derived roles by name; see Theming.
+    -- roles = { accent = "color12", urgent = "#df8787" },
+  },
+
+  launcher = {
+    -- No default. Omit this and the launcher starts with running windows only.
+    favourites = { "sofi.desktop", "firefox.desktop" },
+  },
+
+  items = {
+    -- Top-to-bottom order of the column. "apps" is the launcher band and its
+    -- position is the split: everything before it is pinned to the top,
+    -- everything after it to the bottom. Unknown names warn and are ignored;
+    -- duplicates count once; omitting "apps" reinserts it after "bfb".
+    order = { "bfb", "apps", "sheets", "devices", "trash", "tray", "session" },
+
+    -- The older per-portion form, still honoured, and a filter over the order
+    -- above: false removes that portion wherever it sits, while true does not
+    -- add one the order leaves out. There is no key for "apps".
+    -- bfb = true, sheets = true, devices = true,
+    -- trash = true, tray = true, session = true,
+  },
+
+  session = {
+    -- Empty = use the built-in command: the operator-group command on FreeBSD,
+    -- logind on Linux. See Session controls.
+    suspend = "", reboot = "", poweroff = "",
+
+    -- Empty = use the built-in on Linux, where logind supplies both; on FreeBSD
+    -- it HIDES the entry, because there is nothing to run. See Known limits.
+    lock = "", logout = "",
+  },
 }
 ```
 
@@ -215,7 +351,7 @@ session {
 raster icons resample, which is visible on a surface that is on screen permanently. `padding`
 raises the tile pitch as well as the column width, so a larger value fits fewer tiles.
 
-Four of these need a word on how they behave:
+Five of these need a word on how they behave:
 
 * **`autohide = auto`** hides the column and reserves nothing. A hidden column draws nothing and
   accepts pointer input only in a two-pixel strip at the screen edge, so the windows behind it
@@ -224,10 +360,25 @@ Four of these need a word on how they behave:
 * **`reveal-pressure`** is how far the pointer must travel *inside* that strip before the column
   reveals — distance, not dwell, so a pointer parked at the edge by accident never opens it and
   one deliberately rubbed against the edge does. Lower it if revealing feels stiff.
-* **`animation-ms`** governs every animation, not merely some of them. The Dash's slide-in, the
-  spread's fade-and-rise, menus fading up, the hover cross-fade, and the launch throb and urgent
-  wiggle are all scaled from it against a 180 ms baseline, so `0` genuinely stops all of them
-  rather than leaving two of them running.
+* **`animation-ms`** governs every animation, and that now includes the ones it used to miss.
+  Autohide is animated, with the exclusive zone committed at the two ends of the slide rather
+  than tracked through it — a zone following the offset would hand the compositor a half-width
+  column to lay the desktop out against on every frame, and every window on the output would
+  reflow to each one. Every reveal is symmetric: the Dash, the spread and the quicklist slid in
+  and snapped out, and now they leave the way they arrived. The hover fade uses the value as
+  written; the Dash's slide, the spread's fade-and-rise, menus fading up, the launcher band's
+  scroll, the launch throb and the urgent wiggle are all scaled from it against a 180 ms
+  baseline, so `0` genuinely stops all of them rather than leaving two of them running.
+* **`animation-ms`, left unwritten, is inherited from the compositor.** While
+  `theme { inherit-hikari }` is on, hikari's own `animation { duration }` answers it — with
+  `enabled = false` arriving as 0, which is the same statement made the other way round — and an
+  explicit `panel { animation-ms }` always wins over it. The consequence is worth stating plainly:
+  `hikari-sakura` ships animation **off**, so on a stock desktop with no explicit setting the
+  panel's motion is off too and every surface settles instantly. The installed `saber.lua`
+  therefore leaves the key commented out, so copying the shipped file behaves exactly like having
+  no file at all; write it to keep the panel moving while the compositor does not.
+  `easing` is deliberately not imported — the panel picks a curve per animation, and a
+  window-motion curve is the wrong one for a hover fade.
 * **`backlight = dominant`** tints the running-application backlight to the icon's own colour
   rather than the palette's, sampled with a bias toward the saturated pixels so a mostly-grey
   icon with one coloured mark does not wash out. An icon carrying no colour at all falls back to
@@ -334,14 +485,25 @@ It exits 0 when the panel answers `ok` and 1 otherwise, so it composes in script
 to start rather than stealing the socket, and a stale socket left by an unclean exit is removed
 rather than being mistaken for a live panel.
 
-`saberctl` links **only libc** and is 14 KB. That is deliberate: it runs on every bound
-keypress, and linking the desktop's shared libraries to print one line would be paid per
-keystroke.
+`saberctl` links **only libc** — 14 KB on FreeBSD, 16 KB on Linux. That is deliberate: it runs
+on every bound keypress, and linking the desktop's shared libraries to print one line would be
+paid per keystroke.
 
 ## Session controls
 
-Suspend, reboot and shut down run as you, through FreeBSD's existing `operator` group. **Saber
-installs nothing setuid or setgid, writes no `sudoers` rule, and creates no group of its own:**
+Suspend, reboot and shut down — and, on Linux, lock and log out — all run as you. **Saber
+installs nothing setuid or setgid, writes no `sudoers` rule, creates no group of its own and
+writes no polkit rule either.** There is one interface with a backend per platform; the one that
+does not apply compiles to an empty translation unit rather than a platform test in the build.
+
+Saber asks at startup whether it can carry out each action and **hides** the ones it cannot, so a
+host that declines leaves a menu with no dead buttons rather than one with failing ones. A
+`session { }` command override is trusted without asking the platform anything, and is the whole
+answer on a host with neither privilege model.
+
+### FreeBSD: the `operator` group
+
+Suspend, reboot and shut down go through FreeBSD's existing `operator` group:
 
 ```
 -r-sr-xr--  root operator   /sbin/shutdown      setuid root, group-executable by operator
@@ -356,18 +518,44 @@ pw groupmod operator -m <user>
 ```
 
 `make install` prints this line when it applies; it never runs it, because adding a user to a
-privileged group is an administrator's decision. Saber checks its own membership at startup and
-**hides** the actions it cannot perform, so declining leaves a menu with no dead buttons rather
-than one with failing ones. `session { }` overrides the commands for a host that deliberately
-keeps its users out of `operator`.
+privileged group is an administrator's decision. Saber checks its own membership at startup, so
+declining costs the three entries and nothing else. `session { }` overrides the commands for a
+host that deliberately keeps its users out of `operator`.
 
 `/sbin/reboot` is never used — it is not setuid, so it would fail. `shutdown -r now` is.
 
+### Linux: logind
+
+`Suspend`, `Reboot` and `PowerOff` on `org.freedesktop.login1.Manager`, called over the system
+bus with the interactive flag set, plus the `Lock` and `Logout` that FreeBSD cannot offer at
+all — `org.freedesktop.login1.Session.Lock` and `Manager.TerminateSession`. The interface is
+spoken rather than linked, so systemd-logind and elogind are both answered and neither is a
+dependency, and it is spoken over the GDBus the panel already links for its tray, so it adds no
+library.
+
+Availability is logind's own answer: `CanSuspend`, `CanReboot` and `CanPowerOff`, where **both
+`"yes"` and `"challenge"` count as available.** `"challenge"` is polkit saying it will prompt,
+which is exactly why the interactive flag is set rather than clear — clearing it would have the
+call refused outright on the machines where the probe said the action works. The probes are
+synchronous and run with a menu half-open in front of you, so they carry a 300 ms timeout: a
+wedged bus is a stutter rather than a freeze.
+
+There is no group to join here and nothing for an administrator to do. Each action is authorised
+per session by polkit, which is the same discipline the `operator` group provides on FreeBSD
+rather than a different one.
+
 ## Building
 
-FreeBSD only. This is unlikely to change: the privilege model is the base system's `operator`
-group, mount and file monitoring go through `getfsstat(2)` and kqueue, and the Makefile refuses
-any other `uname`.
+FreeBSD and Linux, from the same tree, with no configure step and nothing generated.
+
+The gate that stood here refused any `uname` but FreeBSD, and two of the three reasons it gave
+were never true of the source. `getfsstat(2)` and kqueue reach Saber only through GLib's
+`GUnixMountMonitor` and `GFileMonitor`, which GLib backs with `/proc/self/mountinfo` and inotify
+on Linux; Saber calls neither itself, and the one BSD libc call in the tree — `closefrom(2)` —
+has carried a POSIX fallback since it was written. What was genuinely FreeBSD-shaped was the
+privilege model, and it is now one backend of two; see [Session controls](#session-controls). The
+third reason was real: the Makefile's own dialect, and it is answered by shipping two drivers
+rather than by a gate.
 
 ### Dependencies
 
@@ -377,36 +565,89 @@ any other `uname`.
 | `graphics/wayland-protocols` | 1.49 | Protocol XML (build only) |
 | `graphics/cairo` | 1.18.2 | All drawing |
 | `x11-toolkits/pango` | 1.57.1 | Text |
-| `devel/glib20` | 2.88.3 | Main loop, GDBus, kqueue file monitor, `getfsstat` mount monitor |
+| `devel/glib20` | 2.88.3 | Main loop, GDBus, and the file and mount monitors — kqueue and `getfsstat` on FreeBSD, inotify and `/proc/self/mountinfo` on Linux |
 | `graphics/gdk-pixbuf2` | 2.44.1 | Raster icons |
 | `graphics/librsvg2-rust` | 2.62.3 | SVG icons, rendered at exact device size |
-| `textproc/libucl` | 0.9.4 | `saber.conf` and the `hikari.conf` palette import |
+| `lang/lua54` | 5.4.6 | `saber.lua`, and the `hikari.lua` palette and animation import |
 | `x11/libxkbcommon` | 1.13.2 | Keyboard handling in the Dash, spread and menus |
 
 ```sh
 pkg install wayland wayland-protocols cairo pango glib gdk-pixbuf2 \
-            librsvg2-rust libucl libxkbcommon
+            librsvg2-rust lua54 libxkbcommon
 ```
+
+```sh
+apt install libwayland-dev wayland-protocols libcairo2-dev libpango1.0-dev \
+            libglib2.0-dev libgdk-pixbuf-2.0-dev librsvg2-dev liblua5.4-dev \
+            libxkbcommon-dev
+```
+
+The second line is Debian's and Ubuntu's spelling of the same nine, verified on Ubuntu 24.04.
+`wayland-scanner` arrives with `libwayland-dev`, and `gio-unix-2.0` — which the mounted-volume
+tiles are built on, and which is a separate package from `gio-2.0` as far as `pkg-config` is
+concerned — is part of `libglib2.0-dev` rather than a package of its own.
+
+**`libucl` is gone, and the reason is the interesting part.** It parsed `saber.conf` and the
+compositor's palette, it is packaged for FreeBSD, and it is not packaged for Linux at all — the
+`libucl` an apt-based distribution ships is an *unrelated compression library* carrying none of
+the `ucl_parser_*` symbols, so `theme.c` and `config.c` could not be linked there however
+portable the rest of the tree was. It was the last dependency that could not be satisfied off
+FreeBSD. Lua replaces it: MIT, which this project's permissive-only dependency rule requires, in
+the base ports and in every distribution, and the language the rest of the desktop is converging
+on. Every packager spells it differently, so the build probes `lua5.4`, `lua-5.4`, `lua54`,
+`lua5.3`, `lua-5.3`, `lua53` and `lua` in that order and reports which one it found.
 
 Two `wlr-*` protocol XMLs are not packaged anywhere and are vendored under `protocol/`. The
 rest are generated from `wayland-protocols` at build time.
 
 ### Build and install
 
+Two drivers, one tree:
+
+| Driver | Dialect | Where it is `make` |
+|---|---|---|
+| `Makefile` | bmake | FreeBSD, where it is the base system's `make` |
+| `GNUmakefile` | GNU make | Linux, where it is `make` |
+
+GNU make reads `GNUmakefile` before `Makefile`, and bmake does not read `GNUmakefile` at all, so
+each `make` finds its own dialect with no detection logic, no configure step and nothing
+generated. There is no portable single driver to write: the conditionals, shell assignment and
+variable modifiers a build of this shape needs are absent from POSIX make and spelled
+differently by each dialect. What keeps the two from drifting is `build/sources.mk`, which holds
+the object lists, the protocol lists and the XML paths behind them in a subset both dialects
+parse identically. Only logic is written twice.
+
 ```sh
 make
-make install            # PREFIX defaults to /usr/local
+make install
+make test
 ```
 
-Saber is **not in the ports tree** yet, but a complete port skeleton ships under
-[`ports/`](ports/) — `Makefile`, `pkg-descr`, `pkg-message` and `pkg-plist`, with `TRAY`, `DASH`
-and `SPREAD` options, all on by default. It installs the configuration as `saber.conf.sample` so
-a package never overwrites a file the administrator has edited. Until a submission is made, build
-it with `make` as above.
+`PREFIX` defaults to `/usr/local` under bmake, which is where FreeBSD ports install, and to
+`/usr` under GNU make, because on Linux a panel installed outside the package manager's prefix
+is one the desktop's own `.desktop` scanning may not find. `ETC_PREFIX` follows `PREFIX` on
+FreeBSD and is `/` on Linux, so the configuration lands in `/etc` and not in `/usr/etc`.
 
 `make install` places `saber` and `saberctl` in `${PREFIX}/bin` (mode 555, neither setuid), the
-default configuration in `${ETC_PREFIX}/etc/saber/saber.conf`, and the BFB emblem in
+default configuration in `${ETC_PREFIX}/etc/saber/saber.lua`, and the BFB emblem in
 `${PREFIX}/share/icons/hicolor/scalable/apps/`.
+
+`make test` builds and runs the contrast and easing regression test, and it is the reason the
+colour work in [Theming](#theming) can be stated rather than hoped for. It checks WCAG AA across
+all three shipped palettes and the compiled-in fallback, that `backlight` and `dim` have not
+recollided, that urgency resolves to the ruled literal for its ground, that Sakura's `urgent` is
+still byte-identical to that palette's `color9`, five contrast ratios recorded independently
+elsewhere, the easing endpoints and their clamping, the spring's peak of 1.0670 at t=0.3925, that
+a zero-length repeating tween settles instead of repainting for ever, and that a cancelled tween
+settles on its target rather than freezing mid-curve. It drives `saber_theme_init` directly
+instead of reading a configuration file, so it links two objects and runs on any host — including
+one that cannot link the panel itself.
+
+Saber is **not in the ports tree** yet, but a port skeleton ships under [`ports/`](ports/) —
+`Makefile`, `pkg-descr`, `pkg-message` and `pkg-plist`, with `TRAY`, `DASH` and `SPREAD` options,
+all on by default. It depends on `lang/lua54` and installs the configuration as
+`saber.lua.sample`, so a package never overwrites a file the administrator has edited. Until a
+submission is made, build it with `make` as above.
 
 ### Build switches
 
@@ -428,11 +669,33 @@ make WITH_ALL=NO           # panel column only
 make DEBUG=YES             # symbols, no optimisation, -Werror
 make DEBUG=YES ASAN=YES    # plus AddressSanitizer
 make features              # print what a build would enable, without building
+make test                  # the contrast and easing regression test
 ```
 
-`saber --build` reports the feature set, the linked library versions and whether you can carry
-out the session actions — so a claim about a switch can be checked against the binary rather
-than the Makefile.
+Every switch above behaves identically under both drivers, and that was checked rather than
+assumed: `make features` prints the same table under each, and `WITH_TRAY=NO`, `=no`, `=No`,
+`WITH_ALL=NO` and `WITH_VIRTUAL_INPUT=YES` all resolve the same way and genuinely drop or add the
+matching `-DHAVE_*` flag. `make features` also prints which Lua module `pkg-config` answered
+with, so a build can be checked against the library it will actually link.
+
+`saber --build` reports the feature set, the linked library versions and each session action
+separately:
+
+```
+session actions:
+  lock             yes
+  logout           yes
+  suspend          yes
+  reboot           yes
+  poweroff         yes
+```
+
+It used to print a single `operator group: yes/no` line, which answers nothing on Linux and
+printed `no` on a machine where every action worked. The five lines ask the same question the
+panel asks when it decides what to draw, so the report and the menu cannot disagree. They are
+the answers for the built-in commands: a `session { }` override is deliberately ignored here,
+because a report about the binary should not change because a configuration file names a
+different command.
 
 ## Troubleshooting
 
@@ -485,8 +748,9 @@ window was dispatched into nothing.
 
 ## Known limits
 
-Stated rather than left to be discovered. Each follows from Saber being a **pure Wayland
-client** that asks `hikari-sakura` for nothing it does not already publish.
+Stated rather than left to be discovered. Most follow from Saber being a **pure Wayland
+client** that asks `hikari-sakura` for nothing it does not already publish; one follows from the
+palette it is painted with, and one is the platform's.
 
 * **The window spread shows no thumbnails**, and the reason is a compositor build flag rather
   than a missing protocol. `wlr-screencopy-v1` is advertised and on by default, but it captures
@@ -499,26 +763,32 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   hardware), and even with it on, it creates only the *output* source and not the toplevel one.
   So thumbnails are two compositor-side decisions away, not impossible. The spread is an
   icon-and-title grid until then.
-* **There is no Lock and no Logout.** `lock` is a keybinding-only compositor action with no CLI
-  and no socket verb, and FreeBSD has no `logind` to ask for a session end. Both entries hide
-  unless you point `session { lock, logout }` at something. A `WITH_VIRTUAL_INPUT` build can
-  synthesise your configured lock keysym instead, but it breaks silently if you rebind the key,
-  which is why it is off by default.
+* **Lock and Logout are the platform's, not Saber's.** On FreeBSD there are neither: `lock` is a
+  keybinding-only compositor action with no CLI and no socket verb, and FreeBSD has no `logind`
+  to ask for a session end, so both entries hide unless you point `session { lock, logout }` at
+  something. A `WITH_VIRTUAL_INPUT` build can synthesise your configured lock keysym instead, but
+  it breaks silently if you rebind the key, which is why it is off by default. On Linux both
+  exist, through `org.freedesktop.login1.Session.Lock` and `Manager.TerminateSession` — with one
+  caveat that is worth knowing in advance. logind's `Lock` is a *signal* to whichever screen
+  locker holds the session; with no locker running, the screen does not lock and no error comes
+  back, and that is not discoverable over the interface. So Lock reports available whenever
+  logind has a session at all, and `session { lock }` remains the way to name a locker outright.
 * **The hold-Super number overlay needs a compositor binding.** A panel cannot observe a modifier
   it has no keyboard focus for, so the compositor drives it: bind the press and the release of
   your key to `saberctl overlay on` and `saberctl overlay off`. The numbers drawn are the ones
   `saberctl launch N` answers to.
 * **Autohide has `never` and `auto`, not `dodge`.** "Hide when a window would overlap" needs
   window geometry, and no foreign-toplevel protocol publishes any.
-* **`saberctl reload` does not reload everything.** The whole `theme { }` block, the column's
-  width (`icon-size` and `padding`), `autohide`, `reveal-pressure` and `animation-ms` change under
-  a running panel. Everything else is settled at startup and needs a restart: `panel { output }`
-  and `panel { edge }`, which decide how many columns exist and which edge they anchor to; the
-  `items { }` order and booleans, which decide whether the tray, sheets, devices and trash
-  subsystems are constructed at all; `launcher { favourites }`, which seeds the launcher on first
-  run only; and the `session { }` command overrides. `SIGHUP` does the same as `reload`. A file
-  that will not parse is refused rather than applied: `reload` reports the error and the panel
-  keeps the settings it is already running with.
+* **`saberctl reload` does not reload everything.** The whole `theme { }` block, `roles { }`
+  included, the column's width (`icon-size` and `padding`), `autohide`, `reveal-pressure` and
+  `animation-ms` change under a running panel. Everything else is settled at startup and needs a
+  restart: `panel { output }` and `panel { edge }`, which decide how many columns exist and which
+  edge they anchor to; the `items { }` order and booleans, which decide whether the tray, sheets,
+  devices and trash subsystems are constructed at all; `launcher { favourites }`, which seeds the
+  launcher on first run only; and the `session { }` command overrides. `SIGHUP` does the same as
+  `reload`. A file that will not parse is refused rather than applied — a syntax error, a runaway
+  chunk, or a chunk that returns anything but a table: `reload` reports it and the panel keeps the
+  settings it is already running with.
 * **The Dash holds the keyboard only while the pointer is over it.** The compositor grants a
   layer surface keyboard focus on pointer entry, so opening the Dash from a keybinding while the
   pointer sits on another monitor gives a Dash whose search field will not type until you move
@@ -528,12 +798,26 @@ client** that asks `hikari-sakura` for nothing it does not already publish.
   advertises no blur protocol of any kind, and nothing in Wayland lets a surface composite
   against what is behind it, so there is nothing to bind. What a client can control exactly is
   how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
-  strip and the spread backdrop are painted at, written to the surface as given rather than
-  stacked out of translucent passes. At the default `1.0` nothing behind them bleeds through at
-  all. A `wlr-screencopy` self-blur is possible in principle — that protocol *is* advertised and
-  on by default — but it captures a still, so the blur would not follow a window moving behind
-  it, and sampling the whole screen to decorate a panel is a privacy question as much as a
-  technical one. A decision not taken, rather than a gap.
+  strip, the spread backdrop and the hold-Super number scrim are painted at, written to the
+  surface as given rather than stacked out of translucent passes — the `overlay` role carries the
+  colour and this key carries the alpha, so the number here is the number the compositor blends
+  with. At the default `1.0` nothing behind them bleeds through at all. A `wlr-screencopy`
+  self-blur is possible in principle — that protocol *is* advertised and on by default — but it
+  captures a still, so the blur would not follow a window moving behind it, and sampling the
+  whole screen to decorate a panel is a privacy question as much as a technical one. A decision
+  not taken, rather than a gap.
+* **On Sakura Dark the focus accent cannot reach WCAG AA, and that is a ruling rather than an
+  oversight.** Every candidate in that palette falls short against its own ground: `color12`
+  measures 2.54:1 and `color4` 1.67:1, and `color13`, the brightest alternative, reaches only
+  2.73:1. `accent` is chosen between `color12` and `color4` because `color12` is the slot hikari
+  paints a focused window's marker with, so a highlighted tile and a focused window agree about
+  what "chosen" looks like — worth more than two tenths of a ratio nobody can read either way. The
+  shortfall therefore stands rather than being rescued with a colour the theme does not contain,
+  and `progress` inherits it by following `accent`. `make test` carries it as one named
+  palette-and-role exemption holding the value the role actually resolves to, not as a lowered
+  threshold, so the same shortfall on any other palette or any other role of this one still fails
+  the test — as does a regression that makes even this pair worse. `theme { roles { accent } }` is
+  the way out on a desktop that needs AA here.
 * **Tray tooltips are not shown**, and `ToolTip` and `Category` are read off the wire and
   discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.
 * **A rejected sheet switch cannot fail the command.** `saberctl sheet N` and `pin N` answer as

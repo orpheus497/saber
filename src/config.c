@@ -17,9 +17,9 @@ settings have no reason to open a file or start a process. */
 #include <glib/gstdio.h>
 #include <lauxlib.h>
 #include <lua.h>
-#include <lualib.h>
 
 #include <saber/config.h>
+#include <saber/luaguard.h>
 #include <saber/saber.h>
 
 #define SABER_ICON_SIZE_MIN 24
@@ -112,8 +112,8 @@ any of it: a metamethod that raises here reaches Lua's panic handler, which
 calls abort(). The chunk decides what table comes back, so it can hand over one
 whose metatable errors on a missing key -- `return _ENV` does it with nothing
 but the sandbox this file installs, since that carries __index =
-config_undefined, and `saberctl reload` on such a file killed the panel outright.
-That is the exact opposite of this file's contract, which is that a broken
+config_undefined, and `saberctl reload` on such a file killed the panel
+outright. That is the exact opposite of this file's contract, which is a broken
 configuration costs the user their settings and never their panel.
 
 So: lua_rawget rather than lua_getfield, lua_rawgeti rather than lua_geti,
@@ -809,7 +809,16 @@ chunk is handed arithmetic, strings and tables and nothing else: no io, no os,
 no package, no require, no load, no dofile. Nothing named here can open a file
 or start a process, and a name absent from this list is absent from the chunk's
 globals, so the sandbox is this list rather than a set of removals a chunk could
-work its way around. */
+work its way around.
+
+The four libraries these names come out of are also the only four that are
+OPENED -- see guard_prepare in src/luaguard.c -- so io and os are not tables
+this list declines to copy, they are tables that do not exist. `string` is
+copied from here and then replaced with a bounded one for the same reason.
+
+pcall is deliberately absent, and that is load-bearing rather than incidental:
+the instruction hook below ends a runaway chunk by raising, and a chunk able to
+catch that error could sit in a loop catching it forever. */
 static const char *const config_environment[] = {
   "assert",
   "error",
@@ -839,54 +848,30 @@ config_undefined(lua_State *L)
       name == NULL ? "that name" : name, name == NULL ? "..." : name);
 }
 
-/* Function purpose: Give the chunk on top of the stack the restricted globals
-above in place of Lua's own. _ENV is a chunk's first upvalue, which is what
-makes this one substitution cover the whole file rather than a list of deletions
-applying only where they were made. The chunk stays on top either way. */
-static bool
-config_sandbox(lua_State *L)
-{
-  lua_newtable(L);
+/* Action purpose: config_undefined is reached through the environment's
+__index, which is why it is handed to saber_lua_open rather than installed
+here. Reading a name the environment does not hold is an error rather than nil,
+and that is the single most useful thing this sandbox does for somebody
+migrating a file by hand.
 
-  for (int i = 0; config_environment[i] != NULL; i++) {
-    lua_getglobal(L, config_environment[i]);
-    lua_setfield(L, -2, config_environment[i]);
-  }
-
-  /* Action purpose: Reading a name this environment does not hold is an error
-  rather than nil, and that is the single most useful thing this sandbox does
-  for somebody migrating a file by hand.
-
-  Every value in the configuration this format replaced was a bare word --
-  `edge = left`, `autohide = never`, `backlight = palette`, `urgent = color9`.
-  All four are valid Lua that reads an undefined global, so without this they
-  would each evaluate to nil, the key would be absent rather than wrong, and
-  the setting would be silently dropped while the file loaded without
-  complaint. A key that does nothing and says nothing is worse than a file that
-  is refused, because the refusal names the line. */
-  lua_newtable(L);
-  lua_pushcfunction(L, config_undefined);
-  lua_setfield(L, -2, "__index");
-  lua_setmetatable(L, -2);
-
-  /* Action purpose: A main chunk always has _ENV as its first upvalue, so this
-  cannot fail in practice -- but lua_setupvalue pops nothing when it does not
-  take the value, and an unnoticed failure would run the file with Lua's real
-  globals, which is the one outcome the sandbox exists to prevent. */
-  if (lua_setupvalue(L, -2, 1) == NULL) {
-    lua_pop(L, 1);
-
-    return false;
-  }
-
-  return true;
-}
+Every value in the configuration this format replaced was a bare word --
+`edge = left`, `autohide = never`, `backlight = palette`, `urgent = color9`.
+All four are valid Lua that reads an undefined global, so without the diagnostic
+they would each evaluate to nil, the key would be absent rather than wrong, and
+the setting would be silently dropped while the file loaded without complaint. A
+key that does nothing and says nothing is worse than a file that is refused,
+because the refusal names the line. */
 
 /* How many VM instructions a configuration file gets before it is taken to
 have hung. The shipped file needs a few hundred, so this is generous by three
 orders of magnitude, and the only thing it stops is a file that never finishes:
 `while true do end` would otherwise hang the panel instead of being refused,
-and a panel that stops answering is worse than one running the old settings. */
+and a panel that stops answering is worse than one running the old settings.
+
+It counts VM instructions, so it cannot interrupt a loop that runs inside a
+single C function however long that function takes -- which is not a limit of
+this number but of what a count hook is. The two string operations where that
+mattered are bounded in src/luaguard.c instead. */
 #define SABER_CONFIG_STEPS 2000000
 
 /* Function purpose: End a chunk that has run too long, through Lua's own error
@@ -934,7 +919,7 @@ config_open(lua_State *L, const char *path, char **error)
     return false;
   }
 
-  if (!config_sandbox(L)) {
+  if (!saber_lua_enter(L)) {
     lua_pop(L, 1);
     *error = g_strdup_printf("%s: not a Lua chunk", path);
 
@@ -943,7 +928,33 @@ config_open(lua_State *L, const char *path, char **error)
 
   lua_sethook(L, config_runaway, LUA_MASKCOUNT, SABER_CONFIG_STEPS);
 
-  if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+  int status = lua_pcall(L, 0, 1, 0);
+
+  /* Action purpose: The memory ceiling is lifted the instant the chunk stops
+  running, whichever way it stopped. Everything below this line is saber's own
+  code with no protected frame under it, so an allocation failure in it would
+  be an abort() rather than a diagnostic -- and a chunk that deliberately
+  parked the whole budget in live data could arrange exactly that, in
+  config_take_error's conversion of a non-string error or in the reader's first
+  key push. Bounding the file must not become a way to crash the panel. */
+  saber_lua_unbound(L);
+
+  if (status == LUA_ERRMEM) {
+    /* Action purpose: Lua's own word for a failed allocation is "not enough
+    memory", with no file and no number in it, which reads as the machine being
+    out of memory when what actually happened is that this one file asked for
+    more than a configuration may have. The file is named and the ceiling is
+    quoted instead, because the user's next move depends on which of the two it
+    was. */
+    lua_pop(L, 1);
+    *error = g_strdup_printf(
+        "%s: refused: a configuration may not use more than %zu bytes", path,
+        (size_t)SABER_LUA_MEMORY_CAP);
+
+    return false;
+  }
+
+  if (status != LUA_OK) {
     *error = config_take_error(L, path);
 
     return false;
@@ -986,19 +997,19 @@ saber_config_load_status(struct saber_config *config,
   struct config_written written = { false, false };
 
   if (file != NULL) {
-    lua_State *L = luaL_newstate();
+    /* Action purpose: One interpreter per load, built and closed here, which
+    is also what makes the bounded string library in src/luaguard.c safe to
+    install on the shared string metatable: nothing outside this load can
+    observe that mutation, because nothing outside this load shares the
+    interpreter. `saberctl reload` comes back through here and gets a new
+    one. */
+    lua_State *L = saber_lua_open(config_environment, config_undefined, false);
 
     outcome = SABER_CONFIG_UNREADABLE;
 
     if (L == NULL) {
       fprintf(stderr, "saber: out of memory reading %s\n", file);
     } else {
-      /* Action purpose: The standard libraries are opened so that math, string
-      and table exist to be handed to the chunk. What the chunk can reach is
-      decided by config_environment and not by what was opened here -- io and
-      os are loaded into globals the chunk never sees. */
-      luaL_openlibs(L);
-
       char *error = NULL;
 
       if (!config_open(L, file, &error)) {
@@ -1017,7 +1028,7 @@ saber_config_load_status(struct saber_config *config,
         lua_pop(L, 1);
       }
 
-      lua_close(L);
+      saber_lua_close(L);
     }
 
     g_free(file);

@@ -22,6 +22,14 @@ on:
       - "**.md"
       - "**.markdown"
 
+# Action purpose: The default token scope is whatever the repository is set to,
+# which on a public repository is read and on others can be write. This job
+# compiles the tree and runs one test binary: it reads the source and writes
+# nothing back, so it is given exactly that and the setting cannot drift with
+# the repository's.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build-${{ matrix.cc }}
@@ -45,7 +53,12 @@ jobs:
       CC: ${{ matrix.cc }}
 
     steps:
+      # Action purpose: The token is used for the clone and for nothing after it,
+      # so it is not left behind in .git/config where every later step -- and
+      # anything those steps run -- could read it.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # Action purpose: Every package here backs a pkg-config module or a tool
       # that GNUmakefile invokes, and nothing is listed that does not:

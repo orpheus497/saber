@@ -35,6 +35,7 @@ OBJS = \
 	display.o \
 	dnd.o \
 	ipc.o \
+	luaguard.o \
 	main.o \
 	match.o \
 	model.o \
@@ -105,10 +106,15 @@ VINPUT_PROTOCOL_OBJS = \
 	wlr-virtual-pointer-unstable-v1-protocol.o
 
 # Action purpose: The contrast and easing regression test. It drives
-# saber_theme_init directly rather than going through saber.lua, so it links
-# only these two objects and needs neither a configuration parser nor a
-# compositor -- which is what lets it run on any host, including one that
-# cannot link the panel itself.
+# saber_theme_init directly rather than going through saber.lua, so it needs
+# neither a configuration parser nor a compositor -- which is what lets it run
+# on any host, including one that cannot link the panel itself.
+#
+# luaguard.o is here because theme.o reads hikari.lua and so builds its
+# interpreter through it. It links nothing the test did not already link: the
+# test has always needed LUA_LIBS for theme.o's own Lua calls, and luaguard.c
+# uses Lua and libc and no glib at all.
 TEST_OBJS = \
 	theme.o \
-	anim.o
+	anim.o \
+	luaguard.o

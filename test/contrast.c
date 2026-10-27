@@ -19,11 +19,12 @@ wrong. */
 #include <saber/anim.h>
 #include <saber/theme.h>
 
-/* hikari-sakura's three shipped palettes, verbatim from the `ui { palette }`
-blocks of its hikari.conf. They are positionally identical and semantically
-divergent -- slot 1 is red on Sakura, muted dark red on Sakura Dark and muted
-emerald GREEN on Sakura Light -- which is the whole reason a role may not be a
-fixed slot index. */
+/* hikari-sakura's three shipped palettes, verbatim from the three `ui.palette`
+tables of its hikari.lua -- one live and two commented out, because Lua keeps
+only the last assignment to a key. They are positionally identical and
+semantically divergent -- slot 1 is red on Sakura, muted dark red on Sakura
+Dark and muted emerald GREEN on Sakura Light -- which is the whole reason a role
+may not be a fixed slot index. */
 static const char *const palettes[][SABER_PALETTE_SLOTS] = {
   { "#2b1e3a", "#c96464", "#df9f87", "#e4b382", "#8e7cc3", "#b18fc7",
     "#9fa0a6", "#d4d4d9", "#5e5966", "#df8787", "#f2bda8", "#f5cf9e",

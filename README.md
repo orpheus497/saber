@@ -71,20 +71,31 @@ one, and running both is normal.
   session bus can own `org.kde.StatusNotifierWatcher`. `sofi -tray-daemon` exists and draws no
   surface by default precisely because Saber owns the tray; run only one. See
   [Troubleshooting](#the-system-tray-is-empty).
+* **Nothing overlaps, and the protocol is what guarantees it.** Three surfaces of this set can
+  be on screen at once, and each picks a layer and an exclusive zone that keeps it clear of the
+  others. The panel column is on the layer-shell `TOP` layer and reserves its own width, so
+  windows tile beside it and a fullscreen window covers it. The Dash and the spread are on
+  `OVERLAY` and reserve nothing, so they draw *above* a fullscreen window — and every `sofi`
+  surface is on `OVERLAY` reserving nothing as well. A surface that reserves nothing is not
+  thereby free to sit on top of one that does: `wlr-layer-shell-unstable-v1` says of a zero
+  zone that *"the surface indicates that it would like to be moved to avoid occluding surfaces
+  with a positive exclusive zone"*, and zero is the protocol's own default. That one sentence is
+  why a `sofi` menu docks beside the column instead of over it without either program knowing
+  the other exists. The lock screen hides all of them.
 
 **Saber triggers `sofi` by running it.** There is no `sofi` IPC socket and none is needed: each
 surface is one invocation of the binary holding its own instance lock, so a launcher tile, a
-`hikari.conf` keybinding and a shell script all reach it the same way, and pressing the same
+`hikari.lua` keybinding and a shell script all reach it the same way, and pressing the same
 trigger twice does not stack two copies. `sofi -show drun`, `-show window`, `-show sheets`,
 `-show volume`, `-show network`, `-show notification-history`. Saber ships **no** binding for any
-of them — the shipped `launcher { favourites }` seeds `sofi.desktop`, which is the application
-menu, and the rest are yours to bind in `hikari.conf` or pin. `org.sofi.Tray` is a private
+of them — the shipped `launcher.favourites` seeds `sofi.desktop`, which is the application
+menu, and the rest are yours to bind in `hikari.lua` or pin. `org.sofi.Tray` is a private
 interface between two `sofi` processes and is not a handoff surface; the commands are the
 contract.
 
 ## The column
 
-Top to bottom, each item switchable in `items { }`:
+Top to bottom, each item switchable in `items`:
 
 | Item | Left click | Middle click | Right click | Scroll |
 |---|---|---|---|---|
@@ -97,7 +108,7 @@ Top to bottom, each item switchable in `items { }`:
 | **Session** | Session menu | — | Session menu | — |
 
 **When the launcher band runs out of room, it scrolls.** Everything listed before `apps` in
-`items { order }` is pinned to the top of the column and everything after it is anchored to the
+`items.order` is pinned to the top of the column and everything after it is anchored to the
 bottom; the band takes the space left between them. A wheel anywhere on the column that is not
 over a tile with a scroll of its own — the BFB, a device, the trash, the session tile, an
 application with fewer than two windows, or the empty gap — moves the band instead. A small
@@ -150,7 +161,7 @@ There are **no thumbnails**, and that is a design decision forced by the composi
 
 ## Theming
 
-Saber has no theme file. It reads `ui { palette }` straight out of your `hikari.lua`, so the
+Saber has no theme file. It reads `ui.palette` straight out of your `hikari.lua`, so the
 panel is painted from the same sixteen colours as the compositor, its top bar and its lock
 screen. Drop a terminal colour scheme into `hikari.lua` and the whole desktop follows, panel
 included.
@@ -158,8 +169,8 @@ included.
 `$XDG_CONFIG_HOME/hikari/hikari.lua` is read first, then `~/.config/hikari/hikari.lua`, then
 `${ETC_PREFIX}/etc/hikari/hikari.lua`. The palette and the animation duration are the only two
 blocks of that file Saber reads, and it writes neither back. The reader is deliberately tolerant
-while the compositor's own Lua shape settles: the colours are taken from `ui { palette }` or
-from a top-level `palette`, the duration from `ui { animation }` or a top-level `animation`, and
+while the compositor's own Lua shape settles: the colours are taken from `ui.palette` or
+from a top-level `palette`, the duration from `ui.animation` or a top-level `animation`, and
 a missing, unparseable or unexpectedly shaped file costs nothing and falls through to the
 built-in palette, which is `hikari-sakura`'s own Sakura. That last case is the ordinary first
 run.
@@ -168,7 +179,7 @@ It is somebody else's file, read for two blocks, so it runs in the same restrict
 as your own configuration — but deliberately not under the same strictness, because `hikari.lua`
 may legitimately read globals Saber does not provide, and refusing the import over one of them
 would fail a file the compositor itself accepts. See [Configuration](#configuration).
-Keybindings are read by hikari out of its own `hikari.conf` — see
+Keybindings are read by hikari out of its own `hikari.lua` — see
 [Making the keys work](#making-the-keys-work).
 
 Unity's mechanics are reproduced; Unity's Ambiance colours are not.
@@ -238,11 +249,11 @@ Dark's ground and Sakura Light's, because the two required luminance windows do 
 so one literal would be a choice of which theme to fail on. On Sakura it resolves to `#df8787`,
 which is byte-identical to that palette's own `color9` and is what urgency already was there, so
 the default desktop is unchanged by the split. Both literals are overridable, and
-`theme { roles { urgent = "color9" } }` is how urgency goes back under a palette's control.
+`theme.roles.urgent = "color9"` is how urgency goes back under a palette's control.
 
 ### Overriding a role
 
-`theme { roles { } }` overrides all ten by name. Each takes either a palette reference
+`theme.roles` overrides all eleven by name. Each takes either a palette reference
 (`"colorN"`) or a literal (`"#rgb"`, `"#rrggbb"`, `"#rrggbbaa"`), and what you write wins over
 the computed value:
 
@@ -260,7 +271,7 @@ still follows a palette that arrives from `hikari.lua` afterwards: `accent = "co
 tracking a retheme exactly as the rest of the panel does. Derived roles follow what they derive
 from — re-point `accent` and the backlight and the progress bar move with it, re-point `urgent`
 and the count disc goes too, with the badge ink re-measured against whatever the disc ended up
-being. All ten are overridable, derived or not, so no colour the panel paints with is out of
+being. All eleven are overridable, derived or not, so no colour the panel paints with is out of
 reach.
 
 Every colour decision above is held by `make test`, because every colour defect this panel has
@@ -386,9 +397,9 @@ Five of these need a word on how they behave:
   scroll, the launch throb and the urgent wiggle are all scaled from it against a 180 ms
   baseline, so `0` genuinely stops all of them rather than leaving two of them running.
 * **`animation-ms`, left unwritten, is inherited from the compositor.** While
-  `theme { inherit-hikari }` is on, hikari's own `animation { duration }` answers it — with
+  `theme.inherit_hikari` is on, hikari's own `animation.duration` answers it — with
   `enabled = false` arriving as 0, which is the same statement made the other way round — and an
-  explicit `panel { animation-ms }` always wins over it. The consequence is worth stating plainly:
+  explicit `panel.animation_ms` always wins over it. The consequence is worth stating plainly:
   `hikari-sakura` ships animation **off**, so on a stock desktop with no explicit setting the
   panel's motion is off too and every surface settles instantly. The installed `saber.lua`
   therefore leaves the key commented out, so copying the shipped file behaves exactly like having
@@ -402,7 +413,7 @@ Five of these need a word on how they behave:
 
 ### Favourites are stored twice, on purpose
 
-`launcher { favourites }` **seeds** the launcher on first run. The live order — the one you get
+`launcher.favourites` **seeds** the launcher on first run. The live order — the one you get
 by dragging tiles — is kept in `$XDG_DATA_HOME/saber/favourites` and wins from then on. Saber
 never rewrites your configuration file. Delete the state file to re-seed from it.
 
@@ -423,10 +434,10 @@ arrives too late.
 ## Making the keys work
 
 Saber is a layer-shell client, and a layer-shell client **cannot grab global keys** — there is no
-protocol for it. Every keyboard shortcut therefore has to be a `hikari.conf` binding that runs
+protocol for it. Every keyboard shortcut therefore has to be a `hikari.lua` binding that runs
 `saberctl`.
 
-**Three already ship.** `hikari-sakura`'s own `hikari.conf` binds them, so on a stock
+**Three already ship.** `hikari-sakura`'s own `hikari.lua` binds them, so on a stock
 configuration there is nothing to do for these:
 
 | Key | Action | Runs |
@@ -442,28 +453,41 @@ summons a `sofi` surface, shifted drives the panel that is already on screen.
 overlay. The overlay is the one that cannot work without you: it needs a binding on the **press**
 and another on the **release** of the same key, and no such pair is shipped.
 
-```ucl
-actions {
-  saber-1        = "saberctl launch 1"
-  saber-2        = "saberctl launch 2"
-  saber-3        = "saberctl launch 3"
-  saber-numbers  = "saberctl overlay on"
-  saber-nonumber = "saberctl overlay off"
-}
+`hikari.lua` is one Lua table — a single `return { ... }` — so these are **entries added to the
+`actions` and `bindings.keyboard` tables it already has**, not blocks appended to the file. Pasting
+a second `actions = { ... }` alongside the first does not merge the two: Lua keeps only the last
+assignment to a key and discards the earlier table whole, silently, which is the one mistake to
+avoid here.
 
-bindings {
-  keyboard {
-    "LA+1" = action-saber-1
-    "LA+2" = action-saber-2
-    "LA+3" = action-saber-3
+```lua
+actions = {
+  -- ... the entries already there ...
+  ["saber-1"]        = "saberctl launch 1",
+  ["saber-2"]        = "saberctl launch 2",
+  ["saber-3"]        = "saberctl launch 3",
+  ["saber-numbers"]  = "saberctl overlay on",
+  ["saber-nonumber"] = "saberctl overlay off",
+},
 
-    "L+Alt_L" = {
-      begin = action-saber-numbers
-      end   = action-saber-nonumber
-    }
-  }
-}
+bindings = {
+  keyboard = {
+    -- ... the bindings already there ...
+    ["LA+1"] = "action-saber-1",
+    ["LA+2"] = "action-saber-2",
+    ["LA+3"] = "action-saber-3",
+
+    ["L+Alt_L"] = {
+      begin   = "action-saber-numbers",
+      ["end"] = "action-saber-nonumber",
+    },
+  },
+},
 ```
+
+A hyphen cannot appear in a bare Lua identifier, so every name above is written in the
+`["..."]` form — and `end` is a Lua keyword, which makes it the one key in the pair that *must* be
+quoted. An action is named from a binding by its own name prefixed with `action-`, as a string:
+`["LA+1"] = "action-saber-1"` runs `actions["saber-1"]`.
 
 The overlay is the `begin`/`end` form: hikari guarantees a `begin` is always followed by its
 `end`, so the numbers cannot be left on screen. `end` also fires when a further key goes down,
@@ -471,7 +495,7 @@ which is what you want here — pressing `1` launches the favourite and takes th
 it. Hold whichever key the launch bindings sit under; with `LA+N` above, that is Logo held while
 Alt goes down.
 
-> **Why `Logo+Alt` and not `Super+N`.** The shipped `hikari.conf` is densely bound: `L+1`…`L+9`
+> **Why `Logo+Alt` and not `Super+N`.** The shipped `hikari.lua` is densely bound: `L+1`…`L+9`
 > are `workspace-switch-to-sheet-N` and `LS+1`…`LS+9` are `view-pin-to-sheet-N`, so both of the
 > obvious choices are taken — as are almost all of `L+`, `LS+` and `LC+`. `LA+` has very few
 > bindings and is the free space. Hikari keeps only the **first** binding it reads for a key
@@ -514,7 +538,7 @@ does not apply compiles to an empty translation unit rather than a platform test
 
 Saber asks at startup whether it can carry out each action and **hides** the ones it cannot, so a
 host that declines leaves a menu with no dead buttons rather than one with failing ones. A
-`session { }` command override is trusted without asking the platform anything, and is the whole
+`session` command override is trusted without asking the platform anything, and is the whole
 answer on a host with neither privilege model.
 
 ### FreeBSD: the `operator` group
@@ -535,7 +559,7 @@ pw groupmod operator -m <user>
 
 `make install` prints this line when it applies; it never runs it, because adding a user to a
 privileged group is an administrator's decision. Saber checks its own membership at startup, so
-declining costs the three entries and nothing else. `session { }` overrides the commands for a
+declining costs the three entries and nothing else. `session` overrides the commands for a
 host that deliberately keeps its users out of `operator`.
 
 `/sbin/reboot` is never used — it is not setuid, so it would fail. `shutdown -r now` is.
@@ -572,7 +596,10 @@ rather than a different one.
 
 ## Building
 
-FreeBSD and Linux, from the same tree, with no configure step and nothing generated.
+FreeBSD and Linux, from the same tree, with no configure step. Two things are generated, both
+by the build itself and neither needing a tool you would not already have: `version.h`, rewritten
+on every build so the version cannot go stale, and one source and header pair per Wayland
+protocol, written by `wayland-scanner` from the XML in `protocols/`.
 
 The gate that stood here refused any `uname` but FreeBSD, and two of the three reasons it gave
 were never true of the source. `getfsstat(2)` and kqueue reach Saber only through GLib's
@@ -735,7 +762,7 @@ session actions:
 It used to print a single `operator group: yes/no` line, which answers nothing on Linux and
 printed `no` on a machine where every action worked. The five lines ask the same question the
 panel asks when it decides what to draw, so the report and the menu cannot disagree. They are
-the answers for the built-in commands: a `session { }` override is deliberately ignored here,
+the answers for the built-in commands: a `session` override is deliberately ignored here,
 because a report about the binary should not change because a configuration file names a
 different command.
 
@@ -774,7 +801,7 @@ FILEMANAGER=thunar saber &
 ### Keyboard shortcuts do nothing
 
 Saber cannot grab global keys. See [Making the keys work](#making-the-keys-work) — the bindings
-have to exist in `hikari.conf` and call `saberctl`.
+have to exist in `hikari.lua` and call `saberctl`.
 
 ### Typing in the Dash does nothing
 
@@ -807,27 +834,28 @@ palette it is painted with, and one is the platform's.
   icon-and-title grid until then.
 * **Lock and Logout are the platform's, not Saber's.** On FreeBSD there are neither: `lock` is a
   keybinding-only compositor action with no CLI and no socket verb, and FreeBSD has no `logind`
-  to ask for a session end, so both entries hide unless you point `session { lock, logout }` at
-  something. A `WITH_VIRTUAL_INPUT` build can synthesise your configured lock keysym instead, but
+  to ask for a session end, so both entries hide unless you point `session.lock` and
+  `session.logout` at something. A `WITH_VIRTUAL_INPUT` build can synthesise your configured lock
+  keysym instead, but
   it breaks silently if you rebind the key, which is why it is off by default. On Linux both
   exist, through `org.freedesktop.login1.Session.Lock` and `Manager.TerminateSession` — with one
   caveat that is worth knowing in advance. logind's `Lock` is a *signal* to whichever screen
   locker holds the session; with no locker running, the screen does not lock and no error comes
   back, and that is not discoverable over the interface. So Lock reports available whenever
-  logind has a session at all, and `session { lock }` remains the way to name a locker outright.
+  logind has a session at all, and `session.lock` remains the way to name a locker outright.
 * **The hold-Super number overlay needs a compositor binding.** A panel cannot observe a modifier
   it has no keyboard focus for, so the compositor drives it: bind the press and the release of
   your key to `saberctl overlay on` and `saberctl overlay off`. The numbers drawn are the ones
   `saberctl launch N` answers to.
 * **Autohide has `never` and `auto`, not `dodge`.** "Hide when a window would overlap" needs
   window geometry, and no foreign-toplevel protocol publishes any.
-* **`saberctl reload` does not reload everything.** The whole `theme { }` block, `roles { }`
+* **`saberctl reload` does not reload everything.** The whole `theme` block, `theme.roles`
   included, the column's width (`icon-size` and `padding`), `autohide`, `reveal-pressure` and
   `animation-ms` change under a running panel. Everything else is settled at startup and needs a
-  restart: `panel { output }` and `panel { edge }`, which decide how many columns exist and which
-  edge they anchor to; the `items { }` order and booleans, which decide whether the tray, sheets,
-  devices and trash subsystems are constructed at all; `launcher { favourites }`, which seeds the
-  launcher on first run only; and the `session { }` command overrides. `SIGHUP` does the same as
+  restart: `panel.output` and `panel.edge`, which decide how many columns exist and which
+  edge they anchor to; the `items` order and booleans, which decide whether the tray, sheets,
+  devices and trash subsystems are constructed at all; `launcher.favourites`, which seeds the
+  launcher on first run only; and the `session` command overrides. `SIGHUP` does the same as
   `reload`. A file that will not parse is refused rather than applied — a syntax error, a runaway
   chunk, or a chunk that returns anything but a table: `reload` reports it and the panel keeps the
   settings it is already running with.
@@ -839,7 +867,7 @@ palette it is painted with, and one is the platform's.
 * **The Dash has no blur, and will not get one — it has opacity instead.** `hikari-sakura`
   advertises no blur protocol of any kind, and nothing in Wayland lets a surface composite
   against what is behind it, so there is nothing to bind. What a client can control exactly is
-  how much of the desktop it lets through: `theme { overlay-opacity }` is the alpha the Dash
+  how much of the desktop it lets through: `theme.overlay_opacity` is the alpha the Dash
   strip, the spread backdrop and the hold-Super number scrim are painted at, written to the
   surface as given rather than stacked out of translucent passes — the `overlay` role carries the
   colour and this key carries the alpha, so the number here is the number the compositor blends
@@ -858,7 +886,7 @@ palette it is painted with, and one is the platform's.
   and `progress` inherits it by following `accent`. `make test` carries it as one named
   palette-and-role exemption holding the value the role actually resolves to, not as a lowered
   threshold, so the same shortfall on any other palette or any other role of this one still fails
-  the test — as does a regression that makes even this pair worse. `theme { roles { accent } }` is
+  the test — as does a regression that makes even this pair worse. `theme.roles.accent` is
   the way out on a desktop that needs AA here.
 * **Tray tooltips are not shown**, and `ToolTip` and `Category` are read off the wire and
   discarded. Saber owns only the KDE watcher name, so fd.o-only tray items find no watcher.

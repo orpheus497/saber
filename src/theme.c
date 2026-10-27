@@ -12,8 +12,8 @@ where hikari's file is read and one sandbox it is read under. */
 
 #include <lauxlib.h>
 #include <lua.h>
-#include <lualib.h>
 
+#include <saber/luaguard.h>
 #include <saber/theme.h>
 
 /* Action purpose: The compiled-in default is hikari-sakura's shipped palette,
@@ -284,7 +284,15 @@ saber_color_parse(const char *spec, struct saber_color *out)
 else's file, read for two blocks out of it, so the sandbox is tighter than the
 compositor's own would be rather than looser: arithmetic, strings and tables,
 and nothing that opens a file or starts a process. A name absent from this list
-is absent from the chunk's globals. */
+is absent from the chunk's globals, and the libraries the names are not in are
+never opened at all -- see guard_prepare in src/luaguard.c.
+
+No metatable goes on this environment, so an undefined name here reads as nil
+rather than being refused. That is deliberate and it is the one place this
+sandbox is looser than saber.lua's: a hikari.lua is written for the compositor
+and will mention names the compositor defines and saber does not, and refusing
+it for that would mean a desktop whose palette stops being imported the moment
+hikari gains a configuration function. */
 static const char *const hikari_environment[] = {
   "assert",
   "error",
@@ -300,31 +308,14 @@ static const char *const hikari_environment[] = {
   NULL,
 };
 
-/* Function purpose: Give the chunk on top of the stack the restricted globals
-above in place of Lua's own. _ENV is a chunk's first upvalue, so one
-substitution covers the whole file. The chunk stays on top either way. */
-static bool
-hikari_sandbox(lua_State *L)
-{
-  lua_newtable(L);
-
-  for (int i = 0; hikari_environment[i] != NULL; i++) {
-    lua_getglobal(L, hikari_environment[i]);
-    lua_setfield(L, -2, hikari_environment[i]);
-  }
-
-  if (lua_setupvalue(L, -2, 1) == NULL) {
-    lua_pop(L, 1);
-
-    return false;
-  }
-
-  return true;
-}
-
 /* How many VM instructions the compositor's configuration gets before it is
 taken to have hung. Reading somebody else's file must not be able to stop the
-panel starting, and the two blocks wanted from it cost a few hundred. */
+panel starting, and the two blocks wanted from it cost a few hundred.
+
+It counts VM instructions and so cannot interrupt a loop that runs inside one C
+function. A hikari.lua carrying `string.rep("", math.maxinteger)` hung the
+panel at startup for exactly that reason, which is what the ceilings in
+src/luaguard.c are for. */
 #define SABER_HIKARI_STEPS 2000000
 
 /* Function purpose: End a chunk that has run too long, through Lua's own error
@@ -346,20 +337,31 @@ state, so neither caller has a cleanup path of its own. */
 static lua_State *
 hikari_open(const char *path)
 {
-  lua_State *L = luaL_newstate();
+  lua_State *L = saber_lua_open(hikari_environment, NULL, true);
 
   if (L == NULL) {
     return NULL;
   }
 
-  /* The standard libraries are opened so math, string and table exist to be
-  handed to the chunk; what it can reach is hikari_environment, not this. */
-  luaL_openlibs(L);
+  if (luaL_loadfile(L, path) != LUA_OK || !saber_lua_enter(L)) {
+    saber_lua_close(L);
+
+    return NULL;
+  }
+
   lua_sethook(L, hikari_runaway, LUA_MASKCOUNT, SABER_HIKARI_STEPS);
 
-  if (luaL_loadfile(L, path) != LUA_OK || !hikari_sandbox(L)
-      || lua_pcall(L, 0, 1, 0) != LUA_OK || !lua_istable(L, -1)) {
-    lua_close(L);
+  int status = lua_pcall(L, 0, 1, 0);
+
+  /* Action purpose: The memory ceiling is lifted as soon as the chunk stops
+  running. Both importers below read the table with no protected frame under
+  them, so an allocation failure there would abort the panel instead of failing
+  the import -- and a hikari.lua that parked the whole budget in live data
+  could arrange it. The ceiling is for the file, not for the reading of it. */
+  saber_lua_unbound(L);
+
+  if (status != LUA_OK || !lua_istable(L, -1)) {
+    saber_lua_close(L);
 
     return NULL;
   }
@@ -438,7 +440,7 @@ saber_theme_import_hikari(const char *path,
     }
   }
 
-  lua_close(L);
+  saber_lua_close(L);
 
   return count;
 }
@@ -485,7 +487,7 @@ saber_theme_import_hikari_animation(const char *path, int *duration_ms)
     lua_pop(L, 1);
   }
 
-  lua_close(L);
+  saber_lua_close(L);
 
   return imported;
 }

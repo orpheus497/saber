@@ -3,9 +3,10 @@ $XDG_RUNTIME_DIR/saber.sock, one request line per connection, response then
 close. Deliberately modelled on hikari's own control socket so that a user who
 has learned one has learned both.
 
-It exists because hikari.conf binds keys to `exec` strings, so a keybinding has
-no way to reach an already-running panel except by launching something that
-talks to it; saberctl(1) is that something (D-008). Every verb resolves to a
+It exists because hikari.lua binds a key to an action name and an action to a
+shell command, so a keybinding has no way to reach an already-running panel
+except by launching something that talks to it; saberctl(1) is that something
+(D-008). Every verb resolves to a
 member of a callback table the panel fills in, so this module holds no panel
 state and can be driven standalone. */
 

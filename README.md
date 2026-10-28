@@ -286,8 +286,16 @@ accepted rather than fixed, and it is stated under [Known limits](#known-limits)
 `~/.config/saber/saber.lua`, in Lua: a chunk that **returns a table**, which is the language the
 compositor's own configuration is moving to, so one syntax covers the desktop. **Every key is
 optional and the whole file may be deleted**; the values below are the defaults. A copy with all
-of this documented in place is installed at `${ETC_PREFIX}/etc/saber/saber.lua`, and it is the
+of this documented in place is installed at `${ETC_PREFIX}/etc/saber/settings.lua`, and it is the
 fullest reference in the tree for what each key does.
+
+**The file named after the program is yours; `settings.lua` is the one that shipped.** That rule
+holds across the desktop — `saber.lua`, `sofi.lua` and `hikari.lua` are all files you write, and
+each component reads its distributor's defaults from a `settings.lua` beside them. It is worth
+stating because the two used to share a name and differ only by which directory they sat in, so a
+path had to be read to its last component before it said whose file it was. An install predating
+the rename still has `${ETC_PREFIX}/etc/saber/saber.lua`; it is read when `settings.lua` is
+absent, and saber says so once on startup.
 
 Four things hold for the whole file:
 
@@ -690,7 +698,7 @@ is one the desktop's own `.desktop` scanning may not find. `ETC_PREFIX` follows 
 FreeBSD and is `/` on Linux, so the configuration lands in `/etc` and not in `/usr/etc`.
 
 `make install` places `saber` and `saberctl` in `${PREFIX}/bin` (mode 555, neither setuid), the
-default configuration in `${ETC_PREFIX}/etc/saber/saber.lua`, and the BFB emblem in
+default configuration in `${ETC_PREFIX}/etc/saber/settings.lua`, and the BFB emblem in
 `${PREFIX}/share/icons/hicolor/scalable/apps/`.
 
 `make test` builds and runs the contrast and easing regression test, and it is the reason the

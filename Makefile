@@ -402,7 +402,7 @@ saber-${VERSION}.tar.gz: version.h
 		include/saber/*.h \
 		protocol/*.xml \
 		test/*.c \
-		etc/saber/saber.lua \
+		etc/saber/settings.lua \
 		build/sources.mk \
 		Makefile \
 		GNUmakefile \
@@ -430,7 +430,7 @@ install: saber saberctl
 		${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps
 	install -m 555 saber ${DESTDIR}${PREFIX}/bin
 	install -m 555 saberctl ${DESTDIR}${PREFIX}/bin
-	install -m 644 etc/saber/saber.lua ${DESTDIR}${ETC_PREFIX}/etc/saber
+	install -m 644 etc/saber/settings.lua ${DESTDIR}${ETC_PREFIX}/etc/saber
 	@${MAKE} -C${.CURDIR} groupcheck
 
 # [COMMENT] Action purpose: Report operator-group membership; never change it.
@@ -455,5 +455,6 @@ groupcheck:
 uninstall:
 	rm -f ${DESTDIR}${PREFIX}/bin/saber
 	rm -f ${DESTDIR}${PREFIX}/bin/saberctl
+	rm -f ${DESTDIR}${ETC_PREFIX}/etc/saber/settings.lua
 	rm -f ${DESTDIR}${ETC_PREFIX}/etc/saber/saber.lua
 	rm -f ${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps/saber.svg

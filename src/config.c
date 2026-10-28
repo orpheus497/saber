@@ -419,6 +419,22 @@ config_find(const char *path)
     return g_strdup(SABER_SYSTEM_CONFIG);
   }
 
+  /* Action purpose: the shipped file was named saber.lua until it was renamed
+  to settings.lua, so that the program's own name means the USER's file and
+  nothing else. An install from before that still has the old one and is not
+  broken by the rename, so it is read when the new name is absent. The notice
+  goes to stderr and not into the error path: this is a working configuration,
+  not a failing one. */
+  if (g_file_test(SABER_LEGACY_SYSTEM_CONFIG, G_FILE_TEST_IS_REGULAR)) {
+    fprintf(stderr,
+        "saber: reading %s, which is the old name for the shipped "
+        "configuration. It is now %s; `saber.lua` means your own file in "
+        "~/.config/saber. Renaming it silences this.\n",
+        SABER_LEGACY_SYSTEM_CONFIG, SABER_SYSTEM_CONFIG);
+
+    return g_strdup(SABER_LEGACY_SYSTEM_CONFIG);
+  }
+
   return NULL;
 }
 

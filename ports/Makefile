@@ -70,13 +70,13 @@ MAKE_ARGS+=	PREFIX=${PREFIX} ETC_PREFIX=${PREFIX} VERSION=${DISTVERSION}
 # already owns /sbin/shutdown and /dev/acpi. pkg-message tells the administrator
 # how to grant it; nothing here grants it automatically, because a package that
 # silently adds users to privileged groups is a package nobody should trust.
-# The tree's install writes a live saber.lua. A package must not overwrite a
+# The tree's install writes a live settings.lua. A package must not overwrite a
 # file the administrator has edited, so it ships as .sample and pkg materialises
 # it on first install only -- the same treatment sakura gives its config.ini.
 post-install:
 	@${STRIP_CMD} ${STAGEDIR}${PREFIX}/bin/saber
 	@${STRIP_CMD} ${STAGEDIR}${PREFIX}/bin/saberctl
-	@${MV} ${STAGEDIR}${PREFIX}/etc/saber/saber.lua \
-		${STAGEDIR}${PREFIX}/etc/saber/saber.lua.sample
+	@${MV} ${STAGEDIR}${PREFIX}/etc/saber/settings.lua \
+		${STAGEDIR}${PREFIX}/etc/saber/settings.lua.sample
 
 .include <bsd.port.mk>

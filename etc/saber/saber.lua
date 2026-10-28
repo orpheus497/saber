@@ -444,10 +444,10 @@ return {
 -- focus for, so the compositor has to say when the key goes down and when it
 -- comes up. In hikari's own configuration:
 --
---   actions {
---     saber-overlay-on  = "saberctl overlay on"
---     saber-overlay-off = "saberctl overlay off"
---   }
+--   actions = {
+--     ["saber-overlay-on"]  = "saberctl overlay on",
+--     ["saber-overlay-off"] = "saberctl overlay off",
+--   },
 --
 -- and bind the two to the press and the release of whichever key you hold. The
 -- numbers drawn are the ones `saberctl launch N` answers to, so the overlay is

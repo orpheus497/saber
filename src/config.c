@@ -913,7 +913,13 @@ one of those paths. */
 static bool
 config_open(lua_State *L, const char *path, char **error)
 {
-  if (luaL_loadfile(L, path) != LUA_OK) {
+  /* Action purpose: "t" loads TEXT only. luaL_loadfile accepts a precompiled
+  binary chunk as readily as source, and a crafted one corrupts interpreter
+  memory directly -- the restricted _ENV below bounds what a chunk can NAME, not
+  what malformed bytecode does to the VM before a name is ever looked up. A
+  configuration is a file people copy from each other, so it is read as the text
+  it is meant to be. */
+  if (luaL_loadfilex(L, path, "t") != LUA_OK) {
     *error = config_take_error(L, path);
 
     return false;

@@ -343,7 +343,11 @@ hikari_open(const char *path)
     return NULL;
   }
 
-  if (luaL_loadfile(L, path) != LUA_OK || !saber_lua_enter(L)) {
+  /* Action purpose: "t" loads TEXT only, for the reason config_open() gives --
+  and with more force here, because this file belongs to another program. A
+  precompiled chunk left where hikari.lua goes would be read by saber with the
+  compositor's authority and none of the compositor's intent. */
+  if (luaL_loadfilex(L, path, "t") != LUA_OK || !saber_lua_enter(L)) {
     saber_lua_close(L);
 
     return NULL;

@@ -71,17 +71,20 @@ one, and running both is normal.
   session bus can own `org.kde.StatusNotifierWatcher`. `sofi -tray-daemon` exists and draws no
   surface by default precisely because Saber owns the tray; run only one. See
   [Troubleshooting](#the-system-tray-is-empty).
-* **Nothing overlaps, and the protocol is what guarantees it.** Three surfaces of this set can
-  be on screen at once, and each picks a layer and an exclusive zone that keeps it clear of the
-  others. The panel column is on the layer-shell `TOP` layer and reserves its own width, so
-  windows tile beside it and a fullscreen window covers it. The Dash and the spread are on
-  `OVERLAY` and reserve nothing, so they draw *above* a fullscreen window — and every `sofi`
-  surface is on `OVERLAY` reserving nothing as well. A surface that reserves nothing is not
-  thereby free to sit on top of one that does: `wlr-layer-shell-unstable-v1` says of a zero
-  zone that *"the surface indicates that it would like to be moved to avoid occluding surfaces
-  with a positive exclusive zone"*, and zero is the protocol's own default. That one sentence is
-  why a `sofi` menu docks beside the column instead of over it without either program knowing
-  the other exists. The lock screen hides all of them.
+* **The panel keeps its own space, and what each surface asks for is a layer and an exclusive
+  zone.** Three surfaces of this set can be on screen at once. The panel column is on the
+  layer-shell `TOP` layer and reserves its own width, so windows tile beside it and a fullscreen
+  window covers it. The Dash and the spread are on `OVERLAY` and reserve nothing, so they draw
+  *above* a fullscreen window — and every `sofi` surface is on `OVERLAY` reserving nothing as
+  well. A surface that reserves nothing asks not to sit on top of one that does:
+  `wlr-layer-shell-unstable-v1` says of a zero zone that *"the surface indicates that it would
+  like to be moved to avoid occluding surfaces with a positive exclusive zone"*, and zero is the
+  protocol's own default. That is a request to the compositor rather than a guarantee of the
+  protocol, and it is what makes a `sofi` menu dock beside the column instead of over it on a
+  compositor that honours it, without either program knowing the other exists. Between two
+  surfaces that both reserve nothing the protocol says nothing at all, so a Dash and a `sofi`
+  surface open at the same moment may overlap; nothing here prevents that, and nothing needs to,
+  because both are summoned deliberately. The lock screen hides all of them.
 
 **Saber triggers `sofi` by running it.** There is no `sofi` IPC socket and none is needed: each
 surface is one invocation of the binary holding its own instance lock, so a launcher tile, a

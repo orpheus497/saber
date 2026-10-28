@@ -19,9 +19,9 @@ C-side loops bounded, and a setup that runs protected. */
 
 #include <lua.h>
 
-/* What a configuration may allocate, declared here because a reader that
-refuses a file for exceeding it has to be able to say so. Measured: a bare
-interpreter with its four libraries and no file read costs 14636 bytes, the
+/* Action purpose: what a configuration may allocate, declared here because a
+reader that refuses a file for exceeding it has to be able to say so. Measured:
+a bare interpreter with its four libraries and no file read costs 14636 bytes, the
 shipped saber.lua peaks at 19895, and hikari-sakura's own 51 KB hikari.lua at
 62000 -- so most of what a real configuration costs is the interpreter and not
 the file, and this is three orders of magnitude of headroom. Against it, a

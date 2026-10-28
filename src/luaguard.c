@@ -58,9 +58,36 @@ saber.lua is 14 bytes of a possible 65536. */
 #define SABER_LUA_REP_MAX (1 << 20)
 #define SABER_LUA_SUBJECT_MAX (1 << 16)
 
+/* Action purpose: SABER_LUA_WORK_MAX bounds the TOTAL byte-work the two
+wrappers above may be asked for, across every call a configuration makes.
+
+The two ceilings above each bound ONE call, and that is a different thing. A
+configuration whose body is
+
+  for i = 1, 1e9 do local _ = string.rep("x", 1048575) end
+
+satisfies the count ceiling, costs a handful of VM instructions per iteration so
+the instruction hook is nowhere near firing, and frees each megabyte before the
+next one so the allocation ceiling never sees it. The same shape was measured
+against sofi, which shares this design: it ran past ninety seconds with no
+diagnostic, which for a panel means not appearing at startup and hanging on
+`saberctl reload`. guard_pattern has the same shape with a less obvious trigger:
+repeated 64 KiB subjects, each scanned in one C call.
+
+A quarter of a gibibyte of copying takes a fraction of a second and is far more
+than any configuration deriving a theme from sixteen colours can want, so a file
+that reaches this ceiling is not doing work of this kind. */
+#define SABER_LUA_WORK_MAX ((size_t)256 << 20)
+
 struct guard_budget {
   size_t used;
   size_t cap;
+  /* Bytes of C-side work the wrappers have been asked for, in total, and the
+  ceiling on it. Separate from `used` because this work allocates nothing that
+  lasts: see the note on SABER_LUA_WORK_MAX. A zero ceiling means unbounded,
+  which is what saber_lua_unbound leaves behind. */
+  size_t work;
+  size_t work_cap;
 };
 
 struct guard_setup {
@@ -69,7 +96,7 @@ struct guard_setup {
   bool environment;
 };
 
-/* Address-as-registry-key: the restricted environment is stored under
+/* Action purpose: the restricted environment is stored under
 &guard_environment_key, so saber_lua_enter() can find it with no string key to
 collide with anything else in the registry. */
 static const char guard_environment_key = 0;
@@ -128,11 +155,49 @@ guard_delegate(lua_State *L)
   return lua_gettop(L);
 }
 
-/* Function purpose: string.rep with its repeat count bounded. */
+/* Function purpose: Charge bytes of C-side work against the running total and
+say whether the configuration has now had all it may have.
+
+Action purpose: the budget is reached through lua_getallocf, which hands back
+the pointer lua_setallocf was given, so a wrapper finds its own budget without a
+second upvalue and without a global. A state this file did not create has a
+different allocator and so no budget to charge, which is not a failure -- it
+simply has no ceiling of this kind.
+
+The addition saturates rather than wrapping, because a wrap would reset the
+total to nearly zero and hand the configuration its whole allowance again. */
+static bool
+guard_charge(lua_State *L, size_t bytes)
+{
+  void *ud = NULL;
+  struct guard_budget *budget;
+
+  if (lua_getallocf(L, &ud) != guard_alloc || ud == NULL) {
+    return true;
+  }
+
+  budget = ud;
+
+  if (budget->work_cap == 0) {
+    return true;
+  }
+
+  if (bytes > SIZE_MAX - budget->work) {
+    budget->work = SIZE_MAX;
+  } else {
+    budget->work += bytes;
+  }
+
+  return budget->work <= budget->work_cap;
+}
+
+/* Function purpose: string.rep with its repeat count and its share of the
+total work both bounded. */
 static int
 guard_rep(lua_State *L)
 {
   lua_Integer count = luaL_optinteger(L, 2, 0);
+  size_t len = 0;
 
   if (count > SABER_LUA_REP_MAX) {
     /* Action purpose: The count is rendered here rather than handed to
@@ -149,6 +214,20 @@ guard_rep(lua_State *L)
         seen, SABER_LUA_REP_MAX);
   }
 
+  /* The work is the count TIMES the length, because that is what the call
+  copies. Bounding the count alone leaves a loop of large-but-legal calls
+  unbounded. */
+  if (lua_type(L, 1) == LUA_TSTRING) {
+    lua_tolstring(L, 1, &len);
+  }
+
+  if (!guard_charge(L, count > 0 ? (size_t)count * len : 0)) {
+    return luaL_error(L,
+        "this configuration has asked for more than the %d MiB of string work "
+        "saber allows it in total",
+        (int)(SABER_LUA_WORK_MAX >> 20));
+  }
+
   return guard_delegate(L);
 }
 
@@ -160,10 +239,10 @@ guard_pattern(lua_State *L)
 {
   size_t len = 0;
 
-  /* The type is tested exactly, because lua_tolstring REWRITES the slot it is
-  given when that slot is not already a string -- and this slot is about to be
-  handed to the real function. A number subject is left to that function to
-  coerce as it always has. */
+  /* Action purpose: the type is tested exactly, because lua_tolstring REWRITES
+  the slot it is given when that slot is not already a string -- and this slot
+  is about to be handed to the real function. A number subject is left to that
+  function to coerce as it always has. */
   if (lua_type(L, 1) == LUA_TSTRING) {
     lua_tolstring(L, 1, &len);
   }
@@ -177,6 +256,16 @@ guard_pattern(lua_State *L)
         "a %s byte string was given to a pattern function, and at most %d "
         "bytes may be matched",
         seen, SABER_LUA_SUBJECT_MAX);
+  }
+
+  /* One scan of the subject is the floor on what a match costs; a pattern that
+  backtracks costs more. Charging the length bounds the NUMBER of scans, which
+  is the half the per-call ceiling above leaves open. */
+  if (!guard_charge(L, len)) {
+    return luaL_error(L,
+        "this configuration has asked for more than the %d MiB of string work "
+        "saber allows it in total",
+        (int)(SABER_LUA_WORK_MAX >> 20));
   }
 
   return guard_delegate(L);
@@ -404,6 +493,8 @@ saber_lua_open(const char *const names[], lua_CFunction undefined,
 
   budget->used = 0;
   budget->cap = SABER_LUA_MEMORY_CAP;
+  budget->work = 0;
+  budget->work_cap = SABER_LUA_WORK_MAX;
 
   /* Action purpose: lua_newstate rather than luaL_newstate, because the cap is
   the allocator -- an interpreter built with Lua's own allocator and switched
@@ -469,6 +560,10 @@ saber_lua_unbound(lua_State *L)
   against has stopped running, and the accounting carries on so that lua_close
   still balances. */
   ((struct guard_budget *)budget)->cap = (size_t)-1;
+
+  /* The work ceiling goes with it, for the same reason: what it bounds is the
+  configuration, and the configuration has finished. Zero means no ceiling. */
+  ((struct guard_budget *)budget)->work_cap = 0;
 }
 
 void

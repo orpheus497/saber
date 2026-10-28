@@ -191,6 +191,44 @@ guard_charge(lua_State *L, size_t bytes)
   return budget->work <= budget->work_cap;
 }
 
+/* Function purpose: The length of an argument as string.rep will see it, in
+bytes, without disturbing the argument.
+
+Action purpose: a number is a legal subject and a legal separator -- Lua
+coerces it to a string before copying it -- so measuring only LUA_TSTRING
+undercharges every call that passes one. It does not let a call escape the
+ceiling, because guard_rep_work() charges the repetition count as a floor, but
+it undercharges badly: string.rep("", 1048576, 1234567890123456789) copies
+about 19.9 MiB and was charged about 1 MiB, so a configuration could do roughly
+twenty times the work the ceiling is meant to allow.
+
+Action purpose: the conversion happens on a COPY. lua_tolstring() coerces in
+place, and the slot it would rewrite is an argument of the call about to be
+passed on -- the real function would coerce it identically, so rewriting it is
+harmless here, but it is not harmless as a habit and the copy costs one stack
+slot. A value that is neither a string nor a number measures zero and is left
+for the real function to reject in its own words. */
+static size_t
+guard_arg_text_len(lua_State *L, int idx)
+{
+  if (lua_type(L, idx) == LUA_TSTRING) {
+    return lua_rawlen(L, idx);
+  }
+
+  if (!lua_isstring(L, idx) || !lua_checkstack(L, 1)) {
+    return 0;
+  }
+
+  lua_pushvalue(L, idx);
+
+  size_t len = 0;
+
+  lua_tolstring(L, -1, &len);
+  lua_pop(L, 1);
+
+  return len;
+}
+
 /* Function purpose: What one string.rep call costs, saturating at SIZE_MAX
 rather than wrapping.
 
@@ -274,15 +312,9 @@ guard_rep(lua_State *L)
   /* The work is what the call actually copies -- see guard_rep_work(), and the
   note there on why the count times the length is not it. Bounding the count
   alone leaves a loop of large-but-legal calls unbounded. */
-  size_t seplen = 0;
+  size_t seplen = guard_arg_text_len(L, 3);
 
-  if (lua_type(L, 1) == LUA_TSTRING) {
-    lua_tolstring(L, 1, &len);
-  }
-
-  if (lua_type(L, 3) == LUA_TSTRING) {
-    lua_tolstring(L, 3, &seplen);
-  }
+  len = guard_arg_text_len(L, 1);
 
   if (!guard_charge(L, guard_rep_work(count, len, seplen))) {
     return luaL_error(L,

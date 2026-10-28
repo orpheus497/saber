@@ -191,6 +191,63 @@ guard_charge(lua_State *L, size_t bytes)
   return budget->work <= budget->work_cap;
 }
 
+/* Function purpose: What one string.rep call costs, saturating at SIZE_MAX
+rather than wrapping.
+
+Action purpose: the cost is NOT the count times the length, which is what this
+charged at first and is wrong in a way that voids the ceiling.
+string.rep(s, n, sep) writes n copies of s with n-1 copies of sep BETWEEN them,
+so a call whose s is empty still writes every separator:
+string.rep("", 1048576, "-") produces a megabyte where count times length is
+zero. Charging that zero left a loop of such calls completely unbounded -- 2000
+of them copied two gigabytes and ran for fifteen seconds, where the same loop
+over a one-byte string was refused at once.
+
+Action purpose: the trailing count is the repetition itself, so a call with
+nothing at all to copy is still not free. Every step is checked because a
+product that wrapped would charge less than the call costs, which is the defect
+above by another route. */
+static size_t
+guard_rep_work(lua_Integer count, size_t len, size_t seplen)
+{
+  if (count <= 0) {
+    return 0;
+  }
+
+  size_t n = (size_t)count;
+  size_t work = 0;
+
+  if (len != 0) {
+    if (n > SIZE_MAX / len) {
+      return SIZE_MAX;
+    }
+
+    work = n * len;
+  }
+
+  if (seplen != 0) {
+    size_t gaps = n - 1;
+
+    if (gaps > SIZE_MAX / seplen) {
+      return SIZE_MAX;
+    }
+
+    size_t separators = gaps * seplen;
+
+    if (separators > SIZE_MAX - work) {
+      return SIZE_MAX;
+    }
+
+    work += separators;
+  }
+
+  if (work > SIZE_MAX - n) {
+    return SIZE_MAX;
+  }
+
+  return work + n;
+}
+
 /* Function purpose: string.rep with its repeat count and its share of the
 total work both bounded. */
 static int
@@ -214,14 +271,20 @@ guard_rep(lua_State *L)
         seen, SABER_LUA_REP_MAX);
   }
 
-  /* The work is the count TIMES the length, because that is what the call
-  copies. Bounding the count alone leaves a loop of large-but-legal calls
-  unbounded. */
+  /* The work is what the call actually copies -- see guard_rep_work(), and the
+  note there on why the count times the length is not it. Bounding the count
+  alone leaves a loop of large-but-legal calls unbounded. */
+  size_t seplen = 0;
+
   if (lua_type(L, 1) == LUA_TSTRING) {
     lua_tolstring(L, 1, &len);
   }
 
-  if (!guard_charge(L, count > 0 ? (size_t)count * len : 0)) {
+  if (lua_type(L, 3) == LUA_TSTRING) {
+    lua_tolstring(L, 3, &seplen);
+  }
+
+  if (!guard_charge(L, guard_rep_work(count, len, seplen))) {
     return luaL_error(L,
         "this configuration has asked for more than the %d MiB of string work "
         "saber allows it in total",

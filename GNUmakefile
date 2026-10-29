@@ -310,6 +310,12 @@ saber-$(VERSION).tar.gz: version.h
 # /etc/saber/settings.lua -- and that file promises in its own header that saber
 # never rewrites it. Skipping is said out loud rather than done quietly, because
 # an install that declines to apply the new shipped defaults has to say so.
+#
+# Action purpose: BOTH names are checked, not just the shipped one. The loader
+# prefers settings.lua and falls back to saber.lua, so writing settings.lua onto
+# a host that has only an edited saber.lua would leave that file on disk and stop
+# it being read -- the same loss as deleting it, and quieter, because the notice
+# the loader prints for the legacy name never fires either.
 install: saber saberctl
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	mkdir -p $(DESTDIR)$(ETC_PREFIX)/etc/saber
@@ -321,6 +327,11 @@ install: saber saberctl
 	@if [ -f $(DESTDIR)$(ETC_PREFIX)/etc/saber/settings.lua ]; then \
 		echo "saber: $(DESTDIR)$(ETC_PREFIX)/etc/saber/settings.lua exists; left exactly as it is."; \
 		echo "       The shipped copy is etc/saber/settings.lua in this tree; merge by hand if you want it."; \
+	elif [ -f $(DESTDIR)$(ETC_PREFIX)/etc/saber/saber.lua ]; then \
+		echo "saber: $(DESTDIR)$(ETC_PREFIX)/etc/saber/saber.lua exists -- the old name for this file,"; \
+		echo "       which saber still reads while settings.lua is absent. Nothing was installed:"; \
+		echo "       settings.lua takes precedence, so writing it would stop your file being read"; \
+		echo "       without removing it. Rename yours to settings.lua when you are ready."; \
 	else \
 		install -m 644 etc/saber/settings.lua $(DESTDIR)$(ETC_PREFIX)/etc/saber; \
 	fi

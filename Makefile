@@ -422,6 +422,14 @@ dist: distclean saber-${VERSION}.tar.gz
 # no sudoers fragment. Suspend, reboot and shut down work through FreeBSD's
 # existing `operator` group, which already owns /sbin/shutdown (setuid root,
 # group-executable) and /dev/acpi (group-writable). See DECISIONS_LOG D-013.
+#
+# [COMMENT] Action purpose: The shipped configuration is installed ONLY where
+# there is none. `install` replaces its destination, so a rebuild from a newer
+# checkout would silently discard whatever the administrator had edited into
+# ${ETC_PREFIX}/etc/saber/settings.lua -- and that file promises in its own
+# header that saber never rewrites it. The port relies on this rule to stage the
+# file, which it then renames to settings.lua.sample; a staging directory is
+# empty on every build, so the guard never stops it.
 install: saber saberctl
 	mkdir -p ${DESTDIR}${PREFIX}/bin
 	mkdir -p ${DESTDIR}${ETC_PREFIX}/etc/saber
@@ -430,7 +438,12 @@ install: saber saberctl
 		${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps
 	install -m 555 saber ${DESTDIR}${PREFIX}/bin
 	install -m 555 saberctl ${DESTDIR}${PREFIX}/bin
-	install -m 644 etc/saber/settings.lua ${DESTDIR}${ETC_PREFIX}/etc/saber
+	@if [ -f ${DESTDIR}${ETC_PREFIX}/etc/saber/settings.lua ]; then \
+		echo "saber: ${DESTDIR}${ETC_PREFIX}/etc/saber/settings.lua exists; left exactly as it is."; \
+		echo "       The shipped copy is etc/saber/settings.lua in this tree; merge by hand if you want it."; \
+	else \
+		install -m 644 etc/saber/settings.lua ${DESTDIR}${ETC_PREFIX}/etc/saber; \
+	fi
 	@${MAKE} -C${.CURDIR} groupcheck
 
 # [COMMENT] Action purpose: Report operator-group membership; never change it.
@@ -452,9 +465,16 @@ groupcheck:
 		echo "       Saber deliberately does not run this for you."; \
 	fi
 
+# [COMMENT] Action purpose: Uninstall leaves ${ETC_PREFIX}/etc/saber alone, as
+# the GNU make driver already did. An administrator's configuration is not the
+# build's to delete, and removing it here would undo the guard the install rule
+# above exists to provide -- install declines to overwrite the file, so
+# uninstall must not be the thing that takes it away instead. The legacy
+# saber.lua is left for the same reason. The FreeBSD package removes its own
+# copy through pkg-plist's @sample, which is a different mechanism and
+# unaffected by this.
 uninstall:
 	rm -f ${DESTDIR}${PREFIX}/bin/saber
 	rm -f ${DESTDIR}${PREFIX}/bin/saberctl
-	rm -f ${DESTDIR}${ETC_PREFIX}/etc/saber/settings.lua
-	rm -f ${DESTDIR}${ETC_PREFIX}/etc/saber/saber.lua
 	rm -f ${DESTDIR}${PREFIX}/share/icons/hicolor/scalable/apps/saber.svg
+	@echo "saber: ${DESTDIR}${ETC_PREFIX}/etc/saber left in place; remove it by hand if you mean to."

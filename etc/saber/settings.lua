@@ -1,4 +1,4 @@
--- saber.lua -- configuration for saber, the Hikari Sakura panel.
+-- settings.lua -- the configuration saber ships, for /etc/saber.
 --
 -- Lua. This file is a chunk that RETURNS a table, and that table is the
 -- configuration -- the same language hikari's own configuration is moving to,

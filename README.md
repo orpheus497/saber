@@ -726,7 +726,7 @@ side it broke.
 Saber is **not in the ports tree** yet, but a port skeleton ships under [`ports/`](ports/) —
 `Makefile`, `pkg-descr`, `pkg-message` and `pkg-plist`, with `TRAY`, `DASH` and `SPREAD` options,
 all on by default. It depends on `lang/lua54` and installs the configuration as
-`saber.lua.sample`, so a package never overwrites a file the administrator has edited. Until a
+`settings.lua.sample`, so a package never overwrites a file the administrator has edited. Until a
 submission is made, build it with `make` as above.
 
 ### Build switches

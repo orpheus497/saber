@@ -303,6 +303,13 @@ saber-$(VERSION).tar.gz: version.h
 # over D-Bus, which authorises them per-session through polkit, so there is no
 # group to join and nothing for an administrator to do -- which is why
 # groupcheck says something different here than it does under bmake.
+#
+# Action purpose: The shipped configuration is installed ONLY where there is
+# none. `install` replaces its destination, so a rebuild from a newer checkout
+# would silently discard whatever the administrator had edited into
+# /etc/saber/settings.lua -- and that file promises in its own header that saber
+# never rewrites it. Skipping is said out loud rather than done quietly, because
+# an install that declines to apply the new shipped defaults has to say so.
 install: saber saberctl
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	mkdir -p $(DESTDIR)$(ETC_PREFIX)/etc/saber
@@ -311,7 +318,12 @@ install: saber saberctl
 		$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps
 	install -m 555 saber $(DESTDIR)$(PREFIX)/bin
 	install -m 555 saberctl $(DESTDIR)$(PREFIX)/bin
-	install -m 644 etc/saber/settings.lua $(DESTDIR)$(ETC_PREFIX)/etc/saber
+	@if [ -f $(DESTDIR)$(ETC_PREFIX)/etc/saber/settings.lua ]; then \
+		echo "saber: $(DESTDIR)$(ETC_PREFIX)/etc/saber/settings.lua exists; left exactly as it is."; \
+		echo "       The shipped copy is etc/saber/settings.lua in this tree; merge by hand if you want it."; \
+	else \
+		install -m 644 etc/saber/settings.lua $(DESTDIR)$(ETC_PREFIX)/etc/saber; \
+	fi
 	@$(MAKE) groupcheck
 
 uninstall:

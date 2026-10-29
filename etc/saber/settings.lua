@@ -167,9 +167,9 @@ return {
     -- in another, so a role map pinned to slots paints urgency green there.
     --
     -- This block exists to disagree with the derivation. Each key takes either
-    -- a palette reference ("colorN") or a literal ("#rgb", "#rrggbb",
-    -- "#rrggbbaa") -- both written as strings -- and what you write WINS over
-    -- the computed value.
+    -- a palette reference ("colorN", or "@colorN" as sofi writes the same
+    -- reference) or a literal ("#rgb", "#rrggbb", "#rrggbbaa") -- both written
+    -- as strings -- and what you write WINS over the computed value.
     --
     --   background  the column itself              color0
     --   foreground  pips, separators, text         color15

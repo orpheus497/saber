@@ -257,8 +257,8 @@ the default desktop is unchanged by the split. Both literals are overridable, an
 ### Overriding a role
 
 `theme.roles` overrides all eleven by name. Each takes either a palette reference
-(`"colorN"`) or a literal (`"#rgb"`, `"#rrggbb"`, `"#rrggbbaa"`), and what you write wins over
-the computed value:
+(`"colorN"`, or `"@colorN"` if you are coming from a sofi layout) or a literal (`"#rgb"`,
+`"#rrggbb"`, `"#rrggbbaa"`), and what you write wins over the computed value:
 
 ```lua
 theme = {

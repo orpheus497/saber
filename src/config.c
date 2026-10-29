@@ -512,11 +512,24 @@ config_apply_palette(struct saber_config *config, lua_State *L)
 
 /* Function purpose: Resolve a "colorN" palette reference, 0-15. Returns -1 for
 anything else, which is what tells the caller to read the value as a literal
-instead -- the same two forms the compositor's own colour keys take. */
+instead -- the same two forms the compositor's own colour keys take. A leading
+`@`, which is how sofi writes the same reference, is accepted on the slot form. */
 static int
 config_palette_reference(const char *spec)
 {
-  if (spec == NULL || g_ascii_strncasecmp(spec, "color", 5) != 0) {
+  if (spec == NULL) {
+    return -1;
+  }
+
+  /* Action purpose: a leading `@` is sofi's spelling of the same reference, and
+  it is skipped rather than refused so that a role copied out of a sofi layout
+  reads here unchanged. The palette block takes literals only, so there is
+  nothing for an `@` to mean there and nowhere else to carry this. */
+  if (*spec == '@') {
+    spec++;
+  }
+
+  if (g_ascii_strncasecmp(spec, "color", 5) != 0) {
     return -1;
   }
 

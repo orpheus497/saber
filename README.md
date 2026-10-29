@@ -448,7 +448,15 @@ Saber is a layer-shell client, and a layer-shell client **cannot grab global key
 protocol for it. Every keyboard shortcut therefore has to be a `hikari.lua` binding that runs
 `saberctl`.
 
-**Three already ship.** `hikari-sakura`'s own `hikari.lua` binds them, so on a stock
+**Which file that is depends on which hikari-sakura you are running.** `hikari.lua` arrives with
+hikari-sakura's own Lua migration; until that lands, `master` still ships `etc/hikari/hikari.conf`
+and reads that. The three bindings below are already in place either way — `master`'s
+`hikari.conf` defines the same `dash`, `spread` and `panel` actions over `saberctl` and binds
+`LS+d`, `LS+e` and `LS+p` to them — so nothing in that table depends on the migration. What does
+depend on it is the syntax of the entries further down, which are Lua tables: on `hikari.conf`
+they go in that file's own syntax instead, as hikari(1) documents it.
+
+**Three already ship.** hikari-sakura's own shipped configuration binds them, so on a stock
 configuration there is nothing to do for these:
 
 | Key | Action | Runs |

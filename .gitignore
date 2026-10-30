@@ -8,9 +8,10 @@
 /saberctl
 /vinput
 
-# The contrast and easing test, built and run by `make test`. The source beside
-# it IS tracked -- only the binary is not.
+# The two tests built and run by `make test`. The sources beside them ARE
+# tracked -- only the binaries are not.
 /test/contrast
+/test/budget
 
 # Libraries. Saber builds executables only, so these are a standing guard
 # rather than a rule for anything the tree produces today.

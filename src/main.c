@@ -409,9 +409,16 @@ app_reload_config(struct saber_app *app)
 
   saber_config_fini(&next);
 
-  saber_theme_init(&app->theme,
+  /* Action purpose: with the roles, not without them. `theme.roles` was being
+  parsed, validated and stored and then never reaching the theme, because this
+  took the wrapper that passes NULL for them -- so every override in saber.lua
+  was accepted and silently ignored. The reload path matters as much as the
+  startup one: a role edited and reloaded has to take effect without the panel
+  being restarted, which is the whole point of `saberctl reload`. */
+  saber_theme_init_with_roles(&app->theme,
       app->config.theme.palette_valid ? app->config.theme.palette : NULL,
-      app->config.theme.opacity, app->config.theme.overlay_opacity);
+      app->config.theme.opacity, app->config.theme.overlay_opacity,
+      &app->config.theme.roles);
 
   saber_panels_reload(app->panels);
   app_repaint(app);
@@ -838,9 +845,10 @@ run(void)
   memset(&app, 0, sizeof(app));
 
   saber_config_load(&app.config, NULL);
-  saber_theme_init(&app.theme,
+  saber_theme_init_with_roles(&app.theme,
       app.config.theme.palette_valid ? app.config.theme.palette : NULL,
-      app.config.theme.opacity, app.config.theme.overlay_opacity);
+      app.config.theme.opacity, app.config.theme.overlay_opacity,
+      &app.config.theme.roles);
 
   app.display = saber_display_create(NULL);
 
@@ -1065,8 +1073,26 @@ main(int argc, char **argv)
 
     if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--build") == 0) {
       report_build();
-      printf("  operator group   %s\n",
-          saber_session_in_operator_group() ? "yes" : "no");
+
+      /* Action purpose: Report each session action separately rather than the
+      one privilege fact behind them, because there is no longer one fact.
+      Membership of `operator` is what decides this on FreeBSD and means
+      nothing on Linux, where logind answers per action and polkit may answer
+      "challenge" -- so a single `operator group: no` line read as the opposite
+      of the truth on a machine where every action worked. This asks the same
+      question the panel asks when it decides what to draw, so `--build` and
+      the session menu can no longer disagree.
+
+      NULL config, so this reports what the built-in commands can do and
+      ignores any `session { }` override: a report about the binary should not
+      change because a configuration file names a different command. */
+      printf("\nsession actions:\n");
+
+      for (int action = 0; action < SABER_SESSION_ACTION_COUNT; action++) {
+        printf("  %-16s %s\n", saber_session_action_id(action),
+            saber_session_available(NULL, action) ? "yes" : "no");
+      }
+
       return EXIT_SUCCESS;
     }
 

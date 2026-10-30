@@ -1,8 +1,9 @@
 /* Script function and purpose: saberctl(1) -- the command-line half of the
 panel's control socket, and its own binary.
 
-hikari.conf binds keys to `exec` strings, so a keybinding cannot reach the
-resident panel except by launching something that talks to it (D-008). That
+hikari.lua binds a key to an action name and an action to a shell command, so a
+keybinding cannot reach the resident panel except by launching something that
+talks to it (D-008). That
 makes this program run on every bound keypress, which is the whole reason it
 links nothing but libc: no Wayland, no cairo, no pango, no gdk-pixbuf, no
 librsvg, and no glib either. It sends one line and prints one response. */

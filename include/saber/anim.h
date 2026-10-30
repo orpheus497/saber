@@ -128,4 +128,58 @@ saber_clock_now(const struct saber_clock *clock);
 bool
 saber_clock_busy(const struct saber_clock *clock);
 
+/* Function purpose: The cross-fade a pointer leaves behind it. `enter` runs on
+whatever is under the pointer now and `leave` on what it has just left, started
+from wherever the incoming fade had reached -- so a pointer swept along a row
+leaves a trail that settles rather than a highlight that snaps from one item to
+the next.
+
+One pair, because the surfaces that highlight anything -- the column, the Dash
+and the spread -- had written the same two tweens and the same four-branch
+handover out once each. */
+struct saber_hover {
+  struct saber_tween enter;
+  struct saber_tween leave;
+};
+
+void
+saber_hover_init(struct saber_hover *hover);
+
+/* Both halves are borrowed by the clock exactly as a bare tween is. */
+void
+saber_hover_add(struct saber_clock *clock, struct saber_hover *hover);
+
+/* Function purpose: Begin the outgoing fade, from wherever the incoming one had
+reached. Called for the item being left, before whichever of saber_hover_enter
+and saber_hover_rest the new state asks for. */
+void
+saber_hover_leave(struct saber_hover *hover, int duration_ms, int64_t now_ms);
+
+void
+saber_hover_enter(struct saber_hover *hover, int duration_ms, int64_t now_ms);
+
+/* Function purpose: Nothing is under the pointer any more. Settles the incoming
+fade back at zero rather than on its target, which is where saber_tween_stop
+would land it and would leave the item just left fully lit. The outgoing fade is
+deliberately untouched: it still has to finish. */
+void
+saber_hover_rest(struct saber_hover *hover);
+
+/* Both halves back to nothing, for a surface being torn down. */
+void
+saber_hover_clear(struct saber_hover *hover);
+
+static inline double
+saber_hover_value(const struct saber_hover *hover)
+{
+  return hover->enter.value;
+}
+
+/* What the item the pointer has just left draws at. */
+static inline double
+saber_hover_fading(const struct saber_hover *hover)
+{
+  return hover->leave.value;
+}
+
 #endif

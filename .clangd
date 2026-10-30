@@ -7,7 +7,7 @@ CompileFlags:
     # The dependency set from BLUEPRINT.md section 7, as pkg-config resolves it
     # on this host. Regenerate with:
     #   pkg-config --cflags wayland-client wayland-cursor cairo pangocairo \
-    #              gio-2.0 gdk-pixbuf-2.0 librsvg-2.0 libucl xkbcommon
+    #              gio-2.0 gdk-pixbuf-2.0 librsvg-2.0 lua-5.4 xkbcommon
     - "-I/usr/local/include"
     - "-I/usr/local/include/cairo"
     - "-I/usr/local/include/pango-1.0"
@@ -22,6 +22,7 @@ CompileFlags:
     - "-I/usr/local/include/libpng16"
     - "-I/usr/local/include/libxml2"
     - "-I/usr/local/include/libepoll-shim"
+    - "-I/usr/local/include/lua54"
     - "-D_THREAD_SAFE"
     - "-DSABER_PREFIX=\"/usr/local\""
     - "-DSABER_ETC_PREFIX=\"/usr/local\""

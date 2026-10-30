@@ -37,9 +37,9 @@ Everything else about sofi is unaffected: its application menu, notification
 daemon and notification history are not superseded, and neither is the
 compositor's own top bar, which keeps all system telemetry.
 
-Saber has no theme file. It reads ui { palette } out of your hikari.conf, so
+Saber has no theme file. It reads ui.palette out of your hikari.lua, so
 retheming the compositor retints the panel with it. Configuration, all of it
-optional, is ~/.config/saber/saber.conf in the same UCL syntax.
+optional, is ~/.config/saber/saber.lua, in Lua like the compositor's own.
 EOM
 }
 { type: remove

@@ -53,9 +53,9 @@ Example -- open the Dash on the second output and wheel the grid down:
 #include "virtual-keyboard-unstable-v1-protocol.h"
 #include "wlr-virtual-pointer-unstable-v1-protocol.h"
 
-/* Wire button codes. Taken as literals rather than through
-<dev/evdev/input-event-codes.h> so this tool builds anywhere the rest does; the
-values are protocol constants and cannot drift. */
+/* linux/input-event-codes.h is a Linux header; the three button codes the
+protocol carries are stable and are spelled out rather than pulled in through a
+shim, so this tool builds anywhere the rest does. */
 #define VIN_BTN_LEFT 0x110
 #define VIN_BTN_RIGHT 0x111
 #define VIN_BTN_MIDDLE 0x112

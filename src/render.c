@@ -966,7 +966,7 @@ draw_focus_arrow(const struct saber_render *render,
 {
   double depth = tile->width * SABER_ARROW_DEPTH;
   double span = tile->height * SABER_ARROW_SPAN;
-  double cy = tile->y + tile->height / 2.0;
+  double cy = tile->y + tile->focus_offset + tile->height / 2.0;
   double base = edge_is_left(render) ? tile->x + tile->width : tile->x;
   double tip = edge_is_left(render) ? base - depth : base + depth;
 
@@ -988,7 +988,8 @@ draw_badge(const struct saber_render *render,
     return;
   }
 
-  double radius = tile->width * SABER_BADGE_RADIUS;
+  double radius = tile->width * SABER_BADGE_RADIUS *
+      (tile->badge_scale > 0.0 ? tile->badge_scale : 1.0);
   /* Top corner on the side away from the screen edge, so the disc never sits
   under the pips. */
   double cx = edge_is_left(render) ? tile->x + tile->width - radius
@@ -1133,6 +1134,13 @@ saber_render_tile(const struct saber_render *render,
 {
   double alpha = tile->dim ? SABER_DIM_ALPHA : 1.0;
 
+  /* A label being replaced under a tile that stays put fades back in rather
+  than being swapped between two frames. Zero means a caller that does not
+  animate, which is fully opaque -- the same reading `throb` has. */
+  if (tile->fade > 0.0) {
+    alpha *= tile->fade;
+  }
+
   cairo_save(cr);
 
   /* The urgent wiggle and the launch throb are the only transforms applied to
@@ -1156,8 +1164,19 @@ saber_render_tile(const struct saber_render *render,
     cairo_translate(cr, -cx, -cy);
   }
 
-  if (tile->running && render->config->theme.backlight != SABER_BACKLIGHT_OFF) {
-    draw_backlight(render, cr, tile, tile->focused ? 0.85 : 0.6);
+  /* Action purpose: The backlight is a fade and not a switch, so a tile that has
+  just stopped running still draws one on its way out. `running` is the state and
+  `backlight` the motion towards it; a caller that leaves the fade at zero gets
+  the state alone, which is what every tile drew before the fade existed. */
+  double backlight = tile->running ? 1.0 : 0.0;
+
+  if (tile->backlight > 0.0) {
+    backlight = tile->backlight;
+  }
+
+  if (backlight > 0.0 &&
+      render->config->theme.backlight != SABER_BACKLIGHT_OFF) {
+    draw_backlight(render, cr, tile, (tile->focused ? 0.85 : 0.6) * backlight);
   }
 
   if (tile->hover > 0.0) {

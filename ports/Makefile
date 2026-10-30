@@ -10,11 +10,17 @@ WWW=		https://github.com/orpheus497/saber
 LICENSE=	MIT
 LICENSE_FILE=	${WRKSRC}/LICENSE
 
-# Saber is FreeBSD-only by construction, not by omission: its privilege model is
-# the base system's operator group, and its mount and file monitoring go through
-# getfsstat(2) and kqueue. The tree's own Makefile refuses any other uname. That
-# needs no expression here -- a port only ever builds on FreeBSD -- and is noted
-# so nobody adds a portability shim to make it build elsewhere.
+# Saber builds on FreeBSD and on Linux, and this port is the FreeBSD half of
+# that; the Linux half is GNUmakefile in the tree, which is why nothing here
+# needs to express a platform.
+#
+# The claim that stood here -- that Saber was FreeBSD-only by construction,
+# because of the operator-group privilege model and because mount and file
+# monitoring went through getfsstat(2) and kqueue -- was two thirds wrong. Saber
+# calls neither getfsstat nor kqueue, and never did: both reach it only through
+# GLib's GUnixMountMonitor and GFileMonitor, which have Linux backends. The
+# privilege model was real and is now one backend of two, session-freebsd.c
+# beside session-linux.c, which is what this port compiles.
 
 USES=		gnome pkgconfig
 USE_GNOME=	glib20 gdkpixbuf librsvg2
@@ -25,7 +31,7 @@ BUILD_DEPENDS=	wayland-protocols>=1.41:graphics/wayland-protocols
 LIB_DEPENDS=	libwayland-client.so:graphics/wayland \
 		libcairo.so:graphics/cairo \
 		libpango-1.0.so:x11-toolkits/pango \
-		libucl.so:textproc/libucl \
+		liblua-5.4.so:lang/lua54 \
 		libxkbcommon.so:x11/libxkbcommon
 
 # The compositor Saber is built for. It is a RUN dependency and not a build one:
@@ -64,13 +70,13 @@ MAKE_ARGS+=	PREFIX=${PREFIX} ETC_PREFIX=${PREFIX} VERSION=${DISTVERSION}
 # already owns /sbin/shutdown and /dev/acpi. pkg-message tells the administrator
 # how to grant it; nothing here grants it automatically, because a package that
 # silently adds users to privileged groups is a package nobody should trust.
-# The tree's install writes a live saber.conf. A package must not overwrite a
+# The tree's install writes a live settings.lua. A package must not overwrite a
 # file the administrator has edited, so it ships as .sample and pkg materialises
 # it on first install only -- the same treatment sakura gives its config.ini.
 post-install:
 	@${STRIP_CMD} ${STAGEDIR}${PREFIX}/bin/saber
 	@${STRIP_CMD} ${STAGEDIR}${PREFIX}/bin/saberctl
-	@${MV} ${STAGEDIR}${PREFIX}/etc/saber/saber.conf \
-		${STAGEDIR}${PREFIX}/etc/saber/saber.conf.sample
+	@${MV} ${STAGEDIR}${PREFIX}/etc/saber/settings.lua \
+		${STAGEDIR}${PREFIX}/etc/saber/settings.lua.sample
 
 .include <bsd.port.mk>

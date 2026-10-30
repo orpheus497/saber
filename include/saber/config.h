@@ -1,9 +1,14 @@
 /* Script function and purpose: The configuration contract, as BLUEPRINT.md
-section 6 defines it. UCL via libucl -- the same dialect and the same parser as
-hikari.conf, so one syntax covers the desktop.
+section 6 defines it. Lua -- the file is a chunk that returns a table, which is
+the same language hikari's own configuration is moving to, so one syntax covers
+the desktop.
+
+Every key is accepted in both spellings, the hyphenated one the manual uses and
+the underscored one a Lua table is naturally written with, so `icon-size` and
+`icon_size` are the same key.
 
 Every key has a default and the whole file is optional: a user with no
-~/.config/saber/saber.conf gets a working panel. */
+~/.config/saber/saber.lua gets a working panel. */
 
 #if !defined(SABER_CONFIG_H)
 #define SABER_CONFIG_H
@@ -50,7 +55,7 @@ enum saber_portion {
 #define SABER_PORTION_COUNT 7
 
 /* The column is icon_size plus a symmetric gutter. This is the DEFAULT gutter,
-not the gutter: panel { padding } overrides it, so a user who wants a tighter
+not the gutter: panel.padding overrides it, so a user who wants a tighter
 or a roomier column is not asking for a recompile. */
 #define SABER_PANEL_PADDING 12
 
@@ -62,6 +67,10 @@ struct saber_config {
     int padding;   /* added to icon_size for the column's width */
     enum saber_autohide autohide;
     int reveal_pressure;
+    /* An explicit `panel.animation-ms` wins. Absent, the compositor's own
+    `ui.animation` supplies it while theme.inherit_hikari is true, so the
+    desktop moves at one speed rather than at two unrelated ones. Absent both,
+    the built-in default stands. */
     int animation_ms;
   } panel;
 
@@ -70,10 +79,16 @@ struct saber_config {
     enum saber_backlight backlight;
     double opacity;
     double overlay_opacity; /* dash and spread backdrop; applied exactly */
-    /* Populated either from hikari.conf or from an explicit theme { palette }
+    /* Populated either from hikari.lua or from an explicit theme.palette
     block; falls back to the built-in palette when neither is readable. */
     struct saber_color palette[SABER_PALETTE_SLOTS];
     bool palette_valid;
+    /* `theme.roles`: a per-role override, each entry either a palette
+    reference or a literal. The palette says what colours exist and this says
+    which of them carries which meaning, so a user who disagrees with a derived
+    role re-points it by name instead of having to rebuild the palette around
+    it. Unset entries leave the derived default in place. */
+    struct saber_theme_roles roles;
   } theme;
 
   struct {

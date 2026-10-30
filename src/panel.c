@@ -14,8 +14,6 @@ deliberately has room for only one of each. */
 
 #include <sys/wait.h>
 
-#include <dev/evdev/input-event-codes.h>
-
 #include <glib.h>
 #include <pango/pangocairo.h>
 
@@ -34,6 +32,21 @@ through a compatibility shim. */
 #define SABER_BTN_LEFT 0x110
 #define SABER_BTN_RIGHT 0x111
 #define SABER_BTN_MIDDLE 0x112
+
+/* The same for the keycodes the sheet grid reads. Wayland carries evdev
+keycodes whatever the system underneath is, so these are wire values rather
+than anything the host's headers get a say in. */
+#define SABER_KEY_ESC 1
+#define SABER_KEY_1 2
+#define SABER_KEY_9 10
+#define SABER_KEY_0 11
+#define SABER_KEY_ENTER 28
+#define SABER_KEY_SPACE 57
+#define SABER_KEY_KPENTER 96
+#define SABER_KEY_UP 103
+#define SABER_KEY_LEFT 105
+#define SABER_KEY_RIGHT 106
+#define SABER_KEY_DOWN 108
 
 /* Baseline durations for the two phase animations, at the shipped
 `animation-ms` of 180. Both are scaled by whatever the user actually configured,
@@ -87,14 +100,41 @@ struct saber_slot {
   size_t item;
   int sub;
   double y, height;
+
+  /* Whether the slot belongs to the scrolling part of the application band.
+  Those are the only slots the band offset moves and the only ones clipped to
+  it; the pinned head and the anchored tail do not scroll. */
+  bool band;
 };
 
 struct saber_anim_state {
   struct saber_tween throb;
   struct saber_tween wiggle;
+
+  /* Action purpose: The rest of the tile's own transitions, one tween each and
+  one multiply at the draw site. `backlight` fades the running mark in and out
+  rather than switching it, `badge` pops the count disc when the number behind
+  it changes, `progress` glides the bar to its new fraction instead of stepping
+  to it, `insert` scales a tile up as it arrives, and `fade` brings a label back
+  after it has been replaced -- which on this column means the sheet number. */
+  struct saber_tween backlight;
+  struct saber_tween badge;
+  struct saber_tween progress;
+  struct saber_tween insert;
+  struct saber_tween fade;
+
   int64_t launch_started;
   int64_t wiggle_started;
   bool throbbing, wiggling, seen;
+
+  /* What the last sync saw. Every tween above is started on a turnover and
+  never on a steady state, so each needs the previous value to compare against;
+  `placed` is what makes the arrival scale run once rather than on every sync. */
+  bool lit;
+  bool placed;
+  int64_t count;
+  double progress_to;
+  int mark;
 
   /* A repeating tween runs until its owner stops it, so both phase animations
   need a latch as well as a ceiling: without one, the next sync would see the
@@ -128,6 +168,14 @@ struct saber_panel {
   int head_visible;  /* scrollable head tiles the band has room for */
   double head_top;   /* where the scrolling part of the band starts */
   double head_limit; /* and where it ends */
+
+  /* Action purpose: `head_scroll` stays the target -- a whole tile index, which
+  is what the clamp, the arrows and the layout are all exact about -- and this
+  carries the distance still to travel towards it, in TILES rather than in
+  pixels, so a wheel step or a chevron click glides instead of jumping. Tiles
+  because the quantity is only ever multiplied by the tile pitch, and a pitch
+  that changes under a running slide would otherwise move the band twice. */
+  struct saber_tween head_slide;
 
   int hover;  /* slot index, or -1 */
   int fading; /* slot index fading out, or -1 */
@@ -168,7 +216,26 @@ struct saber_panel {
   double reveal_accum;
   double reveal_x, reveal_y;
   bool reveal_tracking;
-  struct saber_tween hover_in, hover_out;
+  struct saber_hover hover_fade;
+
+  /* Action purpose: The column slides rather than popping. `reveal` is 1 fully
+  on screen and 0 fully off it, driving a horizontal offset at the draw site,
+  and `revealed` is the state the slide was last started towards -- without it
+  the visibility re-applied on every configure would replay the slide.
+
+  The exclusive zone is NOT a paintable quantity: it is a protocol commit that
+  reflows every window on the output. So it is set to nothing at the START of a
+  hide and to the column's width at the END of a reveal, never at a point in
+  between, and `zone_pending` is what remembers the second of those until the
+  slide lands. */
+  struct saber_tween reveal;
+  bool revealed;
+  bool zone_pending;
+
+  /* Where the focus arrow is, as the focused item's index in the model rather
+  than as a y coordinate -- see panel_sync_focus. -1 while nothing has focus. */
+  struct saber_tween focus_slide;
+  int focus_item;
 
   double pointer_x, pointer_y;
 };
@@ -312,6 +379,60 @@ panel_phase_ms(const struct saber_panel *panel, int baseline)
       (double)SABER_ANIM_BASELINE_MS);
 }
 
+/* Function purpose: The configured duration, used as configured. Zero
+propagates to zero, which anim.c turns into a tween that lands on its target and
+never runs -- so one key still stops every animation in the column dead. */
+static int
+panel_anim_ms(const struct saber_panel *panel)
+{
+  const struct saber_config *config = panel->set->deps.config;
+
+  return config != NULL ? config->panel.animation_ms : 0;
+}
+
+/* Function purpose: Register or drop a tile's whole set of tweens in one place.
+The clock BORROWS them, so a tween missing from this list is either an animation
+that never advances or -- when the state dies with the tile -- a dangling
+pointer the next frame walks into. One list, used both ways, cannot drift. */
+static void
+anim_state_register(struct saber_clock *clock,
+    struct saber_anim_state *state,
+    bool add)
+{
+  struct saber_tween *tweens[] = { &state->throb, &state->wiggle,
+    &state->backlight, &state->badge, &state->progress, &state->insert,
+    &state->fade };
+
+  for (size_t i = 0; i < G_N_ELEMENTS(tweens); i++) {
+    if (add) {
+      saber_clock_add(clock, tweens[i]);
+    } else {
+      saber_clock_remove(clock, tweens[i]);
+    }
+  }
+}
+
+/* How far off zero a live tween is held. saber_render_tile() reads an exact
+zero as "not animating", so a tween passing through it has to miss it. A
+thousandth of a tile is 0.03px at the default 32px icon -- below a pixel at any
+scale the panel supports, and far above the precision of a double. */
+#define SABER_ANIM_FLOOR 1e-3
+
+/* Function purpose: A tween's value, kept off the renderer's zero sentinel
+while the tween is actually running. See the draw site in panel_draw() for the
+defect this exists to prevent. */
+static double
+anim_live(const struct saber_tween *tween)
+{
+  double value = saber_tween_value(tween);
+
+  if (!saber_tween_running(tween)) {
+    return value;
+  }
+
+  return value < SABER_ANIM_FLOOR ? SABER_ANIM_FLOOR : value;
+}
+
 static struct saber_anim_state *
 panel_anim(struct saber_panel *panel, const char *id)
 {
@@ -325,11 +446,61 @@ panel_anim(struct saber_panel *panel, const char *id)
 
   saber_tween_init(&state->throb, 0.0);
   saber_tween_init(&state->wiggle, 0.0);
-  saber_clock_add(panel->clock, &state->throb);
-  saber_clock_add(panel->clock, &state->wiggle);
+
+  /* Action purpose: These four rest at the value that means "nothing is
+  happening to this tile", not at zero, because a tile whose state has never
+  turned over must draw exactly as it did before any of them existed: full size,
+  full label, the badge at its nominal radius. The backlight is the exception --
+  it rests dark and the first sync lights it. */
+  saber_tween_init(&state->backlight, 0.0);
+  saber_tween_init(&state->badge, 1.0);
+  saber_tween_init(&state->progress, 0.0);
+  saber_tween_init(&state->insert, 1.0);
+  saber_tween_init(&state->fade, 1.0);
+  anim_state_register(panel->clock, state, true);
   g_hash_table_insert(panel->anim, g_strdup(id), state);
 
   return state;
+}
+
+/* Function purpose: Whether the tile's backlight should be lit -- the "this is
+running" mark. One function because the fade in panel_sync_anim and the tile the
+painter fills have to agree about it; two copies of the test would drift and
+leave a backlight fading towards a state the tile never draws. */
+static bool
+panel_item_lit(const struct saber_panels *set, const struct saber_item *item)
+{
+  switch (item->type) {
+  case SABER_ITEM_APP:
+    return saber_item_window_count(item) > 0;
+
+  case SABER_ITEM_SHEETS: {
+    const struct saber_sheets_state *state =
+        saber_sheets_get_state(set->deps.sheets);
+
+    return state != NULL && state->current > 0;
+  }
+
+  case SABER_ITEM_DEVICES:
+    return true;
+
+  default:
+    return false;
+  }
+}
+
+/* The number the tile's badge shows, for the pop when it changes. Same
+reasoning as panel_item_lit: the trash keeps its count outside the model item,
+so the test has to live where both the sync and the painter can reach it. */
+static int64_t
+panel_item_count(const struct saber_panels *set, const struct saber_item *item)
+{
+  if (item->type == SABER_ITEM_TRASH) {
+    return set->deps.trash != NULL ? (int64_t)saber_trash_count(set->deps.trash)
+                                   : 0;
+  }
+
+  return item->badge.count_visible ? item->badge.count : 0;
 }
 
 /* Phase tweens are stopped back at zero rather than at their target, so a tile
@@ -362,8 +533,8 @@ input at all, so it is entirely out of the way until something asks for it back.
 Nothing here moves or resizes the surface. A layer surface that shrinks and
 regrows has to be re-anchored and re-configured, and every one of those round
 trips is a chance for the compositor and the client to disagree about the size;
-leaving the geometry alone and drawing nothing costs one transparent buffer and
-cannot desynchronise. */
+leaving the geometry alone and drawing the column at an offset costs one
+transparent buffer and cannot desynchronise. */
 static void
 panel_apply_visibility(struct saber_panel *panel)
 {
@@ -371,23 +542,49 @@ panel_apply_visibility(struct saber_panel *panel)
     return;
   }
 
+  const struct saber_config *config = panel->set->deps.config;
   bool autohide = panel_autohides(panel);
-
-  saber_surface_set_exclusive_zone(panel->surface,
-      panel->visible && !autohide ? panel->width : 0);
+  int32_t zone = panel->visible && !autohide ? panel->width : 0;
 
   if (panel->visible) {
     saber_surface_set_input_region(panel->surface, 0, 0, panel->width,
         panel->height);
   } else if (autohide) {
-    bool right = panel->set->deps.config != NULL &&
-        panel->set->deps.config->panel.edge == SABER_EDGE_RIGHT;
+    bool right = config != NULL && config->panel.edge == SABER_EDGE_RIGHT;
     int32_t strip = MIN(SABER_REVEAL_STRIP, panel->width);
 
     saber_surface_set_input_region(panel->surface,
         right ? panel->width - strip : 0, 0, strip, panel->height);
   } else {
     saber_surface_set_input_region(panel->surface, 0, 0, 0, 0);
+  }
+
+  /* Action purpose: Started only when the state actually turns over. This
+  function is re-applied on every configure with the visibility unchanged, and
+  without the latch a resize would replay the whole slide. */
+  bool turned = panel->revealed != panel->visible;
+
+  panel->revealed = panel->visible;
+
+  if (turned) {
+    saber_tween_start(&panel->reveal, saber_tween_value(&panel->reveal),
+        panel->visible ? 1.0 : 0.0, panel_anim_ms(panel),
+        SABER_EASE_OUT_CUBIC, saber_clock_now(panel->clock));
+  }
+
+  /* Action purpose: The zone at the two ENDS of the slide and never inside it
+  -- a zone tracking the offset would hand the compositor a half-width column to
+  lay the desktop out against on every frame of it, and every window on the
+  output would reflow to each one. Going out, nothing is reserved from the first
+  frame, so the windows have the space for the whole of the slide. Coming back,
+  the reservation waits for the column to arrive; panel_frame makes that commit.
+  A slide that is not running -- `animation-ms = 0`, or a re-apply that turned
+  nothing over -- commits here, which is also what keeps the zero case exact. */
+  if (!panel->visible || !saber_tween_running(&panel->reveal)) {
+    panel->zone_pending = false;
+    saber_surface_set_exclusive_zone(panel->surface, zone);
+  } else {
+    panel->zone_pending = true;
   }
 
   panel_damage(panel);
@@ -440,6 +637,121 @@ panel_expire_anim(struct saber_panel *panel, int64_t now)
   }
 }
 
+/* Function purpose: Slide the focus arrow between tiles rather than moving it in
+one step.
+
+Carried as the focused item's INDEX in the model and not as a y coordinate,
+because the band the arrow sits in scrolls: an index does not change when the
+tiles under it slide, so a scroll carries the arrow along with its own tile
+instead of sending it on a second journey of its own. Consecutive applications
+are exactly one tile apart, so the index difference is the distance. */
+static void
+panel_sync_focus(struct saber_panel *panel, int64_t now)
+{
+  struct saber_model *model = panel->set->deps.model;
+  size_t count = saber_model_size(model);
+  int focused = -1;
+
+  for (size_t i = 0; i < count; i++) {
+    const struct saber_item *item = saber_model_nth(model, i);
+
+    if (item->type == SABER_ITEM_APP && item->focused) {
+      focused = (int)i;
+      break;
+    }
+  }
+
+  if (focused == panel->focus_item) {
+    return;
+  }
+
+  /* Action purpose: An arrow arriving from nowhere is PLACED rather than flown
+  in -- the first focus of the session, or focus returning after a spell with
+  none, would otherwise set out from whichever tile last held it, which by then
+  may not be on the column at all. */
+  if (focused >= 0 && panel->focus_item >= 0) {
+    saber_tween_start(&panel->focus_slide,
+        saber_tween_value(&panel->focus_slide), (double)focused,
+        panel_anim_ms(panel), SABER_EASE_OUT_CUBIC, now);
+  } else if (focused >= 0) {
+    saber_tween_stop(&panel->focus_slide);
+    panel->focus_slide.value = (double)focused;
+  }
+
+  panel->focus_item = focused;
+}
+
+/* Function purpose: Start whichever of a tile's own transitions the model has
+just turned over. Every one of them is driven from a comparison against what the
+last sync saw, so a sync that changes nothing starts nothing -- which is what
+keeps an idle column out of the repaint loop. */
+static void
+panel_sync_tile_anim(struct saber_panel *panel,
+    const struct saber_item *item,
+    struct saber_anim_state *state,
+    int64_t now)
+{
+  const struct saber_panels *set = panel->set;
+  int duration = panel_anim_ms(panel);
+  bool lit = panel_item_lit(set, item);
+  int64_t count = panel_item_count(set, item);
+
+  /* Action purpose: A tile arriving scales up into place rather than appearing
+  between two frames, and the spring's single overshoot is what makes it read as
+  landing. First sight only: a tile the column has drawn before is not new,
+  however the model came by it again. */
+  if (!state->placed) {
+    state->placed = true;
+    saber_tween_start(&state->insert, 0.0, 1.0, duration, SABER_EASE_SPRING,
+        now);
+  }
+
+  if (state->lit != lit) {
+    state->lit = lit;
+    saber_tween_start(&state->backlight, saber_tween_value(&state->backlight),
+        lit ? 1.0 : 0.0, duration, SABER_EASE_OUT_CUBIC, now);
+  }
+
+  /* Action purpose: The disc pops rather than the number stepping. The count
+  itself is NOT interpolated: a badge counting up through numbers nobody
+  published would be inventing state, so the digits change at once and the
+  emphasis is in the radius. */
+  if (state->count != count) {
+    state->count = count;
+    saber_tween_start(&state->badge, count > 0 ? 0.6 : 1.0, 1.0, duration,
+        SABER_EASE_SPRING, now);
+  }
+
+  double progress = item->badge.progress_visible
+      ? CLAMP(item->badge.progress, 0.0, 1.0)
+      : 0.0;
+
+  if (state->progress_to != progress) {
+    state->progress_to = progress;
+    saber_tween_start(&state->progress, saber_tween_value(&state->progress),
+        progress, duration, SABER_EASE_OUT_CUBIC, now);
+  }
+
+  /* Action purpose: The sheet number is the one label on this column that is
+  replaced while its own tile stays put, so the new one fades in where the old
+  one stood rather than being swapped between two frames. Nothing else has a
+  label that changes, so nothing else ever enters this. */
+  int mark = 0;
+
+  if (item->type == SABER_ITEM_SHEETS) {
+    const struct saber_sheets_state *sheets =
+        saber_sheets_get_state(set->deps.sheets);
+
+    mark = sheets != NULL ? sheets->current : 0;
+  }
+
+  if (state->mark != mark) {
+    state->mark = mark;
+    saber_tween_start(&state->fade, 0.0, 1.0, duration, SABER_EASE_OUT_CUBIC,
+        now);
+  }
+}
+
 static void
 panel_sync_anim(struct saber_panel *panel)
 {
@@ -456,16 +768,25 @@ panel_sync_anim(struct saber_panel *panel)
     ((struct saber_anim_state *)value)->seen = false;
   }
 
+  panel_sync_focus(panel, now);
+
   for (size_t i = 0; i < count; i++) {
     struct saber_item *item = saber_model_nth(model, i);
 
-    if (item->type != SABER_ITEM_APP || item->id == NULL) {
+    if (item->id == NULL) {
       continue;
     }
 
     struct saber_anim_state *state = panel_anim(panel, item->id);
 
     state->seen = true;
+    panel_sync_tile_anim(panel, item, state, now);
+
+    /* Past here is the two phase animations, which belong to applications
+    alone: nothing else launches, and the urgent hint is an application's. */
+    if (item->type != SABER_ITEM_APP) {
+      continue;
+    }
 
     /* Action purpose: The throb has a five second ceiling. An application that
     never opens a window -- or one whose app_id never matches -- must not leave
@@ -522,8 +843,7 @@ panel_sync_anim(struct saber_panel *panel)
     struct saber_anim_state *state = value;
 
     if (!state->seen) {
-      saber_clock_remove(panel->clock, &state->throb);
-      saber_clock_remove(panel->clock, &state->wiggle);
+      anim_state_register(panel->clock, state, false);
       g_hash_table_iter_remove(&iter);
     }
   }
@@ -573,7 +893,22 @@ panel_frame(void *data, uint32_t time)
   would buy one more frame per expiry. */
   panel_expire_anim(panel, now);
 
-  if (saber_clock_advance(panel->clock, now)) {
+  bool busy = saber_clock_advance(panel->clock, now);
+
+  /* Action purpose: The column has arrived, so it may now reserve its width --
+  see panel_apply_visibility for why the zone waits for this rather than
+  tracking the slide. Tested against the reveal itself and not against the clock
+  as a whole, so a hover fade still running somewhere else on the column cannot
+  hold the reservation back behind it. */
+  if (panel->zone_pending && !saber_tween_running(&panel->reveal)) {
+    panel->zone_pending = false;
+
+    if (panel->visible && !panel_autohides(panel)) {
+      saber_surface_set_exclusive_zone(panel->surface, panel->width);
+    }
+  }
+
+  if (busy) {
     saber_surface_damage(panel->surface);
   }
 }
@@ -620,16 +955,30 @@ panel_tile_count(const struct saber_panels *set, const struct saber_item *item)
 }
 
 static void
-panel_push_slot(struct saber_panel *panel, size_t item, int sub, double y)
+panel_push_slot(struct saber_panel *panel,
+    size_t item,
+    int sub,
+    double y,
+    bool band)
 {
   struct saber_slot slot = {
     .item = item,
     .sub = sub,
     .y = y,
     .height = (double)panel->render.tile,
+    .band = band,
   };
 
   g_array_append_val(panel->slots, slot);
+}
+
+/* Function purpose: How far the band is from where it is going, in logical
+pixels. Zero whenever it is settled, which is almost always -- every caller adds
+it to a band slot's y and most of them are adding nothing. */
+static double
+panel_head_slide(const struct saber_panel *panel)
+{
+  return saber_tween_value(&panel->head_slide) * (double)panel->render.tile;
 }
 
 /* Function purpose: How far the head band can be scrolled, in whole tiles.
@@ -706,7 +1055,8 @@ panel_layout(struct saber_panel *panel)
     int sub = 0;
 
     for (; sub < tiles && y + tile <= head_limit; sub++) {
-      panel_push_slot(panel, head, item_is_zone(item->type) ? sub : -1, y);
+      panel_push_slot(panel, head, item_is_zone(item->type) ? sub : -1, y,
+          false);
       y += tile;
     }
 
@@ -726,13 +1076,35 @@ panel_layout(struct saber_panel *panel)
   panel->head_scroll =
       CLAMP(panel->head_scroll, 0, panel_head_max_scroll(panel));
 
-  for (head += (size_t)panel->head_scroll; head < tail_begin; head++) {
-    if (y + tile > head_limit) {
-      break;
+  /* Action purpose: One tile either side of the band is laid out as well as the
+  tiles inside it, because the band slides a whole tile's distance and the one
+  arriving has to exist in the slot array before it is on screen. Both are
+  clipped to the band where they are drawn and neither is hittable outside it --
+  see panel_slot_at -- so a settled band is exactly the band it always was.
+
+  The two counts above are deliberately NOT touched by this: `head_count` and
+  `head_visible` are what the clamp and the overflow arrows are exact about, and
+  a tile laid out only to be clipped away is not a tile the band has room for. */
+  size_t first = head + (size_t)panel->head_scroll;
+
+  if (panel->head_visible > 0) {
+    if (first > head) {
+      first--;
+      y -= tile;
     }
 
-    panel_push_slot(panel, head, -1, y);
-    y += tile;
+    for (size_t i = first; i < tail_begin; i++) {
+      panel_push_slot(panel, i, -1, y, true);
+      y += tile;
+
+      if (y + tile > head_limit) {
+        if (i + 1 < tail_begin) {
+          panel_push_slot(panel, i + 1, -1, y, true);
+        }
+
+        break;
+      }
+    }
   }
 
   if (tail_tiles > 0 && tail_begin > 0) {
@@ -746,7 +1118,7 @@ panel_layout(struct saber_panel *panel)
     int tiles = panel_tile_count(set, item);
 
     for (int sub = 0; sub < tiles; sub++) {
-      panel_push_slot(panel, i, item_is_zone(item->type) ? sub : -1, y);
+      panel_push_slot(panel, i, item_is_zone(item->type) ? sub : -1, y, false);
       y += tile;
     }
   }
@@ -759,11 +1131,25 @@ panel_slot_at(const struct saber_panel *panel, double x, double y)
     return -1;
   }
 
+  /* Action purpose: The band's own tiles answer where they are DRAWN, offset
+  and all, so a tile caught mid-slide is picked up under the pointer rather than
+  at the rest it has not reached yet. The window test is what makes the tile
+  either side of the band unhittable: it is laid out so that it can slide in,
+  and until it is inside the band it is not there to be clicked. */
+  bool in_band = y >= panel->head_top && y < panel->head_limit;
+  double slide = panel_head_slide(panel);
+
   for (guint i = 0; i < panel->slots->len; i++) {
     const struct saber_slot *slot =
         &g_array_index(panel->slots, struct saber_slot, i);
 
-    if (y >= slot->y && y < slot->y + slot->height) {
+    if (slot->band && !in_band) {
+      continue;
+    }
+
+    double top = slot->band ? slot->y + slide : slot->y;
+
+    if (y >= top && y < top + slot->height) {
       return (int)i;
     }
   }
@@ -841,7 +1227,7 @@ panel_fill_app_tile(struct saber_panel *panel,
   }
 
   tile->windows = (int)saber_item_window_count(item);
-  tile->running = tile->windows > 0;
+  tile->running = panel_item_lit(panel->set, item);
   tile->focused = item->focused;
   tile->badge = item->badge;
 
@@ -894,7 +1280,7 @@ panel_fill_special_tile(struct saber_panel *panel,
     g_snprintf(scratch, scratch_size, "%d", state != NULL ? state->current : 0);
     tile->label = scratch;
     tile->focused = state != NULL;
-    tile->running = state != NULL && state->current > 0;
+    tile->running = panel_item_lit(set, item);
     break;
   }
 
@@ -910,12 +1296,12 @@ panel_fill_special_tile(struct saber_panel *panel,
       "drive-harddisk", "drive-removable-media-symbolic" };
 
     tile->icon = panel_icon(panel, names, G_N_ELEMENTS(names), tile);
-    tile->running = true;
+    tile->running = panel_item_lit(set, item);
     break;
   }
 
   case SABER_ITEM_TRASH: {
-    unsigned int count = saber_trash_count(set->deps.trash);
+    int64_t count = panel_item_count(set, item);
     const char *names[] = { count > 0 ? "user-trash-full" : "user-trash",
       "user-trash", "edit-delete", "user-trash-symbolic" };
 
@@ -1071,13 +1457,32 @@ panel_render_surface(void *data,
     panel_layout(panel);
   }
 
-  /* Action purpose: A hidden column draws nothing at all. The surface layer has
-  already cleared the buffer to transparent, so returning here leaves the
-  windows behind it visible through the space it occupies -- which, together
+  /* Action purpose: A column off the screen draws nothing at all. The surface
+  layer has already cleared the buffer to transparent, so returning here leaves
+  the windows behind it visible through the space it occupies -- which, together
   with the input region set in panel_apply_visibility, is what "hidden" means
-  for a surface that is never actually unmapped. */
-  if (!panel->visible) {
+  for a surface that is never actually unmapped.
+
+  The test is the reveal's value and not `visible`, because a column still
+  sliding out is not off the screen yet and has a frame left to draw. */
+  double reveal = saber_tween_value(&panel->reveal);
+
+  if (reveal <= 0.0) {
     return;
+  }
+
+  /* Action purpose: The autohide transition: the column slides out past the
+  edge it is docked against instead of vanishing between two frames. Applied as
+  a translation of everything below rather than as a per-element offset, so
+  nothing else in this function has to know the column animates. No
+  save/restore: the context is created fresh for every frame and destroyed at
+  the end of it, and this function has no early return past this point. */
+  if (reveal < 1.0) {
+    bool right = panel->set->deps.config != NULL &&
+        panel->set->deps.config->panel.edge == SABER_EDGE_RIGHT;
+    double slide = (1.0 - reveal) * (double)width;
+
+    cairo_translate(cr, right ? slide : -slide, 0.0);
   }
 
   saber_render_column(&panel->render, cr, width, height);
@@ -1104,7 +1509,7 @@ panel_render_surface(void *data,
     char initial[8] = { 0 };
     struct saber_tile tile = {
       .x = 0.0,
-      .y = slot->y,
+      .y = slot->band ? slot->y + panel_head_slide(panel) : slot->y,
       .width = (double)width,
       .height = slot->height,
       .throb = 1.0,
@@ -1127,13 +1532,72 @@ panel_render_surface(void *data,
     }
 
     if ((int)i == panel->hover) {
-      tile.hover = saber_tween_value(&panel->hover_in);
+      tile.hover = saber_hover_value(&panel->hover_fade);
       tile.pressed = panel->pressed == (int)i;
     } else if ((int)i == panel->fading) {
-      tile.hover = saber_tween_value(&panel->hover_out);
+      tile.hover = saber_hover_fading(&panel->hover_fade);
+    }
+
+    /* Action purpose: The tile's own transitions, all of them a value this
+    frame rather than a state. The arrival scale MULTIPLIES whatever the tile is
+    already doing, so a tile that is both new and launching does both; the rest
+    are read straight off their tweens, which rest at the values that mean
+    nothing is happening. */
+    struct saber_anim_state *anim =
+        item->id != NULL ? panel_anim(panel, item->id) : NULL;
+
+    if (anim != NULL) {
+      /* Action purpose: a RUNNING tween is held off zero, because zero is the
+      renderer's sentinel for "this tile is not animating" and means the
+      opposite of what a tween starting at 0.0 intends. `insert`, `backlight`
+      and `fade` all start there, saber_tween_start() sets the value to `from`,
+      and saber_render_tile() reads a zero as full size (scale 1.0), full
+      opacity and the full backlight on a running tile -- so the first frame of
+      every insert, every fade and every backlight light-up drew the tile at
+      full value, then snapped to near nothing and animated back up. A visible
+      flash per tile at startup and on every launch.
+
+      Gated on running rather than clamped unconditionally, because the resting
+      values are already correct and must stay exact: `insert` and `fade` rest
+      at 1.0 -- nothing happening -- and `backlight` rests at 0.0, which is how
+      a tile that is not running draws dark. Only the live tween is nudged, and
+      only off the sentinel; see panel_anim(). */
+      tile.throb *= anim_live(&anim->insert);
+      tile.backlight = anim_live(&anim->backlight);
+      tile.badge_scale = saber_tween_value(&anim->badge);
+      tile.fade = anim_live(&anim->fade);
+
+      if (tile.badge.progress_visible) {
+        tile.badge.progress = saber_tween_value(&anim->progress);
+      }
+    }
+
+    /* The arrow is between two tiles for as long as the slide runs, so the tile
+    it has arrived at draws it short of itself by whatever is left to travel. */
+    if (tile.focused && item->type == SABER_ITEM_APP &&
+        saber_tween_running(&panel->focus_slide)) {
+      tile.focus_offset =
+          (saber_tween_value(&panel->focus_slide) - (double)slot->item) *
+          (double)panel->render.tile;
+    }
+
+    /* Action purpose: The band is clipped to its own strip, which is what lets
+    the tile either side of it be laid out: on a settled band both are entirely
+    outside this rectangle and neither is drawn at all, and mid-slide each is
+    revealed exactly as far as it has come. The pinned head and the anchored
+    tail are not clipped, because neither of them moves. */
+    if (slot->band) {
+      cairo_save(cr);
+      cairo_rectangle(cr, 0.0, panel->head_top, (double)width,
+          panel->head_limit - panel->head_top);
+      cairo_clip(cr);
     }
 
     saber_render_tile(&panel->render, cr, &tile);
+
+    if (slot->band) {
+      cairo_restore(cr);
+    }
 
     if (owned != NULL) {
       cairo_surface_destroy(owned);
@@ -1635,6 +2099,40 @@ panel_close_menu(struct saber_panels *set)
   sheet_grid_close(set->grid);
 }
 
+/* Function purpose: Close the menu and have it GONE before this returns, not
+fading. Every caller that puts something else in its place needs this rather
+than panel_close_menu(), and two separate failures follow from not having it.
+
+The first is a protocol error. A close with animations on only starts the root
+popup's fade, so the popup is still alive; the grabbed popup that goes up next
+-- another quicklist, or the sheet grid -- is then not the topmost popup, which
+xdg_wm_base makes a fatal error on the whole client.
+
+The second is worse because it survives. `set->menu` is reassigned to the
+replacement while the old menu is still fading, and when that fade lands the
+old menu's teardown calls menu_closed(), which clears `set->menu`
+unconditionally -- so the OLD menu's teardown nulls the NEW menu's pointer. The
+panel then has no handle on a popup that holds the seat: nothing can close it,
+not panel_close_menu(), not saber_panels_close_menu(). Opening one menu while
+another is open is the ordinary path, and it left an undismissable menu on
+screen.
+
+The second close is what forces teardown -- see saber_quicklist_close(), which
+documents it as the one route a caller has to that, for exactly the reason the
+destroy path needs it too: a popup that outlives its parent layer surface is a
+protocol error. */
+static void
+panel_close_menu_now(struct saber_panels *set)
+{
+  panel_close_menu(set);
+
+  /* Still here means fading out, since a synchronous teardown has already
+  cleared it through menu_closed(). */
+  if (set->menu != NULL) {
+    saber_quicklist_close(set->menu);
+  }
+}
+
 static void
 menu_closed(void *user)
 {
@@ -1786,6 +2284,15 @@ panel_menu_context(struct saber_panel *panel,
 {
   struct saber_panels *set = panel->set;
 
+  /* Action purpose: A menu dismissed a moment ago is still fading out and still
+  owns its popup, so it is finished off before a second one is composed. Two
+  root popups on one surface is what xdg_wm_base.not_the_topmost_popup
+  disconnects a client for, and the second close reaches quicklist.c as the
+  "be rid of it now" it treats it as. */
+  if (set->menu != NULL) {
+    saber_quicklist_close(set->menu);
+  }
+
   if (set->menu_ctx != NULL) {
     g_free(set->menu_ctx->id);
     g_free(set->menu_ctx);
@@ -1850,7 +2357,7 @@ panel_open_app_menu(struct saber_panel *panel,
   params.running = count > 0;
   params.offer_pin = true;
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_APP, item->id));
 
@@ -1869,7 +2376,7 @@ panel_open_tray_menu(struct saber_panel *panel,
   params.menu_bus_name = saber_sni_item_bus_name(entry);
   params.menu_object_path = saber_sni_item_menu_path(entry);
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_TRAY, NULL));
 
@@ -1929,7 +2436,7 @@ panel_open_session_menu(struct saber_panel *panel,
   params.windows = entries;
   params.windows_len = count;
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_SESSION, NULL));
 }
@@ -1949,7 +2456,7 @@ panel_open_trash_menu(struct saber_panel *panel, const struct saber_slot *slot)
   params.windows = entries;
   params.windows_len = G_N_ELEMENTS(entries);
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
   set->menu = saber_quicklist_open(&params, &panel_menu_handlers,
       panel_menu_context(panel, SABER_MENU_TRASH, NULL));
 }
@@ -2054,7 +2561,10 @@ grid_render(void *data,
 
     int count = grid->counts[sheet];
     bool marked = sheet == grid->hovered || sheet == grid->selected;
-    const struct saber_color *ink = &theme->dim;
+    /* The hint role and not the dim one: this ink draws the sheet's number,
+    which is how the user picks the cell, so it has to be read even on a sheet
+    holding nothing. The frame below stays dim, because that is a hairline. */
+    const struct saber_color *ink = &theme->hint;
 
     if (sheet == grid->current) {
       saber_theme_set_source(cr, &theme->accent);
@@ -2069,7 +2579,7 @@ grid_render(void *data,
     }
 
     /* An empty sheet keeps its outline, so the grid still reads as ten places,
-    and keeps the dim ink, so it reads as an empty one. */
+    and keeps the recessed ink, so it reads as an empty one. */
     saber_theme_set_source(cr, marked ? &theme->accent : &theme->dim);
     cairo_set_line_width(cr, marked ? 2.0 : 1.0);
     cairo_rectangle(cr, x + 0.5, y + 0.5, w - 1.0, h - 1.0);
@@ -2209,7 +2719,7 @@ grid_pointer_button(void *data, uint32_t time, uint32_t button, uint32_t state)
 
   struct saber_sheet_grid *grid = data;
 
-  if (button != BTN_LEFT) {
+  if (button != SABER_BTN_LEFT) {
     return;
   }
 
@@ -2320,40 +2830,40 @@ grid_key(void *data, uint32_t time, uint32_t key, uint32_t state)
   a grid of numbers sits at a fixed physical position -- so these need no xkb
   keymap, and none of them can be missing at the moment the grid opens. */
   switch (key) {
-  case KEY_ESC:
+  case SABER_KEY_ESC:
     sheet_grid_close(grid);
     break;
 
-  case KEY_LEFT:
+  case SABER_KEY_LEFT:
     grid_move(grid, -1);
     break;
 
-  case KEY_RIGHT:
+  case SABER_KEY_RIGHT:
     grid_move(grid, 1);
     break;
 
-  case KEY_UP:
+  case SABER_KEY_UP:
     grid_move(grid,
         grid->selected > SABER_GRID_COLUMNS ? -SABER_GRID_COLUMNS : -1);
     break;
 
-  case KEY_DOWN:
+  case SABER_KEY_DOWN:
     grid_move(grid, grid->selected == 0 ? 1 : SABER_GRID_COLUMNS);
     break;
 
-  case KEY_ENTER:
-  case KEY_KPENTER:
-  case KEY_SPACE:
+  case SABER_KEY_ENTER:
+  case SABER_KEY_KPENTER:
+  case SABER_KEY_SPACE:
     grid_activate(grid, grid->selected);
     break;
 
-  case KEY_0:
+  case SABER_KEY_0:
     grid_activate(grid, 0);
     break;
 
   default:
-    if (key >= KEY_1 && key <= KEY_9) {
-      grid_activate(grid, (int)(key - KEY_1) + 1);
+    if (key >= SABER_KEY_1 && key <= SABER_KEY_9) {
+      grid_activate(grid, (int)(key - SABER_KEY_1) + 1);
     }
     break;
   }
@@ -2461,7 +2971,7 @@ panel_open_sheet_grid(struct saber_panel *panel, const struct saber_slot *slot)
     return;
   }
 
-  panel_close_menu(set);
+  panel_close_menu_now(set);
 
   struct saber_sheet_grid *grid = g_new0(struct saber_sheet_grid, 1);
 
@@ -2843,6 +3353,17 @@ panel_scroll_head(struct saber_panel *panel, int steps)
     return;
   }
 
+  /* Action purpose: The band starts the step from where it stood and glides to
+  the new index, so a wheel notch or a chevron click reads as a scroll rather
+  than as a jump. Measured against the OLD target and added to whatever is left
+  of a slide already running, because a second notch arriving mid-glide has to
+  carry that remainder with it instead of restarting from a whole tile out. */
+  saber_tween_start(&panel->head_slide,
+      saber_tween_value(&panel->head_slide) +
+          (double)(next - panel->head_scroll),
+      0.0, panel_anim_ms(panel), SABER_EASE_OUT_CUBIC,
+      saber_clock_now(panel->clock));
+
   panel->head_scroll = next;
   panel_layout(panel);
 
@@ -2955,7 +3476,6 @@ panel_set_hover(struct saber_panel *panel, int slot)
   }
 
   int64_t now = saber_clock_now(panel->clock);
-  int animation_ms = panel->set->deps.config->panel.animation_ms;
   /* Action purpose: The configured duration, used as configured. This was
   MIN(animation_ms, SABER_HOVER_MS) with 0 mapped to SABER_HOVER_MS, which
   silently truncated every value above 120 -- including the shipped default of
@@ -2963,24 +3483,21 @@ panel_set_hover(struct saber_panel *panel, int slot)
   other value" rather than the "disables animation entirely" it is documented
   as. A zero duration needs no special case here: anim.c lands a zero-length
   tween on its target and never runs it. */
-  int duration = animation_ms;
+  int duration = panel_anim_ms(panel);
 
   panel->fading = panel->hover;
 
   if (panel->fading >= 0) {
-    saber_tween_start(&panel->hover_out, saber_tween_value(&panel->hover_in),
-        0.0, duration, SABER_EASE_OUT_CUBIC, now);
+    saber_hover_leave(&panel->hover_fade, duration, now);
   }
 
   panel->hover = slot;
   panel->pressed = -1;
 
   if (slot >= 0) {
-    saber_tween_start(&panel->hover_in, 0.0, 1.0, duration,
-        SABER_EASE_OUT_CUBIC, now);
+    saber_hover_enter(&panel->hover_fade, duration, now);
   } else {
-    saber_tween_stop(&panel->hover_in);
-    panel->hover_in.value = 0.0;
+    saber_hover_rest(&panel->hover_fade);
   }
 
   panel_damage(panel);
@@ -3273,11 +3790,17 @@ panel_create(struct saber_panels *panels, struct saber_output *output)
   hiding on the first pointer-leave would flash the panel across every screen at
   login, which is exactly what the setting exists to avoid. */
   panel->visible = !panel_autohides(panel);
+  panel->revealed = panel->visible;
+  panel->focus_item = -1;
 
-  saber_tween_init(&panel->hover_in, 0.0);
-  saber_tween_init(&panel->hover_out, 0.0);
-  saber_clock_add(panel->clock, &panel->hover_in);
-  saber_clock_add(panel->clock, &panel->hover_out);
+  saber_hover_init(&panel->hover_fade);
+  saber_tween_init(&panel->reveal, panel->visible ? 1.0 : 0.0);
+  saber_tween_init(&panel->head_slide, 0.0);
+  saber_tween_init(&panel->focus_slide, 0.0);
+  saber_hover_add(panel->clock, &panel->hover_fade);
+  saber_clock_add(panel->clock, &panel->reveal);
+  saber_clock_add(panel->clock, &panel->head_slide);
+  saber_clock_add(panel->clock, &panel->focus_slide);
 
   struct saber_surface_params params;
 
@@ -3314,6 +3837,21 @@ panel_destroy(struct saber_panel *panel)
   if (panel->set->menu != NULL && panel->set->menu_ctx != NULL &&
       panel->set->menu_ctx->panel == panel) {
     saber_quicklist_close(panel->set->menu);
+
+    /* Action purpose: The second close is what forces teardown -- the same
+    route panel_close_menu_now() takes, and the one saber_quicklist_close()
+    documents for a caller that must be rid of a menu this instant. One close
+    only starts the root's fade and leaves the popup mapped, and the layer
+    surface this column destroys below is that popup's parent. Still here means
+    fading out, since a synchronous teardown has already cleared the pointer
+    through menu_closed().
+
+    panel_close_menu_now() is not the call to make here even though it holds
+    this exact pair: it closes set->grid unconditionally, and the guard above
+    deliberately leaves the grid alone when it belongs to another column. */
+    if (panel->set->menu != NULL) {
+      saber_quicklist_close(panel->set->menu);
+    }
   }
 
   g_clear_pointer(&panel->pressed_id, g_free);
@@ -3448,8 +3986,11 @@ saber_panels_destroy(struct saber_panels *panels)
   }
 
   /* Before the listeners are dropped: closing a menu puts the panel's own pair
-  back, and doing that after they had been cleared would resurrect them. */
-  panel_close_menu(panels);
+  back, and doing that after they had been cleared would resurrect them. Gone
+  rather than fading, because the columns are about to go and a popup that
+  outlives its parent layer surface is a protocol error -- which is one of the
+  cases saber_quicklist_close() names in its own comment. */
+  panel_close_menu_now(panels);
 
   saber_display_set_output_listener(panels->deps.display, NULL, NULL);
   saber_display_remove_pointer_listener(panels->deps.display,

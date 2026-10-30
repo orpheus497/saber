@@ -3,6 +3,14 @@ invoking user through the base system's `operator` group (D-013). Saber installs
 nothing setuid or setgid and writes no sudoers fragment; where the group is not
 held, the action is reported unavailable and the panel hides it. */
 
+/* Action purpose: The build driver compiles exactly one session backend per
+platform, so this guard is not what selects it. It is here so the other
+platform's build reads this file as an empty translation unit rather than a
+screenful of errors, which is what keeps a whole-tree syntax-only sweep over
+every source worth running -- the same reason src/appinfo.c guards
+closefrom(2). */
+#if defined(__FreeBSD__)
+
 #include <stdbool.h>
 #include <string.h>
 
@@ -370,3 +378,5 @@ saber_session_run(const struct saber_config *config,
 
   return spawn((char *const *)builtin, saber_session_action_id(action), error);
 }
+
+#endif /* __FreeBSD__ */

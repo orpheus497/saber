@@ -8,6 +8,11 @@
 /saberctl
 /vinput
 
+# The two tests built and run by `make test`. The sources beside them ARE
+# tracked -- only the binaries are not.
+/test/contrast
+/test/budget
+
 # Libraries. Saber builds executables only, so these are a standing guard
 # rather than a rule for anything the tree produces today.
 *.a

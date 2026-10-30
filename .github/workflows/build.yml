@@ -1,0 +1,125 @@
+# Script function and purpose: Linux CI for saber. Builds the tree with the GNU
+# make driver -- GNUmakefile, which is what `make` reads on Linux -- under both
+# gcc and clang, and runs `make test`, the contrast and easing regression test
+# that holds the theme's colour and animation invariants. The bmake half of the
+# build is the other platform's job and is covered by .build.yml on
+# builds.sr.ht; neither driver is exercised by the other's runner.
+name: CI Build
+
+# Action purpose: Markdown is ignored because documentation genuinely cannot
+# break a build here -- no .md file is compiled, embedded or read by either
+# driver. Nothing else is ignored: etc/saber/saber.lua, protocol/*.xml and
+# share/icons/saber.svg all reach the build or the install.
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+      - "**.markdown"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "**.markdown"
+
+# Action purpose: The default token scope is whatever the repository is set to,
+# which on a public repository is read and on others can be write. This job
+# compiles the tree and runs one test binary: it reads the source and writes
+# nothing back, so it is given exactly that and the setting cannot drift with
+# the repository's.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-${{ matrix.cc }}
+    runs-on: ubuntu-latest
+
+    # Action purpose: A matrix rather than two near-identical jobs, because the
+    # dependency list below is a dozen lines and factoring it into a composite
+    # action the way sofi does would take a second file. Both compilers are
+    # worth a run: the tree builds clean under each, and each diagnoses what
+    # the other does not -- the one standing warning in the tree,
+    # src/render.c:1013, is a gcc -Wformat-truncation that clang does not
+    # implement. fail-fast is off so a break in one compiler is reported as
+    # that rather than cancelling its sibling and hiding which one broke.
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    # The driver takes CC from the environment; nothing else in it is set.
+    env:
+      CC: ${{ matrix.cc }}
+
+    steps:
+      # Action purpose: The token is used for the clone and for nothing after it,
+      # so it is not left behind in .git/config where every later step -- and
+      # anything those steps run -- could read it.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Action purpose: Every package here backs a pkg-config module or a tool
+      # that GNUmakefile invokes, and nothing is listed that does not:
+      #
+      #   libcairo2-dev          cairo
+      #   libgdk-pixbuf-2.0-dev  gdk-pixbuf-2.0
+      #   libglib2.0-dev         gio-2.0 and gio-unix-2.0 -- two pkg-config
+      #                          modules, one package
+      #   liblua5.4-dev          lua5.4, which is the first of the seven names
+      #                          the driver probes that Debian and Ubuntu ship
+      #   libpango1.0-dev        pangocairo
+      #   librsvg2-dev           librsvg-2.0
+      #   libwayland-bin         wayland-scanner, which generates the six
+      #                          *-protocol.{h,c} pairs. It arrives as a
+      #                          dependency of libwayland-dev and is named
+      #                          anyway, because the build runs the tool
+      #                          directly and a tool the build runs should not
+      #                          be installed by accident
+      #   libwayland-dev         wayland-client and wayland-cursor
+      #   libxkbcommon-dev       xkbcommon
+      #   pkg-config             the driver's own PKG_CONFIG default
+      #   wayland-protocols      the XML behind the four non-vendored
+      #                          protocols, found through
+      #                          `pkg-config --variable pkgdatadir`. The two
+      #                          wlr-* protocols are vendored under protocol/
+      #                          and need no package
+      #
+      # The compiler is installed by name from the matrix rather than taken on
+      # trust from the runner image, so the job does not turn on which
+      # compilers a given image happens to carry.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ${{ matrix.cc }} \
+            libcairo2-dev \
+            libgdk-pixbuf-2.0-dev \
+            libglib2.0-dev \
+            liblua5.4-dev \
+            libpango1.0-dev \
+            librsvg2-dev \
+            libwayland-bin \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config \
+            wayland-protocols
+
+      # Action purpose: Print the feature set and the Lua module the driver
+      # resolved, before anything is compiled. Lua is the one dependency whose
+      # pkg-config name varies by packager -- the driver probes seven -- so
+      # this is the cheapest way to tell a real compile failure from a host
+      # that simply spells Lua differently.
+      - name: Report resolved feature set
+        run: make features
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      # Action purpose: `make test` links test/contrast against theme.o and
+      # anim.o and runs it. It drives saber_theme_init directly rather than
+      # reading saber.lua and speaks to no compositor, which is what makes it
+      # runnable on a bare runner with no session and no display.
+      - name: Test
+        run: make test

@@ -199,13 +199,13 @@ struct saber_dash {
   /* Action purpose: The dash's own clock, driven from the surface layer's frame
   hook. Both tweens are one-shot -- neither repeats -- so the loop settles by
   itself and cannot pin a core the way an unbounded repeat did (D-036).
-  `reveal` runs once on show and slides the strip in from the panel's edge;
-  `hover_in`/`hover_out` fade a cell's highlight, with `fading` naming the cell
-  the pointer has just left. */
+  `reveal` runs once on show and slides the strip in from the panel's edge, then
+  runs backwards on dismissal; `hover_fade` fades a cell's highlight, with
+  `fading` naming the cell the pointer has just left. */
   struct saber_clock *clock;
   bool revealing; /* the open transition has been started for this mapping */
   struct saber_tween reveal;
-  struct saber_tween hover_in, hover_out;
+  struct saber_hover hover_fade;
   int fading;
 
   int columns, rows, visible_rows;
@@ -242,6 +242,14 @@ struct saber_dash {
 
   bool listening;
   bool hiding;
+
+  /* Action purpose: The strip slides out before the surface goes, so the dash
+  outlives its own dismissal by one animation. `closing` is that window --
+  nothing is drawn into the dash and no input reaches it while it stands -- and
+  `teardown` is the idle that does the freeing, because the surface cannot be
+  destroyed from inside the frame callback that noticed the slide had landed. */
+  bool closing;
+  guint teardown;
 };
 
 /* ------------------------------------------------------------- primitives */
@@ -954,13 +962,13 @@ dash_draw_search(struct saber_dash *dash, cairo_t *cr)
   double glyph_width = 12.0;
   double filter_x = x + w - 12.0 - filter_width;
 
-  set_source_alpha(cr, filtered ? &theme->accent : &theme->dim, 1.0);
+  set_source_alpha(cr, filtered ? &theme->accent : &theme->hint, 1.0);
   cairo_move_to(cr, filter_x, y + (h - filter_height) / 2.0);
   pango_cairo_show_layout(cr, layout);
   draw_filter_glyph(cr, filter_x - 7.0 - glyph_width, y + h / 2.0 - 4.5,
       glyph_width);
 
-  set_source_alpha(cr, &theme->dim, 1.0);
+  set_source_alpha(cr, &theme->hint, 1.0);
   draw_magnifier(cr, x + 18.0, y + h / 2.0 - 1.5, 5.5);
 
   double text_x = x + 32.0;
@@ -981,7 +989,7 @@ dash_draw_search(struct saber_dash *dash, cairo_t *cr)
   int text_width, text_height;
 
   pango_layout_get_pixel_size(layout, &text_width, &text_height);
-  saber_theme_set_source(cr, empty ? &theme->dim : &theme->foreground);
+  saber_theme_set_source(cr, empty ? &theme->hint : &theme->foreground);
   cairo_move_to(cr, text_x, y + (h - text_height) / 2.0);
   pango_cairo_show_layout(cr, layout);
 
@@ -1050,7 +1058,7 @@ dash_draw_strip(struct saber_dash *dash, cairo_t *cr)
     }
 
     if (chip->icon == NULL) {
-      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
+      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->hint);
       draw_all_glyph(cr, chip->x + chip->width / 2.0, cy, DASH_STRIP_ICON - 6.0);
     } else if (icon != NULL) {
       draw_icon(cr, icon, chip->x + chip->width / 2.0, cy, DASH_STRIP_ICON,
@@ -1063,7 +1071,7 @@ dash_draw_strip(struct saber_dash *dash, cairo_t *cr)
       pango_layout_set_width(layout, (int)((chip->width - 4.0) * PANGO_SCALE));
       pango_layout_set_text(layout, chip->label, -1);
       pango_layout_get_pixel_size(layout, &text_width, &text_height);
-      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->dim);
+      saber_theme_set_source(cr, selected ? &theme->foreground : &theme->hint);
       cairo_move_to(cr, chip->x + (chip->width - text_width) / 2.0,
           cy - text_height / 2.0);
       pango_cairo_show_layout(cr, layout);
@@ -1095,9 +1103,9 @@ dash_draw_cell(struct saber_dash *dash,
   double hover = 0.0;
 
   if (index == dash->hovered) {
-    hover = saber_tween_value(&dash->hover_in);
+    hover = saber_hover_value(&dash->hover_fade);
   } else if (index == dash->fading) {
-    hover = saber_tween_value(&dash->hover_out);
+    hover = saber_hover_fading(&dash->hover_fade);
   }
 
   bool selected = index == dash->selected;
@@ -1296,7 +1304,7 @@ dash_render(void *data,
         (int)((dash->panel_width - 2.0 * DASH_PAD) * PANGO_SCALE));
     pango_layout_set_height(layout, 0);
     pango_layout_set_text(layout, "No matching applications", -1);
-    saber_theme_set_source(cr, &theme->dim);
+    saber_theme_set_source(cr, &theme->hint);
     cairo_move_to(cr, dash->panel_x + DASH_PAD, dash->grid_y + 24.0);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
@@ -1323,6 +1331,12 @@ dash_anim_ms(const struct saber_dash *dash);
 
 static void
 dash_damage(struct saber_dash *dash);
+
+static void
+dash_teardown(struct saber_dash *dash);
+
+static gboolean
+dash_teardown_idle(gpointer data);
 
 static void
 dash_configure(void *data,
@@ -1385,6 +1399,17 @@ dash_frame(void *data, uint32_t time)
 
   if (saber_clock_advance(dash->clock, saber_clock_stamp(dash->clock, time))) {
     saber_surface_damage(dash->surface);
+
+    return;
+  }
+
+  /* Action purpose: Nothing is moving any more, so a dismissal that was waiting
+  for its slide has arrived -- but the surface is NOT destroyed from in here.
+  The surface layer reads the surface again as this returns, so freeing it on
+  this stack is a read of freed memory; an idle does it with the main loop back
+  in charge. */
+  if (dash->closing && dash->teardown == 0) {
+    dash->teardown = g_idle_add(dash_teardown_idle, dash);
   }
 }
 
@@ -1515,16 +1540,13 @@ dash_set_hover(struct saber_dash *dash, double x, double y)
   dash->fading = dash->hovered;
 
   if (dash->fading >= 0) {
-    saber_tween_start(&dash->hover_out, saber_tween_value(&dash->hover_in), 0.0,
-        duration, SABER_EASE_OUT_CUBIC, now);
+    saber_hover_leave(&dash->hover_fade, duration, now);
   }
 
   if (cell >= 0) {
-    saber_tween_start(&dash->hover_in, 0.0, 1.0, duration, SABER_EASE_OUT_CUBIC,
-        now);
+    saber_hover_enter(&dash->hover_fade, duration, now);
   } else {
-    saber_tween_stop(&dash->hover_in);
-    dash->hover_in.value = 0.0;
+    saber_hover_rest(&dash->hover_fade);
   }
 
   dash->hovered = cell;
@@ -2161,11 +2183,9 @@ saber_dash_create(const struct saber_dash_deps *deps)
 
   dash->clock = saber_clock_create();
   saber_tween_init(&dash->reveal, 1.0);
-  saber_tween_init(&dash->hover_in, 0.0);
-  saber_tween_init(&dash->hover_out, 0.0);
+  saber_hover_init(&dash->hover_fade);
   saber_clock_add(dash->clock, &dash->reveal);
-  saber_clock_add(dash->clock, &dash->hover_in);
-  saber_clock_add(dash->clock, &dash->hover_out);
+  saber_hover_add(dash->clock, &dash->hover_fade);
 
   dash->font = pango_font_description_from_string(DASH_FONT);
   dash->search_font = pango_font_description_from_string(DASH_SEARCH_FONT);
@@ -2197,7 +2217,13 @@ saber_dash_destroy(struct saber_dash *dash)
     return;
   }
 
+  /* An animated dismissal cannot outlive the dash, so the teardown it was
+  waiting on a frame for happens here instead. */
   saber_dash_hide(dash);
+
+  if (dash->closing) {
+    dash_teardown(dash);
+  }
 
   g_ptr_array_free(dash->results, TRUE);
   g_ptr_array_unref(dash->entries);
@@ -2220,7 +2246,10 @@ saber_dash_destroy(struct saber_dash *dash)
 bool
 saber_dash_is_visible(const struct saber_dash *dash)
 {
-  return dash != NULL && dash->surface != NULL;
+  /* A dash sliding out is already dismissed as far as every caller is
+  concerned: it takes no input, and `saberctl dash` must open a new one rather
+  than report one still on screen. */
+  return dash != NULL && dash->surface != NULL && !dash->closing;
 }
 
 bool
@@ -2228,6 +2257,12 @@ saber_dash_show(struct saber_dash *dash, struct saber_output *output)
 {
   if (dash == NULL) {
     return false;
+  }
+
+  /* A dash still sliding out owns the surface the new one needs, so its
+  teardown happens now rather than being waited for. */
+  if (dash->closing) {
+    dash_teardown(dash);
   }
 
   if (dash->surface != NULL) {
@@ -2321,28 +2356,49 @@ saber_dash_show(struct saber_dash *dash, struct saber_output *output)
   return true;
 }
 
-void
-saber_dash_hide(struct saber_dash *dash)
+/* Function purpose: Give the seat back. Split out because a dismissal gives up
+its input the moment it is asked for, a whole animation before the surface it
+was drawn on goes: a strip on its way out must not take a click, and the panel
+underneath has to be reachable again immediately. */
+static void
+dash_release_input(struct saber_dash *dash)
 {
-  /* Hiding is re-entrant by design: the surface's `closed` callback lands here,
-  and a launch hides the dash from inside a keyboard event. */
-  if (dash == NULL || dash->surface == NULL || dash->hiding) {
+  if (!dash->listening) {
+    return;
+  }
+
+  saber_display_remove_pointer_listener(dash->deps.display,
+      &dash_pointer_listener, dash);
+  saber_display_set_keyboard_listener(dash->deps.display, dash->prev_keyboard,
+      dash->prev_keyboard_data);
+  dash->listening = false;
+}
+
+/* Function purpose: Everything the dash holds, let go at once. The animated
+dismissal arrives here when its slide lands; a zero duration, a second
+dismissal, a compositor-closed surface and saber_dash_destroy all come straight
+through without waiting for a frame. */
+static void
+dash_teardown(struct saber_dash *dash)
+{
+  if (dash->hiding) {
     return;
   }
 
   dash->hiding = true;
+  dash->closing = false;
 
-  saber_surface_destroy(dash->surface);
-  dash->surface = NULL;
-
-  if (dash->listening) {
-    saber_display_remove_pointer_listener(dash->deps.display,
-        &dash_pointer_listener, dash);
-    saber_display_set_keyboard_listener(dash->deps.display, dash->prev_keyboard,
-        dash->prev_keyboard_data);
-    dash->listening = false;
+  if (dash->teardown != 0) {
+    g_source_remove(dash->teardown);
+    dash->teardown = 0;
   }
 
+  if (dash->surface != NULL) {
+    saber_surface_destroy(dash->surface);
+    dash->surface = NULL;
+  }
+
+  dash_release_input(dash);
   saber_display_flush(dash->deps.display);
 
   g_ptr_array_set_size(dash->results, 0);
@@ -2364,14 +2420,63 @@ saber_dash_hide(struct saber_dash *dash)
   dash->fading = -1;
   saber_tween_stop(&dash->reveal);
   dash->reveal.value = 1.0;
-  saber_tween_stop(&dash->hover_in);
-  dash->hover_in.value = 0.0;
-  saber_tween_stop(&dash->hover_out);
-  dash->hover_out.value = 0.0;
+  saber_hover_clear(&dash->hover_fade);
+
+  /* The surface took its frame callbacks with it while the tweens above were
+  still marked running, so no advance ever recorded them stopping -- without
+  this the next open anchors its slide against a stale timestamp. */
   saber_clock_reset(dash->clock);
   dash->scroll = 0;
   saber_scroll_reset(&dash->scroll_accum);
   dash->hiding = false;
+}
+
+static gboolean
+dash_teardown_idle(gpointer data)
+{
+  struct saber_dash *dash = data;
+
+  dash->teardown = 0;
+  dash_teardown(dash);
+
+  return G_SOURCE_REMOVE;
+}
+
+void
+saber_dash_hide(struct saber_dash *dash)
+{
+  /* Hiding is re-entrant by design: the surface's `closed` callback lands here,
+  and a launch hides the dash from inside a keyboard event. */
+  if (dash == NULL || dash->surface == NULL || dash->hiding) {
+    return;
+  }
+
+  /* Action purpose: A second dismissal while the first is still sliding out
+  finishes it rather than restarting it. Asking twice means the caller wants the
+  dash gone, not gone more slowly. */
+  if (dash->closing) {
+    dash_teardown(dash);
+
+    return;
+  }
+
+  /* Action purpose: The reveal runs backwards and the surface goes when it
+  lands, so the dash leaves the way it arrived instead of snapping off the
+  screen. Two cases cannot wait for that: `animation-ms = 0` means there is no
+  animation to wait for, and a surface the compositor has already closed will
+  never deliver another frame to notice the landing on. */
+  if (dash->surface->closed || dash_anim_ms(dash) <= 0) {
+    dash_teardown(dash);
+
+    return;
+  }
+
+  dash->closing = true;
+  dash_release_input(dash);
+  saber_display_flush(dash->deps.display);
+  saber_tween_start(&dash->reveal, saber_tween_value(&dash->reveal), 0.0,
+      dash_anim_ms(dash), SABER_EASE_OUT_CUBIC, saber_clock_now(dash->clock));
+  dash_damage(dash);
 }
 
 void
@@ -2394,7 +2499,7 @@ saber_dash_toggle(struct saber_dash *dash, struct saber_output *output)
     return false;
   }
 
-  if (dash->surface != NULL) {
+  if (saber_dash_is_visible(dash)) {
     saber_dash_hide(dash);
 
     return false;

@@ -21,11 +21,25 @@ that has not been handed the Makefile's flags still parses this header. */
 #define SABER_ETC_PREFIX "/usr/local"
 #endif
 
-#define SABER_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/saber/saber.conf"
+/* Action purpose: the distributor's file is `settings.lua` and the user's is
+`saber.lua`, so neither name has to be read twice to know which one you are
+looking at. They used to share the name `saber.lua` and differ only by which
+root they sat under, which meant a path had to be read to its last component
+before it said whose file it was -- and sofi had the same problem spelled the
+other way round, where `sofi.lua` was the SYSTEM file and `config.lua` the
+user's. One rule now covers all three components of the desktop: the file named
+after the program is yours, `settings.lua` is the one that shipped.
 
-/* Action purpose: The compositor's configuration is read for its `ui { palette }`
-block, so that retheming hikari retints the panel with it (BLUEPRINT.md 6.1).
-Only the palette is read; nothing else in that file is Saber's business. */
-#define SABER_HIKARI_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/hikari/hikari.conf"
+SABER_LEGACY_SYSTEM_CONFIG is the old path, still read when the new one is
+absent, because an install that predates this rename is a working install. */
+#define SABER_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/saber/settings.lua"
+#define SABER_LEGACY_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/saber/saber.lua"
+
+/* Action purpose: The compositor's configuration is read for two blocks, so
+that retheming hikari retints the panel with it and the desktop moves at one
+speed rather than at two unrelated ones (BLUEPRINT.md 6.1): `ui.palette` for the
+sixteen colours and `ui.animation` for the duration. Nothing else in that file
+is Saber's business, and neither block is ever written back. */
+#define SABER_HIKARI_SYSTEM_CONFIG SABER_ETC_PREFIX "/etc/hikari/hikari.lua"
 
 #endif

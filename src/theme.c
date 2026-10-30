@@ -313,9 +313,14 @@ taken to have hung. Reading somebody else's file must not be able to stop the
 panel starting, and the two blocks wanted from it cost a few hundred.
 
 It counts VM instructions and so cannot interrupt a loop that runs inside one C
-function. A hikari.lua carrying `string.rep("", math.maxinteger)` hung the
-panel at startup for exactly that reason, which is what the ceilings in
-src/luaguard.c are for. */
+function, nor bound how long an instruction takes. A hikari.lua carrying
+`string.rep("", math.maxinteger)` hung the panel at startup for the first
+reason, and one concatenating a mebibyte string with itself in a loop ran 77
+seconds for the second. Both are what the ceilings in src/luaguard.c are for --
+the wrappers for the C-side loops, and SABER_LUA_TIME_CAP_MS for the elapsed
+time neither a count nor a byte total can express. This ceiling is retained
+beside them because it refuses a different file: a tight infinite loop reaches
+it long before a second has passed. */
 #define SABER_HIKARI_STEPS 2000000
 
 /* Function purpose: End a chunk that has run too long, through Lua's own error
@@ -324,9 +329,17 @@ other unusable file. */
 static void
 hikari_runaway(lua_State *L, lua_Debug *activation)
 {
+  const char *reason = saber_lua_tick(L);
+
   (void)activation;
 
-  luaL_error(L, "the file did not finish");
+  /* Action purpose: the hook fires every SABER_LUA_SAMPLE instructions so that
+  the clock gets looked at, so most calls are a charge and a return. */
+  if (reason == NULL) {
+    return;
+  }
+
+  luaL_error(L, "%s", reason);
 }
 
 /* Function purpose: The one place the compositor's configuration is opened.
@@ -353,7 +366,7 @@ hikari_open(const char *path)
     return NULL;
   }
 
-  lua_sethook(L, hikari_runaway, LUA_MASKCOUNT, SABER_HIKARI_STEPS);
+  saber_lua_arm(L, hikari_runaway, SABER_HIKARI_STEPS);
 
   int status = lua_pcall(L, 0, 1, 0);
 

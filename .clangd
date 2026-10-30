@@ -22,6 +22,7 @@ CompileFlags:
     - "-I/usr/local/include/libpng16"
     - "-I/usr/local/include/libxml2"
     - "-I/usr/local/include/libepoll-shim"
+    - "-I/usr/local/include/lua54"
     - "-D_THREAD_SAFE"
     - "-DSABER_PREFIX=\"/usr/local\""
     - "-DSABER_ETC_PREFIX=\"/usr/local\""

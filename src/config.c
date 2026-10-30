@@ -898,9 +898,14 @@ orders of magnitude, and the only thing it stops is a file that never finishes:
 and a panel that stops answering is worse than one running the old settings.
 
 It counts VM instructions, so it cannot interrupt a loop that runs inside a
-single C function however long that function takes -- which is not a limit of
-this number but of what a count hook is. The two string operations where that
-mattered are bounded in src/luaguard.c instead. */
+single C function however long that function takes, and it says nothing about
+how long an instruction takes either -- which is not a limit of this number but
+of what a count hook is. Both gaps are closed in src/luaguard.c: the two string
+operations whose work happens inside one C call are charged by the wrappers
+there, and SABER_LUA_TIME_CAP_MS bounds the elapsed time that neither a count
+nor a byte total can express. This ceiling is retained beside it rather than
+replaced by it, because the two refuse different files: a tight infinite loop
+reaches this one long before a second has passed. */
 #define SABER_CONFIG_STEPS 2000000
 
 /* Function purpose: End a chunk that has run too long, through Lua's own error
@@ -910,9 +915,18 @@ which is the one piece of information that makes a runaway loop findable. */
 static void
 config_runaway(lua_State *L, lua_Debug *activation)
 {
+  const char *reason = saber_lua_tick(L);
+
+  /* Action purpose: the hook now fires every SABER_LUA_SAMPLE instructions so
+  that the clock gets looked at, so most calls are a charge and a return. Only
+  a ceiling actually passed raises. */
+  if (reason == NULL) {
+    return;
+  }
+
   lua_getinfo(L, "Sl", activation);
-  luaL_error(L, "%s:%d: the file did not finish", activation->short_src,
-      activation->currentline);
+  luaL_error(L, "%s:%d: %s", activation->short_src, activation->currentline,
+      reason);
 }
 
 /* Function purpose: Take Lua's error off the stack as a string this file owns.
@@ -961,7 +975,7 @@ config_open(lua_State *L, const char *path, char **error)
     return false;
   }
 
-  lua_sethook(L, config_runaway, LUA_MASKCOUNT, SABER_CONFIG_STEPS);
+  saber_lua_arm(L, config_runaway, SABER_CONFIG_STEPS);
 
   int status = lua_pcall(L, 0, 1, 0);
 

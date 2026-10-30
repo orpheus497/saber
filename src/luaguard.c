@@ -1,7 +1,7 @@
 /* Script function and purpose: Build the interpreter a configuration file is
-read in, with the three ceilings that make running somebody's file safe: a
-memory cap, a bound on the two string operations whose work happens inside a
-single C call, and a setup that cannot abort the panel.
+read in, with the four ceilings that make running somebody's file safe: a memory
+cap, a bound on the two string operations whose work happens inside a single C
+call, a deadline on the whole chunk, and a setup that cannot abort the panel.
 
 WHY THE INSTRUCTION HOOK IS NOT ENOUGH, which is the whole reason this file
 exists. Both readers arm a count hook (lua_sethook with LUA_MASKCOUNT). That
@@ -13,13 +13,22 @@ that guard, and then runs its copy loop nearly maxinteger times. It allocates
 nothing, so a memory cap does not catch it either. Measured with the hook armed
 at 2000000 instructions, a saber.lua containing that one line ran past 20
 seconds without the hook firing once -- at startup and again on `saberctl
-reload`, which is a hung panel rather than a refused file. */
+reload`, which is a hung panel rather than a refused file.
+
+AND WHY BOUNDING THOSE TWO IS NOT ENOUGH EITHER, which is the second reason.
+Charging the operations whose work hides inside a C call bounds the ones named
+here; it does not bound the ones whose work hides inside a single VM
+INSTRUCTION, and `..` is one of those. The deadline documented beside
+SABER_LUA_TIME_CAP_MS in the header closes that class rather than its members,
+because the question a reader has is whether the file finished. */
 
 #include <saber/luaguard.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <lauxlib.h>
 #include <lualib.h>
@@ -88,6 +97,16 @@ struct guard_budget {
   which is what saber_lua_unbound leaves behind. */
   size_t work;
   size_t work_cap;
+  /* Instructions charged through saber_lua_tick, and the reader's ceiling on
+  them. Charged in SABER_LUA_SAMPLE-sized pieces because the hook now fires
+  that often in order to read the clock; the ceiling it adds up to is the same
+  one the reader used to arm in a single count. Zero means unbounded. */
+  unsigned long steps;
+  unsigned long step_cap;
+  /* When the chunk must have finished by, on the monotonic clock, in
+  nanoseconds. Zero means unbounded, which is what an unarmed state and
+  saber_lua_unbound both leave behind. */
+  long long deadline;
 };
 
 struct guard_setup {
@@ -590,6 +609,9 @@ saber_lua_open(const char *const names[], lua_CFunction undefined,
   budget->cap = SABER_LUA_MEMORY_CAP;
   budget->work = 0;
   budget->work_cap = SABER_LUA_WORK_MAX;
+  budget->steps = 0;
+  budget->step_cap = 0;
+  budget->deadline = 0;
 
   /* Action purpose: lua_newstate rather than luaL_newstate, because the cap is
   the allocator -- an interpreter built with Lua's own allocator and switched
@@ -638,6 +660,95 @@ saber_lua_enter(lua_State *L)
   return strcmp(upvalue, "_ENV") == 0;
 }
 
+/* Function purpose: The monotonic clock in nanoseconds. A deadline cannot be
+built on CLOCK_REALTIME, which moves when the machine's time is corrected and
+would expire a chunk that had just started or never expire one that had not.
+src/buffer.c reads the same clock the same way. */
+static long long
+guard_now(void)
+{
+  struct timespec now;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  return (long long)now.tv_sec * 1000000000LL + (long long)now.tv_nsec;
+}
+
+/* Function purpose: The budget a state carries, or NULL for a state this file
+did not build -- which is the same test guard_charge makes, because the
+allocator is the only handle on it. */
+static struct guard_budget *
+guard_of(lua_State *L)
+{
+  void *ud = NULL;
+
+  if (lua_getallocf(L, &ud) != guard_alloc) {
+    return NULL;
+  }
+
+  return ud;
+}
+
+void
+saber_lua_arm(lua_State *L, lua_Hook hook, unsigned long step_cap)
+{
+  struct guard_budget *budget = guard_of(L);
+
+  if (budget == NULL) {
+    return;
+  }
+
+  budget->steps = 0;
+  budget->step_cap = step_cap;
+  budget->deadline =
+      guard_now() + (long long)SABER_LUA_TIME_CAP_MS * 1000000LL;
+
+  lua_sethook(L, hook, LUA_MASKCOUNT, SABER_LUA_SAMPLE);
+}
+
+/* Action purpose: stringified so the ceiling appears in the diagnostic as the
+one number a user would change, with no buffer to own and no formatting to do
+inside a hook that is about to raise. */
+#define GUARD_QUOTE_(x) #x
+#define GUARD_QUOTE(x) GUARD_QUOTE_(x)
+
+const char *
+saber_lua_tick(lua_State *L)
+{
+  struct guard_budget *budget = guard_of(L);
+
+  if (budget == NULL) {
+    return NULL;
+  }
+
+  /* The instruction ceiling, reached in samples rather than in one count, so
+  that it means exactly what it meant when the reader armed it directly. The
+  addition saturates for the same reason guard_charge's does: a wrap would hand
+  the chunk its whole allowance again. */
+  if (budget->step_cap != 0) {
+    if (SABER_LUA_SAMPLE > ULONG_MAX - budget->steps) {
+      budget->steps = ULONG_MAX;
+    } else {
+      budget->steps += SABER_LUA_SAMPLE;
+    }
+
+    if (budget->steps > budget->step_cap) {
+      return "the file did not finish";
+    }
+  }
+
+  /* Action purpose: and the ceiling the instruction count cannot express. The
+  clock is read after the charging so that a chunk which trips both is reported
+  against the instruction ceiling, which is the older and more specific of the
+  two. */
+  if (budget->deadline != 0 && guard_now() > budget->deadline) {
+    return "the file was still running after "
+           GUARD_QUOTE(SABER_LUA_TIME_CAP_MS) " ms";
+  }
+
+  return NULL;
+}
+
 void
 saber_lua_unbound(lua_State *L)
 {
@@ -659,6 +770,11 @@ saber_lua_unbound(lua_State *L)
   /* The work ceiling goes with it, for the same reason: what it bounds is the
   configuration, and the configuration has finished. Zero means no ceiling. */
   ((struct guard_budget *)budget)->work_cap = 0;
+
+  /* And the time and instruction ceilings, which bound the same thing. Nothing
+  armed is left behind for a later chunk on this state to inherit half-spent. */
+  ((struct guard_budget *)budget)->step_cap = 0;
+  ((struct guard_budget *)budget)->deadline = 0;
 }
 
 void

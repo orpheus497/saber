@@ -118,3 +118,12 @@ TEST_OBJS = \
 	theme.o \
 	anim.o \
 	luaguard.o
+
+# Action purpose: The configuration-budget regression test is a second binary
+# rather than more cases in the contrast one, because it shares nothing with
+# it: it drives the luaguard interface directly and links neither cairo nor
+# gio, so it needs only this one object and Lua. Keeping them separate also
+# keeps a slow test slow on its own -- every case in it deliberately runs a
+# chunk until a ceiling stops it.
+BUDGET_OBJS = \
+	luaguard.o

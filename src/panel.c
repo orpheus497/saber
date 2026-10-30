@@ -3837,6 +3837,21 @@ panel_destroy(struct saber_panel *panel)
   if (panel->set->menu != NULL && panel->set->menu_ctx != NULL &&
       panel->set->menu_ctx->panel == panel) {
     saber_quicklist_close(panel->set->menu);
+
+    /* Action purpose: The second close is what forces teardown -- the same
+    route panel_close_menu_now() takes, and the one saber_quicklist_close()
+    documents for a caller that must be rid of a menu this instant. One close
+    only starts the root's fade and leaves the popup mapped, and the layer
+    surface this column destroys below is that popup's parent. Still here means
+    fading out, since a synchronous teardown has already cleared the pointer
+    through menu_closed().
+
+    panel_close_menu_now() is not the call to make here even though it holds
+    this exact pair: it closes set->grid unconditionally, and the guard above
+    deliberately leaves the grid alone when it belongs to another column. */
+    if (panel->set->menu != NULL) {
+      saber_quicklist_close(panel->set->menu);
+    }
   }
 
   g_clear_pointer(&panel->pressed_id, g_free);

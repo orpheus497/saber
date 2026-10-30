@@ -375,10 +375,16 @@ features:
 # test has to be runnable anywhere -- including on a host that cannot link the
 # panel itself, which is why it drives saber_theme_init directly rather than
 # reading saber.lua.
-test: ${PROTOCOL_HEADERS} ${TEST_OBJS}
+# The budget test links luaguard.o alone and asserts both that a runaway
+# configuration is refused and how long the refusal takes -- the second being
+# the part a refusal-only check missed while the escape ran for 77 seconds.
+test: ${PROTOCOL_HEADERS} ${TEST_OBJS} ${BUDGET_OBJS}
 	${CC} ${LDFLAGS} ${CFLAGS} -o test/contrast ${.CURDIR}/test/contrast.c \
 		${TEST_OBJS} ${CAIRO_LIBS} ${GIO_LIBS} ${LUA_LIBS} -lm
+	${CC} ${LDFLAGS} ${CFLAGS} -o test/budget ${.CURDIR}/test/budget.c \
+		${BUDGET_OBJS} ${LUA_LIBS}
 	@./test/contrast
+	@./test/budget
 
 clean:
 	@echo "cleaning generated protocol sources"
@@ -390,7 +396,7 @@ clean:
 	@rm -f ${OBJS} ${PROTOCOL_OBJS} ${CTL_OBJS}
 	@rm -f vinput.o ${VINPUT_PROTOCOL_OBJS}
 	@echo "cleaning executables"
-	@rm -f saber saberctl vinput test/contrast
+	@rm -f saber saberctl vinput test/contrast test/budget
 
 distclean: clean
 	@rm -f saber-${VERSION}.tar.gz
@@ -401,6 +407,7 @@ saber-${VERSION}.tar.gz: version.h
 		src/*.c \
 		include/saber/*.h \
 		protocol/*.xml \
+		share/icons/saber.svg \
 		test/*.c \
 		etc/saber/settings.lua \
 		build/sources.mk \

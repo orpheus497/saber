@@ -341,7 +341,7 @@ return {
   },
 
   theme = {
-    inherit_hikari  = true,      -- import ui { palette } and ui { animation } from hikari.lua
+    inherit_hikari  = true,      -- import ui.palette and ui.animation from hikari.lua
     backlight       = "palette", -- palette | dominant | off  -- see the note below
     opacity         = 0.92,      -- the column itself
     overlay_opacity = 1.00,      -- dash strip and spread backdrop; 1.0 = opaque
@@ -408,11 +408,11 @@ Five of these need a word on how they behave:
   scroll, the launch throb and the urgent wiggle are all scaled from it against a 180 ms
   baseline, so `0` genuinely stops all of them rather than leaving two of them running.
 * **`animation-ms`, left unwritten, is inherited from the compositor.** While
-  `theme.inherit_hikari` is on, hikari's own `animation.duration` answers it — with
+  `theme.inherit_hikari` is on, hikari's own `ui.animation.duration` answers it — with
   `enabled = false` arriving as 0, which is the same statement made the other way round — and an
   explicit `panel.animation_ms` always wins over it. The consequence is worth stating plainly:
   `hikari-sakura` ships animation **off**, so on a stock desktop with no explicit setting the
-  panel's motion is off too and every surface settles instantly. The installed `saber.lua`
+  panel's motion is off too and every surface settles instantly. The installed `settings.lua`
   therefore leaves the key commented out, so copying the shipped file behaves exactly like having
   no file at all; write it to keep the panel moving while the compositor does not.
   `easing` is deliberately not imported — the panel picks a curve per animation, and a

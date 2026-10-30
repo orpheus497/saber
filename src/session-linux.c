@@ -282,9 +282,10 @@ session_id(GDBusConnection *bus, const char *path)
 }
 
 /* Function purpose: Which logind session this process belongs to, worked out
-once and kept -- a process does not change session, so the answer cannot go
-stale the way a capability can. Where there is none, lock and logout have
-nothing to act on and the panel hides them.
+once and kept -- a process does not change session, so an answer cannot go
+stale the way a capability can. A FAILURE is not kept, for the reason given at
+the assignment below. Where there is no session, lock and logout have nothing
+to act on and the panel hides them.
 
 XDG_SESSION_ID is the cheap answer and is tested rather than trusted: it is
 inherited by everything the session starts, including a process that outlives
@@ -308,7 +309,15 @@ current_session(void)
     return &identity;
   }
 
-  resolved = true;
+  /* Action purpose: Only an ANSWER is kept, which is why `resolved` is set at
+  each success below and not here. A lookup can fail for reasons that have
+  nothing to do with this process's session existing: logind still starting
+  while the panel is already up, or LOGIND_PROBE_TIMEOUT_MS expiring on a busy
+  system bus. Settling on the empty identity then would hide lock and logout
+  for the life of the process, which is the same mistake the NULL bus above
+  deliberately avoids -- and the panel is long-lived, so "until it restarts"
+  means until the user next logs in. A failed lookup costs two quick failing
+  calls on the next menu open instead. */
 
   const char *env = g_getenv("XDG_SESSION_ID");
 
@@ -318,6 +327,7 @@ current_session(void)
     if (path != NULL) {
       identity.id = g_strdup(env);
       identity.path = path;
+      resolved = true;
 
       return &identity;
     }
@@ -329,6 +339,7 @@ current_session(void)
 
   if (identity.path != NULL) {
     identity.id = session_id(bus, identity.path);
+    resolved = true;
   }
 
   return &identity;
